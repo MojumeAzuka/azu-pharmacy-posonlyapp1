@@ -41,9 +41,10 @@ export default function App() {
     barcode: ''
   });
 
-  // Sales History Filter State
+  // Sales History Filter & Cloud Sync State
   const [historySearchTerm, setHistorySearchTerm] = useState('');
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
+  const [cloudSales, setCloudSales] = useState([]);
 
   // Handle Supabase Auth Session
   useEffect(() => {
@@ -94,10 +95,51 @@ export default function App() {
     setSession(null);
   };
 
+  // Fetch Central Sales History directly from Supabase for cross-device visibility
+  const fetchCloudSales = async () => {
+    if (!navigator.onLine || !session) return;
+    try {
+      const oneYearAgo = new Date();
+      oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+      let query = supabase
+        .from('sales')
+        .select('*')
+        .gte('created_at', oneYearAgo.toISOString())
+        .order('created_at', { ascending: false });
+
+      if (userRole !== 'manager') {
+        query = query.eq('cashier_id', session.user.id);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      if (data) {
+        const formatted = data.map((s) => ({
+          id: s.id,
+          total: Number(s.total || s.total_amount || 0),
+          saleType: s.sale_type || s.saleType || 'retail',
+          cashierId: s.cashier_id || s.cashierId,
+          cashierEmail: s.cashier_email || s.cashierEmail,
+          customerName: s.customer_name || s.customerName || 'Walk-in Customer',
+          customerPhone: s.customer_phone || s.customerPhone || 'N/A',
+          createdAt: s.created_at || s.createdAt,
+          items: typeof s.items === 'string' ? JSON.parse(s.items) : (s.items || []),
+          synced: 1
+        }));
+        setCloudSales(formatted);
+      }
+    } catch (err) {
+      console.warn('Cloud sales fetch deferred:', err.message);
+    }
+  };
+
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
-      syncPendingSalesToCloud();
+      syncDrugsFromCloud();
+      syncPendingSalesToCloud().then(() => fetchCloudSales());
       pruneSalesOlderThanOneYear();
     };
     const handleOffline = () => setIsOnline(false);
@@ -107,7 +149,7 @@ export default function App() {
 
     if (navigator.onLine) {
       syncDrugsFromCloud();
-      syncPendingSalesToCloud();
+      syncPendingSalesToCloud().then(() => fetchCloudSales());
       pruneSalesOlderThanOneYear();
     }
 
@@ -115,7 +157,14 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, []);
+  }, [session, userRole]);
+
+  // Refetch cloud sales when entering History tab
+  useEffect(() => {
+    if (activeTab === 'history' && isOnline) {
+      fetchCloudSales();
+    }
+  }, [activeTab, isOnline]);
 
   // Live Query for Drugs Inventory
   const drugs = useLiveQuery(async () => {
@@ -127,25 +176,40 @@ export default function App() {
       .toArray();
   }, [searchTerm]);
 
-  // Live Query for Sales History with Role-Based Scoping
-  const salesHistory = useLiveQuery(async () => {
+  // Query Local Dexie Sales
+  const localSales = useLiveQuery(async () => {
     if (!session) return [];
+    let records = await db.sales.orderBy('createdAt').reverse().toArray();
 
-    let query = db.sales.orderBy('createdAt').reverse();
-
-    let records = await query.toArray();
-
-    // 1-Year Filtering Safeguard
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
     records = records.filter(s => new Date(s.createdAt) >= oneYearAgo);
 
-    // Role Scoping: Salespersons see ONLY their own transactions
     if (userRole !== 'manager') {
       records = records.filter(
         (s) => s.cashierId === session.user.id || s.cashierEmail === session.user.email
       );
-    } else if (historyCashierFilter !== 'all') {
+    }
+    return records;
+  }, [session, userRole]);
+
+  // Merge Local (Offline/Pending) & Cloud Sales into unified history
+  const salesHistory = React.useMemo(() => {
+    const combinedMap = new Map();
+
+    // Add Cloud sales first
+    cloudSales.forEach((s) => combinedMap.set(String(s.id), s));
+
+    // Overlay Local sales (overwrites cloud if pending/matching)
+    (localSales || []).forEach((s) => combinedMap.set(String(s.id), s));
+
+    let records = Array.from(combinedMap.values());
+
+    // Sort newest first
+    records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    // Manager Cashier Filter
+    if (userRole === 'manager' && historyCashierFilter !== 'all') {
       records = records.filter((s) => s.cashierEmail === historyCashierFilter);
     }
 
@@ -161,7 +225,7 @@ export default function App() {
     }
 
     return records;
-  }, [session, userRole, historySearchTerm, historyCashierFilter]);
+  }, [localSales, cloudSales, userRole, historyCashierFilter, historySearchTerm]);
 
   // Cart Operations
   const addToCart = (drug) => {
@@ -212,7 +276,7 @@ export default function App() {
 
   const cartTotal = cart.reduce((sum, item) => sum + item.activePrice * item.quantity, 0);
 
-  // Complete Sale Logic
+  // Complete Sale Logic with Direct Cloud Sync + Local Fallback
   const handleCheckout = async () => {
     if (cart.length === 0) return;
 
@@ -231,42 +295,68 @@ export default function App() {
         synced: 0
       };
 
-      // 1. Deduct stock locally in Dexie safely
+      // 1. Deduct stock locally in Dexie
       for (const item of cart) {
         if (item.id) {
           const existingDrug = await db.drugs.get(String(item.id));
           if (existingDrug) {
             const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
             await db.drugs.update(String(item.id), { stock: newStock });
+
+            // Sync stock deduction to Supabase if online
+            if (isOnline) {
+              supabase
+                .from('drugs')
+                .update({ stock: newStock })
+                .eq('id', String(item.id))
+                .then();
+            }
           }
         }
       }
 
-      // 2. Save sale record locally
+      // 2. Save sale record locally in Dexie
       await db.sales.add(saleData);
 
-      // 3. Immediately launch printable receipt on screen
+      // 3. Direct Cloud Push if Online
+      if (isOnline) {
+        const supabasePayload = {
+          id: saleData.id,
+          total: saleData.total,
+          sale_type: saleData.saleType,
+          cashier_id: saleData.cashierId,
+          cashier_email: saleData.cashierEmail,
+          customer_name: saleData.customerName,
+          customer_phone: saleData.customerPhone,
+          created_at: saleData.createdAt,
+          items: JSON.stringify(saleData.items)
+        };
+
+        const { error } = await supabase.from('sales').insert([supabasePayload]);
+        if (!error) {
+          await db.sales.update(saleId, { synced: 1 });
+          saleData.synced = 1;
+          fetchCloudSales();
+        } else {
+          console.warn('Cloud insert pending, queued locally:', error.message);
+        }
+      }
+
+      // 4. Launch printable receipt on screen
       setSaleSuccessData(saleData);
       setShowReceiptModal(true);
 
-      // 4. Reset cart and inputs
+      // 5. Reset cart and inputs
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
-
-      // 5. Trigger cloud sync if online
-      if (isOnline) {
-        syncPendingSalesToCloud().catch((err) =>
-          console.warn('Background sync deferred:', err.message)
-        );
-      }
     } catch (err) {
       console.error('Checkout error:', err);
       alert(`Checkout failed: ${err.message || 'Error processing database transaction'}`);
     }
   };
 
-  // Manager CRUD Handlers
+  // Manager CRUD Handlers (Updates Dexie + Supabase)
   const handleOpenAddModal = () => {
     setEditingDrug(null);
     setFormData({
@@ -299,13 +389,18 @@ export default function App() {
   const handleDeleteDrug = async (id, e) => {
     e.stopPropagation();
     if (window.confirm('Are you sure you want to delete this drug from inventory?')) {
-      await db.drugs.delete(id);
+      await db.drugs.delete(String(id));
+      if (isOnline) {
+        await supabase.from('drugs').delete().eq('id', String(id));
+      }
     }
   };
 
   const handleSaveDrug = async (e) => {
     e.preventDefault();
+    const drugId = editingDrug ? String(editingDrug.id) : Date.now().toString();
     const drugPayload = {
+      id: drugId,
       name: formData.name,
       unitType: formData.unitType,
       costPrice: Number(formData.costPrice),
@@ -316,15 +411,29 @@ export default function App() {
     };
 
     if (editingDrug) {
-      await db.drugs.update(editingDrug.id, drugPayload);
+      await db.drugs.update(drugId, drugPayload);
     } else {
-      await db.drugs.add({ ...drugPayload, id: Date.now().toString() });
+      await db.drugs.add(drugPayload);
+    }
+
+    if (isOnline) {
+      const cloudPayload = {
+        id: drugId,
+        name: formData.name,
+        unit_type: formData.unitType,
+        cost_price: Number(formData.costPrice),
+        retail_price: Number(formData.retailPrice),
+        wholesale_price: Number(formData.wholesalePrice),
+        stock: Number(formData.stock),
+        barcode: formData.barcode
+      };
+      await supabase.from('drugs').upsert([cloudPayload]);
     }
 
     setIsModalOpen(false);
   };
 
-  // LOGIN SCREEN
+  // ------------------- LOGIN SCREEN -------------------
   if (!session) {
     return (
       <div className="login-container">
@@ -377,7 +486,7 @@ export default function App() {
     );
   }
 
-  // MAIN POS APP SCREEN
+  // ------------------- MAIN POS APP SCREEN -------------------
   return (
     <div className="app-container">
       <header className="header no-print">
@@ -388,6 +497,7 @@ export default function App() {
           </span>
         </div>
 
+        {/* Navigation Tabs */}
         <nav className="nav-tabs">
           <button
             className={activeTab === 'pos' ? 'active-tab' : ''}
@@ -403,6 +513,7 @@ export default function App() {
           </button>
         </nav>
 
+        {/* User Account Info */}
         <div className="user-profile-header">
           <div>
             <div className="user-email">{session.user.email}</div>
@@ -502,6 +613,7 @@ export default function App() {
                   <h3>Current Cart ({saleType.toUpperCase()})</h3>
                 </div>
 
+                {/* Customer Details Form */}
                 <div className="customer-info-section">
                   <h4>Customer Information</h4>
                   <div className="customer-input-row">
@@ -627,7 +739,7 @@ export default function App() {
         </div>
       )}
 
-      {/* PRINTABLE RECEIPT MODAL */}
+      {/* PRINTABLE RECEIPT & SALE COMPLETION MODAL */}
       {showReceiptModal && saleSuccessData && (
         <div className="receipt-container">
           <div className="receipt-card">
