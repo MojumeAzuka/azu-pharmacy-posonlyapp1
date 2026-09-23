@@ -281,7 +281,7 @@ export default function App() {
 
   const cartTotal = cart.reduce((sum, item) => sum + (item.activePrice || 0) * item.quantity, 0);
 
-  // Complete Sale Logic with Direct Cloud Sync + Local Fallback
+  // Complete Sale Logic inside atomic Dexie transaction with Direct Cloud Sync + Local Fallback
   const handleCheckout = async () => {
     if (cart.length === 0) return;
 
@@ -300,36 +300,41 @@ export default function App() {
         synced: 0
       };
 
-      // 1. Deduct stock locally in Dexie & sync to Supabase
-      for (const item of cart) {
-        if (item.id) {
-          const drugKey = String(item.id);
-          const existingDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
-          
-          if (existingDrug) {
-            const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
-            await db.drugs.update(existingDrug.id, { stock: newStock });
+      // Execute Dexie Local Storage Updates within an Atomic Read-Write Transaction
+      await db.transaction('rw', db.drugs, db.sales, async () => {
+        for (const item of cart) {
+          if (item.id) {
+            const drugKey = String(item.id);
+            const existingDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+            
+            if (existingDrug) {
+              const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
+              await db.drugs.update(existingDrug.id, { stock: newStock });
+            }
+          }
+        }
+        await db.sales.add(saleData);
+      });
 
-            // Sync stock deduction to Supabase if online
-            if (isOnline) {
+      // Sync stock deductions and sale record to Supabase if online
+      if (isOnline) {
+        for (const item of cart) {
+          if (item.id) {
+            const drugKey = String(item.id);
+            const updatedDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+            if (updatedDrug) {
               try {
                 await supabase
                   .from('drugs')
-                  .update({ stock: newStock })
-                  .eq('id', existingDrug.id);
+                  .update({ stock: updatedDrug.stock })
+                  .eq('id', updatedDrug.id);
               } catch (cloudErr) {
                 console.warn(`Stock update postponed for ${item.name}:`, cloudErr.message);
               }
             }
           }
         }
-      }
 
-      // 2. Save sale record locally in Dexie
-      await db.sales.add(saleData);
-
-      // 3. Direct Cloud Push if Online
-      if (isOnline) {
         const supabasePayload = {
           id: saleData.id,
           total: saleData.total,
@@ -352,11 +357,11 @@ export default function App() {
         }
       }
 
-      // 4. Launch printable receipt on screen
+      // Launch printable receipt on screen
       setSaleSuccessData(saleData);
       setShowReceiptModal(true);
 
-      // 5. Reset cart and inputs
+      // Reset cart and inputs
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
@@ -501,175 +506,179 @@ export default function App() {
   // ------------------- MAIN POS APP SCREEN -------------------
   return (
     <div className="app-container">
+      {/* REFACTORED COMPACT HEADER */}
       <header className="header no-print">
-        <div>
+        {/* Top Row: User Account Info & Logout */}
+        <div className="user-profile-header">
+          <div className="user-info-group">
+            <span className="user-email">{session?.user?.email}</span>
+            <span className="user-role-badge">{userRole.toUpperCase()} ACCOUNT</span>
+          </div>
+          <button className="logout-btn" onClick={handleLogout}>Sign Out</button>
+        </div>
+
+        {/* Middle Row: App Title & Status */}
+        <div className="header-title-row">
           <h1>AZU PHARMACY POS</h1>
           <span className={`status-badge ${isOnline ? 'online' : 'offline'}`}>
             {isOnline ? '● Online' : '○ Offline'}
           </span>
         </div>
 
-        {/* Navigation Tabs */}
-        <nav className="nav-tabs">
-          <button
-            className={activeTab === 'pos' ? 'active-tab' : ''}
-            onClick={() => setActiveTab('pos')}
-          >
-            🛒 POS Terminal
-          </button>
-          <button
-            className={activeTab === 'history' ? 'active-tab' : ''}
-            onClick={() => setActiveTab('history')}
-          >
-            📋 Sales History
-          </button>
-        </nav>
-
-        {/* User Account Info */}
-        <div className="user-profile-header">
-          <div>
-            <div className="user-email">{session.user.email}</div>
-            <div className="user-role-badge">{userRole.toUpperCase()} ACCOUNT</div>
+        {/* Bottom Row: Compact Nav + Price Mode Toggle */}
+        <div className="controls-bar">
+          <div className="nav-tabs">
+            <button 
+              className={activeTab === 'pos' ? 'active-tab' : ''} 
+              onClick={() => setActiveTab('pos')}
+            >
+              🛒 POS Terminal
+            </button>
+            <button 
+              className={activeTab === 'history' ? 'active-tab' : ''} 
+              onClick={() => setActiveTab('history')}
+            >
+              📋 Sales History
+            </button>
           </div>
-          <button className="logout-btn" onClick={handleLogout}>Sign Out</button>
+
+          {activeTab === 'pos' && (
+            <div className="price-mode-toggle">
+              <button 
+                className={saleType === 'retail' ? 'active' : ''} 
+                onClick={() => handleSaleTypeChange('retail')}
+              >
+                🛒 Retail
+              </button>
+              <button 
+                className={saleType === 'wholesale' ? 'active' : ''} 
+                onClick={() => handleSaleTypeChange('wholesale')}
+              >
+                📦 Wholesale
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
       {/* POS TERMINAL TAB */}
       {activeTab === 'pos' && (
-        <>
-          <div className="price-mode-toggle no-print">
-            <button
-              className={saleType === 'retail' ? 'active' : ''}
-              onClick={() => handleSaleTypeChange('retail')}
-            >
-              🛒 Retail Price
-            </button>
-            <button
-              className={saleType === 'wholesale' ? 'active' : ''}
-              onClick={() => handleSaleTypeChange('wholesale')}
-            >
-              📦 Wholesale Price
-            </button>
-          </div>
-
-          <div className="pos-screen no-print">
-            <div className="search-row">
-              <input
-                type="text"
-                className="search-input"
-                placeholder="Search drug name or barcode..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                autoFocus
-              />
-              {userRole === 'manager' && (
-                <button className="add-drug-btn" onClick={handleOpenAddModal}>
-                  + Add Drug
-                </button>
-              )}
-            </div>
-
-            <div className="drug-list">
-              {drugs && drugs.length > 0 ? (
-                drugs.map((drug) => {
-                  const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
-                  const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
-                  const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
-                  const unit = drug.unitType || drug.unit_type || 'Sachet';
-
-                  return (
-                    <div key={drug.id} className="drug-card" onClick={() => addToCart(drug)}>
-                      <div className="drug-info">
-                        <div className="drug-name">{drug.name}</div>
-                        <div className="tags-row">
-                          <span className="unit-tag">{unit}</span>
-                          <span className={`stock-tag ${drug.stock < 10 ? 'low-stock' : ''}`}>
-                            Stock: {drug.stock}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="price-stack">
-                        {userRole === 'manager' && (
-                          <div className="price-item cost-price">
-                            <small>Cost:</small> ₦{cost.toLocaleString()}
-                          </div>
-                        )}
-                        <div className={`price-item ${saleType === 'retail' ? 'highlight' : ''}`}>
-                          <small>Retail:</small> ₦{retail.toLocaleString()}
-                        </div>
-                        <div className={`price-item ${saleType === 'wholesale' ? 'highlight' : ''}`}>
-                          <small>Wholesale:</small> ₦{wholesale.toLocaleString()}
-                        </div>
-
-                        {userRole === 'manager' && (
-                          <div className="manager-actions">
-                            <button onClick={(e) => handleOpenEditModal(drug, e)}>✏️ Edit</button>
-                            <button onClick={(e) => handleDeleteDrug(drug.id, e)} className="del-btn">🗑️</button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="empty-state">No drugs found.</div>
-              )}
-            </div>
-
-            {/* Cart & Customer Drawer */}
-            {cart.length > 0 && (
-              <div className="cart-drawer">
-                <div className="cart-header">
-                  <h3>Current Cart ({saleType.toUpperCase()})</h3>
-                </div>
-
-                {/* Customer Details Form */}
-                <div className="customer-info-section">
-                  <h4>Customer Information</h4>
-                  <div className="customer-input-row">
-                    <input
-                      type="text"
-                      placeholder="Customer Name (Optional)"
-                      value={customerName}
-                      onChange={(e) => setCustomerName(e.target.value)}
-                    />
-                    <input
-                      type="tel"
-                      placeholder="Phone Number (Optional)"
-                      value={customerPhone}
-                      onChange={(e) => setCustomerPhone(e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <div className="cart-items-list">
-                  {cart.map((item) => (
-                    <div key={item.id} className="cart-item">
-                      <div>
-                        <strong>{item.name}</strong>
-                        <div className="unit-price">
-                          ₦{(item.activePrice || 0).toLocaleString()} per {item.unitType || item.unit_type}
-                        </div>
-                      </div>
-                      <div className="qty-controls">
-                        <button onClick={() => updateQuantity(item.id, -1)}>-</button>
-                        <span>{item.quantity}</span>
-                        <button onClick={() => updateQuantity(item.id, 1)}>+</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="cart-summary">
-                  <div>Total: <strong>₦{cartTotal.toLocaleString()}</strong></div>
-                  <button className="checkout-btn" onClick={handleCheckout}>Complete Sale</button>
-                </div>
-              </div>
+        <div className="pos-screen no-print">
+          <div className="search-row">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search drug name or barcode..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              autoFocus
+            />
+            {userRole === 'manager' && (
+              <button className="add-drug-btn" onClick={handleOpenAddModal}>
+                + Add Drug
+              </button>
             )}
           </div>
-        </>
+
+          <div className="drug-list">
+            {drugs && drugs.length > 0 ? (
+              drugs.map((drug) => {
+                const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
+                const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
+                const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
+                const unit = drug.unitType || drug.unit_type || 'Sachet';
+
+                return (
+                  <div key={drug.id} className="drug-card" onClick={() => addToCart(drug)}>
+                    <div className="drug-info">
+                      <div className="drug-name">{drug.name}</div>
+                      <div className="tags-row">
+                        <span className="unit-tag">{unit}</span>
+                        <span className={`stock-tag ${drug.stock < 10 ? 'low-stock' : ''}`}>
+                          Stock: {drug.stock}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="price-stack">
+                      {userRole === 'manager' && (
+                        <div className="price-item cost-price">
+                          <small>Cost:</small> ₦{cost.toLocaleString()}
+                        </div>
+                      )}
+                      <div className={`price-item ${saleType === 'retail' ? 'highlight' : ''}`}>
+                        <small>Retail:</small> ₦{retail.toLocaleString()}
+                      </div>
+                      <div className={`price-item ${saleType === 'wholesale' ? 'highlight' : ''}`}>
+                        <small>Wholesale:</small> ₦{wholesale.toLocaleString()}
+                      </div>
+
+                      {userRole === 'manager' && (
+                        <div className="manager-actions">
+                          <button onClick={(e) => handleOpenEditModal(drug, e)}>✏️ Edit</button>
+                          <button onClick={(e) => handleDeleteDrug(drug.id, e)} className="del-btn">🗑️</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="empty-state">No drugs found.</div>
+            )}
+          </div>
+
+          {/* Cart & Customer Drawer */}
+          {cart.length > 0 && (
+            <div className="cart-drawer">
+              <div className="cart-header">
+                <h3>Current Cart ({saleType.toUpperCase()})</h3>
+              </div>
+
+              {/* Customer Details Form */}
+              <div className="customer-info-section">
+                <h4>Customer Information</h4>
+                <div className="customer-input-row">
+                  <input
+                    type="text"
+                    placeholder="Customer Name (Optional)"
+                    value={customerName}
+                    onChange={(e) => setCustomerName(e.target.value)}
+                  />
+                  <input
+                    type="tel"
+                    placeholder="Phone Number (Optional)"
+                    value={customerPhone}
+                    onChange={(e) => setCustomerPhone(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="cart-items-list">
+                {cart.map((item) => (
+                  <div key={item.id} className="cart-item">
+                    <div>
+                      <strong>{item.name}</strong>
+                      <div className="unit-price">
+                        ₦{(item.activePrice || 0).toLocaleString()} per {item.unitType || item.unit_type}
+                      </div>
+                    </div>
+                    <div className="qty-controls">
+                      <button onClick={() => updateQuantity(item.id, -1)}>-</button>
+                      <span>{item.quantity}</span>
+                      <button onClick={() => updateQuantity(item.id, 1)}>+</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="cart-summary">
+                <div>Total: <strong>₦{cartTotal.toLocaleString()}</strong></div>
+                <button className="checkout-btn" onClick={handleCheckout}>Complete Sale</button>
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       {/* SALES HISTORY TAB */}
@@ -723,7 +732,7 @@ export default function App() {
 
                   <div className="sale-items-table">
                     {sale.items && sale.items.map((item, idx) => (
-                      <div key={idx} className="sale-item-row">
+                      <div key={item.id || idx} className="sale-item-row">
                         <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
                         <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
                       </div>
@@ -766,7 +775,7 @@ export default function App() {
             <hr />
             <div className="receipt-items">
               {saleSuccessData.items.map((item, index) => (
-                <div key={index} className="receipt-item-row">
+                <div key={item.id || index} className="receipt-item-row">
                   <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
                   <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
                 </div>
