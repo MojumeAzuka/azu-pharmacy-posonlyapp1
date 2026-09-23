@@ -166,13 +166,18 @@ export default function App() {
     }
   }, [activeTab, isOnline]);
 
-  // Live Query for Drugs Inventory
+  // Live Query for Drugs Inventory with Barcode & Safe Name Matching
   const drugs = useLiveQuery(async () => {
     if (!searchTerm.trim()) {
       return db.drugs.toArray();
     }
+    const term = searchTerm.toLowerCase().trim();
     return db.drugs
-      .filter((drug) => drug.name.toLowerCase().includes(searchTerm.toLowerCase()))
+      .filter((drug) => {
+        const nameMatch = drug.name?.toLowerCase().includes(term);
+        const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
+        return Boolean(nameMatch || barcodeMatch);
+      })
       .toArray();
   }, [searchTerm]);
 
@@ -233,7 +238,7 @@ export default function App() {
     const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
     const activePrice = saleType === 'wholesale' ? wholesale : retail;
 
-    const existingIndex = cart.findIndex((item) => item.id === drug.id);
+    const existingIndex = cart.findIndex((item) => String(item.id) === String(drug.id));
 
     if (existingIndex > -1) {
       const updated = [...cart];
@@ -264,7 +269,7 @@ export default function App() {
     setCart(
       cart
         .map((item) => {
-          if (item.id === id) {
+          if (String(item.id) === String(id)) {
             const newQty = item.quantity + delta;
             return newQty > 0 ? { ...item, quantity: newQty } : null;
           }
@@ -274,7 +279,7 @@ export default function App() {
     );
   };
 
-  const cartTotal = cart.reduce((sum, item) => sum + item.activePrice * item.quantity, 0);
+  const cartTotal = cart.reduce((sum, item) => sum + (item.activePrice || 0) * item.quantity, 0);
 
   // Complete Sale Logic with Direct Cloud Sync + Local Fallback
   const handleCheckout = async () => {
@@ -295,21 +300,26 @@ export default function App() {
         synced: 0
       };
 
-      // 1. Deduct stock locally in Dexie
+      // 1. Deduct stock locally in Dexie & sync to Supabase
       for (const item of cart) {
         if (item.id) {
-          const existingDrug = await db.drugs.get(String(item.id));
+          const drugKey = String(item.id);
+          const existingDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+          
           if (existingDrug) {
             const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
-            await db.drugs.update(String(item.id), { stock: newStock });
+            await db.drugs.update(existingDrug.id, { stock: newStock });
 
             // Sync stock deduction to Supabase if online
             if (isOnline) {
-              supabase
-                .from('drugs')
-                .update({ stock: newStock })
-                .eq('id', String(item.id))
-                .then();
+              try {
+                await supabase
+                  .from('drugs')
+                  .update({ stock: newStock })
+                  .eq('id', existingDrug.id);
+              } catch (cloudErr) {
+                console.warn(`Stock update postponed for ${item.name}:`, cloudErr.message);
+              }
             }
           }
         }
@@ -375,7 +385,7 @@ export default function App() {
     e.stopPropagation();
     setEditingDrug(drug);
     setFormData({
-      name: drug.name,
+      name: drug.name || '',
       unitType: drug.unitType || drug.unit_type || 'Sachet',
       costPrice: drug.costPrice ?? drug.cost_price ?? '',
       retailPrice: drug.retailPrice ?? drug.retail_price ?? '',
@@ -389,9 +399,11 @@ export default function App() {
   const handleDeleteDrug = async (id, e) => {
     e.stopPropagation();
     if (window.confirm('Are you sure you want to delete this drug from inventory?')) {
-      await db.drugs.delete(String(id));
+      const drugKey = String(id);
+      await db.drugs.delete(drugKey);
+      await db.drugs.delete(Number(id)); // Safe fallback if stored as number
       if (isOnline) {
-        await supabase.from('drugs').delete().eq('id', String(id));
+        await supabase.from('drugs').delete().eq('id', drugKey);
       }
     }
   };
@@ -411,7 +423,7 @@ export default function App() {
     };
 
     if (editingDrug) {
-      await db.drugs.update(drugId, drugPayload);
+      await db.drugs.update(editingDrug.id, drugPayload);
     } else {
       await db.drugs.add(drugPayload);
     }
@@ -638,7 +650,7 @@ export default function App() {
                       <div>
                         <strong>{item.name}</strong>
                         <div className="unit-price">
-                          ₦{item.activePrice.toLocaleString()} per {item.unitType || item.unit_type}
+                          ₦{(item.activePrice || 0).toLocaleString()} per {item.unitType || item.unit_type}
                         </div>
                       </div>
                       <div className="qty-controls">
@@ -713,7 +725,7 @@ export default function App() {
                     {sale.items && sale.items.map((item, idx) => (
                       <div key={idx} className="sale-item-row">
                         <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
-                        <span>₦{(item.activePrice * item.quantity).toLocaleString()}</span>
+                        <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
                       </div>
                     ))}
                   </div>
@@ -756,7 +768,7 @@ export default function App() {
               {saleSuccessData.items.map((item, index) => (
                 <div key={index} className="receipt-item-row">
                   <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
-                  <span>₦{(item.activePrice * item.quantity).toLocaleString()}</span>
+                  <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
                 </div>
               ))}
             </div>
