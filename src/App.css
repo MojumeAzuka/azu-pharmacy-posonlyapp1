@@ -1,4 +1,7 @@
-/* Global Reset & Mobile Viewport Safeguards */
+/* ============================================================
+   GLOBAL RESET
+   ============================================================ */
+
 * {
   box-sizing: border-box;
 }
@@ -8,18 +11,40 @@ body {
   margin: 0;
   padding: 0;
   width: 100%;
+  min-width: 0;
 }
 
 body {
-  display: block; /* neutralises Vite's default "display:flex; place-items:center" */
+  display: block;
+
   min-width: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    sans-serif;
+
   background-color: #f8fafc;
   color: #0f172a;
+
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Neutralise Vite's default #root styling (max-width 1280px, padding 2rem, centered text) */
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
 #root {
   max-width: none;
   width: 100%;
@@ -28,351 +53,664 @@ body {
   text-align: left;
 }
 
-/* BASE CONTAINER LAYOUT */
+/* ============================================================
+   BASE APP CONTAINER
+   ============================================================ */
+
 .app-container {
   width: 100%;
   max-width: 1440px;
+
   margin: 0 auto;
-  padding: 0.5rem;
+  padding: 5px;
+
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+
+  gap: 5px;
+
   min-height: 100vh;
+
+  min-width: 0;
 }
 
-/* Login Screen Styles */
+/* ============================================================
+   LOGIN
+   ============================================================ */
+
 .login-container {
   display: flex;
   justify-content: center;
   align-items: center;
+
   min-height: 100vh;
+
   padding: 16px;
+
   background: #f1f5f9;
 }
 
 .login-card {
   background: #ffffff;
+
   padding: 24px 20px;
+
   border-radius: 12px;
+
   width: 100%;
   max-width: 360px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.08);
 }
 
 .login-card h2 {
   margin: 0 0 6px 0;
+
   font-size: 1.25rem;
 }
 
 .login-card p {
   margin: 0 0 16px 0;
+
   color: #64748b;
+
   font-size: 0.85rem;
 }
 
 .login-card form {
   display: flex;
   flex-direction: column;
+
   gap: 10px;
 }
 
 .login-card label {
   font-size: 0.8rem;
+
   font-weight: 600;
+
   color: #334155;
 }
 
 .login-card input {
   padding: 10px;
+
   border: 1px solid #cbd5e1;
   border-radius: 6px;
+
   font-size: 0.95rem;
+
   width: 100%;
+}
+
+.password-field {
+  position: relative;
+
+  display: flex;
+  align-items: center;
+
+  width: 100%;
+}
+
+.password-field input {
+  padding-right: 3.5rem;
+}
+
+.password-toggle {
+  position: absolute;
+
+  right: 8px;
+
+  background: none;
+  border: none;
+
+  cursor: pointer;
+
+  font-size: 0.72rem;
+
+  font-weight: 700;
+
+  color: #64748b;
 }
 
 .login-btn {
   background: #2563eb;
+
   color: #ffffff;
+
   border: none;
+
   padding: 12px;
+
   border-radius: 6px;
+
   font-weight: 600;
+
   margin-top: 8px;
+
   cursor: pointer;
+
   font-size: 0.95rem;
 }
 
 .auth-error {
   background: #fee2e2;
+
   color: #dc2626;
+
   padding: 8px;
+
   border-radius: 6px;
+
   font-size: 0.85rem;
+
   margin-bottom: 12px;
 }
 
-/* HEADER (compact on mobile, single row on desktop) */
+/* ============================================================
+   HEADER
+   ============================================================ */
+
 .header {
   position: sticky;
+
   top: 0;
-  z-index: 900; /* above page content, below the cart drawer (1000) and modals (2000) */
+
+  z-index: 900;
+
   background: #ffffff;
+
   border-radius: 8px;
-  padding: 8px 10px;
+
+  padding: 7px 10px;
+
   border: 1px solid #e2e8f0;
-  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+
+  box-shadow:
+    0 2px 8px rgba(15, 23, 42, 0.08);
+
   display: flex;
   flex-direction: column;
-  gap: 6px;
+
+  gap: 5px;
+
+  min-width: 0;
 }
 
 .user-profile-header {
   display: flex;
+
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 6px;
-  border-bottom: 1px dashed #e2e8f0;
+
+  gap: 6px;
+
+  min-width: 0;
+
+  padding-bottom: 5px;
+
+  border-bottom:
+    1px dashed #e2e8f0;
 }
 
 .user-info-group {
   display: flex;
+
   align-items: center;
-  gap: 6px;
+
+  gap: 5px;
+
   min-width: 0;
+
+  overflow: hidden;
 }
 
 .user-email {
-  font-size: 0.75rem;
+  min-width: 0;
+
+  font-size: 0.72rem;
+
   font-weight: 600;
+
   color: #334155;
+
   overflow: hidden;
+
   text-overflow: ellipsis;
+
   white-space: nowrap;
 }
 
 .user-role-badge {
-  font-size: 0.65rem;
+  flex-shrink: 0;
+
+  font-size: 0.6rem;
+
   color: #0369a1;
+
   font-weight: 700;
+
   background: #e0f2fe;
+
   padding: 1px 5px;
+
   border-radius: 4px;
+
   white-space: nowrap;
 }
 
 .logout-btn {
+  flex-shrink: 0;
+
   background: #fee2e2;
+
   color: #dc2626;
+
   border: 1px solid #fca5a5;
-  padding: 3px 8px;
+
+  padding: 3px 7px;
+
   border-radius: 4px;
-  font-size: 0.7rem;
+
+  font-size: 0.68rem;
+
   font-weight: 600;
+
   cursor: pointer;
+
   white-space: nowrap;
 }
 
+/* ============================================================
+   TITLE / STATUS
+   ============================================================ */
+
 .header-title-row {
   display: flex;
+
   justify-content: space-between;
   align-items: center;
-  gap: 8px;
+
+  gap: 6px;
+
+  min-width: 0;
 }
 
 .header-title-row h1 {
-  font-size: 0.85rem;
+  min-width: 0;
+
   margin: 0;
+
+  font-size: 0.82rem;
+
+  line-height: 1.1;
+
   font-weight: 700;
+
   color: #1e293b;
+
+  overflow: hidden;
+
+  text-overflow: ellipsis;
+
+  white-space: nowrap;
 }
 
 .status-badge {
-  font-size: 0.7rem;
+  flex-shrink: 0;
+
+  font-size: 0.65rem;
+
   font-weight: 600;
-  padding: 1px 8px;
-  border-radius: 12px;
+
+  padding: 1px 7px;
+
+  border-radius: 10px;
+
   white-space: nowrap;
 }
 
 .status-badge.online {
   background: #dcfce7;
+
   color: #15803d;
 }
 
 .status-badge.offline {
   background: #fee2e2;
+
   color: #dc2626;
 }
 
+/* ============================================================
+   MAIN CONTROL BAR
+   ============================================================ */
+
 .controls-bar {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+
+  grid-template-columns:
+    minmax(0, 1.35fr)
+    minmax(0, 1fr)
+    auto;
+
   gap: 4px;
+
   width: 100%;
+
+  min-width: 0;
+
+  align-items: stretch;
 }
 
 .nav-tabs,
 .price-mode-toggle {
   display: flex;
-  gap: 4px;
-  flex: 1;
+
+  min-width: 0;
+
+  gap: 2px;
+
   background: #f1f5f9;
+
   padding: 2px;
+
   border-radius: 6px;
 }
 
 .nav-tabs button,
 .price-mode-toggle button {
   flex: 1;
+
+  min-width: 0;
+
   background: transparent;
+
   border: none;
+
   color: #475569;
-  padding: 5px 2px;
+
+  padding: 5px 3px;
+
   border-radius: 5px;
+
   cursor: pointer;
+
   font-weight: 600;
-  font-size: 0.72rem;
+
+  font-size: 0.7rem;
+
   text-align: center;
+
   white-space: nowrap;
-  transition: all 0.15s ease;
+
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .nav-tabs button.active-tab,
 .price-mode-toggle button.active {
   background: #ffffff;
+
   color: #0284c7;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.08);
 }
 
-/* POS TERMINAL & CATALOG LAYOUT */
-.pos-screen {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-}
-
-.pos-catalog-section {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  flex: 1;
-  min-width: 0; /* lets the grid column shrink instead of overflowing */
-}
-
-/* Search Row */
-.search-row {
-  display: flex;
-  gap: 6px;
-}
-
-.search-input {
-  flex: 1;
-  padding: 8px 10px;
-  font-size: 0.88rem;
-  border: 1.5px solid #cbd5e1;
-  border-radius: 6px;
-  width: 100%;
-  outline: none;
-  background: #ffffff;
-}
-
-.search-input:focus {
-  border-color: #0284c7;
-  box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15);
-}
+/* ============================================================
+   ADD DRUG
+   ============================================================ */
 
 .add-drug-btn {
-  flex: 1 1 100%; /* mobile: its own full-width row inside the button bar */
+  display: inline-flex;
+
+  align-items: center;
+
+  justify-content: center;
+
+  gap: 4px;
+
+  min-width: 72px;
+
   background: #059669;
+
   color: #ffffff;
+
   border: none;
+
   border-radius: 6px;
-  padding: 6px 12px;
-  font-weight: 600;
-  font-size: 0.75rem;
+
+  padding: 5px 9px;
+
+  font-weight: 700;
+
+  font-size: 0.7rem;
+
   cursor: pointer;
+
   white-space: nowrap;
+
+  transition:
+    background 0.15s ease;
 }
 
 .add-drug-btn:hover {
   background: #047857;
 }
 
-/* DRUG LIST — auto-fills as many columns as the available width allows */
-.drug-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 6px;
+.add-drug-icon {
+  font-size: 0.9rem;
+
+  line-height: 1;
 }
 
-/* Mobile: compact horizontal card (name left, prices right) */
+.add-drug-short {
+  display: none;
+}
+
+.add-drug-full {
+  display: inline;
+}
+
+/* ============================================================
+   SEARCH
+   ============================================================ */
+
+.search-row {
+  display: flex;
+
+  width: 100%;
+
+  min-width: 0;
+}
+
+.search-input {
+  width: 100%;
+
+  min-width: 0;
+
+  padding: 7px 9px;
+
+  font-size: 0.84rem;
+
+  border:
+    1.5px solid #cbd5e1;
+
+  border-radius: 6px;
+
+  outline: none;
+
+  background: #ffffff;
+}
+
+.search-input:focus {
+  border-color: #0284c7;
+
+  box-shadow:
+    0 0 0 3px
+    rgba(2, 132, 199, 0.15);
+}
+
+/* ============================================================
+   POS LAYOUT
+   ============================================================ */
+
+.pos-screen {
+  display: flex;
+
+  flex-direction: column;
+
+  gap: 0.6rem;
+
+  min-width: 0;
+}
+
+.pos-catalog-section {
+  display: flex;
+
+  flex-direction: column;
+
+  gap: 0.5rem;
+
+  flex: 1;
+
+  min-width: 0;
+}
+
+/* ============================================================
+   DRUG LIST
+   ============================================================ */
+
+.drug-list {
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fill,
+      minmax(260px, 1fr)
+    );
+
+  gap: 6px;
+
+  min-width: 0;
+}
+
 .drug-card {
   display: flex;
+
   flex-direction: row;
+
   justify-content: space-between;
+
   align-items: flex-start;
+
   padding: 8px 10px;
+
   background: #ffffff;
+
   border-radius: 6px;
+
   border: 1px solid #e2e8f0;
+
   cursor: pointer;
+
   gap: 6px;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+
+  min-width: 0;
+
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
 }
 
 .drug-card:hover {
   border-color: #0284c7;
-  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.08);
+
+  box-shadow:
+    0 4px 12px
+    rgba(2, 132, 199, 0.08);
 }
 
 .drug-info {
   display: flex;
+
   flex-direction: column;
+
   gap: 4px;
+
   flex: 1;
+
   min-width: 0;
 }
 
 .drug-name {
   font-weight: 700;
+
   font-size: 0.85rem;
+
   line-height: 1.2;
+
   color: #0f172a;
+
+  overflow-wrap: anywhere;
 }
 
 .tags-row {
   display: flex;
+
   flex-wrap: wrap;
+
   gap: 4px;
 }
 
 .unit-tag,
 .stock-tag {
   font-size: 0.65rem;
+
   background: #f1f5f9;
+
   color: #334155;
+
   padding: 1px 5px;
+
   border-radius: 4px;
+
   font-weight: 600;
 }
 
 .stock-tag {
   background: #fef3c7;
+
   color: #92400e;
 }
 
 .stock-tag.low-stock {
   background: #fee2e2;
+
   color: #991b1b;
 }
 
+/* ============================================================
+   DRUG PRICES
+   ============================================================ */
+
 .price-stack {
   text-align: right;
+
   font-size: 0.75rem;
+
   display: flex;
+
   flex-direction: column;
+
   gap: 1px;
+
   min-width: 90px;
+
+  flex-shrink: 0;
 }
 
 .price-item small {
@@ -381,151 +719,245 @@ body {
 
 .price-item.cost-price {
   color: #d97706;
+
   font-weight: 600;
 }
 
 .price-item.highlight {
   font-weight: 700;
+
   color: #0284c7;
+
   font-size: 0.82rem;
 }
 
 .manager-actions {
   display: flex;
+
   gap: 4px;
+
   margin-top: 4px;
+
   justify-content: flex-end;
 }
 
 .manager-actions button {
   background: #f1f5f9;
-  border: 1px solid #cbd5e1;
+
+  border:
+    1px solid #cbd5e1;
+
   border-radius: 4px;
+
   padding: 2px 6px;
+
   font-size: 0.68rem;
+
   cursor: pointer;
 }
 
 .manager-actions button.del-btn {
   background: #fee2e2;
+
   border-color: #fca5a5;
+
   color: #991b1b;
 }
 
-/* CART SIDEBAR & DRAWER RULES */
+/* ============================================================
+   CART
+   ============================================================ */
+
 .cart-sidebar-wrapper {
   width: 100%;
+
+  min-width: 0;
 }
 
 .cart-drawer {
   background: #ffffff;
+
   border-radius: 10px;
+
   padding: 0.85rem;
-  box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05);
+
+  box-shadow:
+    0 -2px 10px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05);
+
   border: 1px solid #e2e8f0;
+
   display: flex;
+
   flex-direction: column;
+
   gap: 0.6rem;
+
+  min-width: 0;
 }
 
 .cart-header {
   display: flex;
+
   justify-content: space-between;
+
   align-items: center;
+
+  gap: 8px;
 }
 
 .cart-header h3 {
   margin: 0;
+
   font-size: 1rem;
+
   color: #1e293b;
 }
 
 .clear-cart-btn {
   background: transparent;
+
   border: none;
+
   color: #ef4444;
+
   font-weight: 600;
+
   font-size: 0.78rem;
+
   cursor: pointer;
 }
 
 .customer-info-section {
   padding-bottom: 0.4rem;
-  border-bottom: 1px solid #f1f5f9;
+
+  border-bottom:
+    1px solid #f1f5f9;
 }
 
 .customer-input-row {
   display: flex;
+
   gap: 0.5rem;
 }
 
 .customer-input-row input {
   flex: 1;
+
   min-width: 0;
+
   padding: 0.4rem 0.6rem;
+
   font-size: 0.82rem;
-  border: 1px solid #cbd5e1;
+
+  border:
+    1px solid #cbd5e1;
+
   border-radius: 6px;
+
   background: #ffffff;
 }
 
-/* ACCESSIBLE SCROLLING ITEM CONTAINER */
+/* ============================================================
+   CART ITEMS
+   ============================================================ */
+
 .cart-items-list {
   max-height: 280px;
+
   min-height: 0;
+
   overflow-y: auto;
+
   display: flex;
+
   flex-direction: column;
+
   gap: 0.4rem;
+
   padding-right: 4px;
+
   scroll-behavior: smooth;
 }
 
 .cart-item {
   display: flex;
+
   align-items: center;
+
   justify-content: space-between;
+
+  gap: 8px;
+
   padding: 0.45rem 0.6rem;
+
   background: #f8fafc;
-  border: 1px solid #e2e8f0;
+
+  border:
+    1px solid #e2e8f0;
+
   border-radius: 6px;
+
   flex-shrink: 0;
 }
 
 .cart-item-info {
   display: flex;
+
   flex-direction: column;
+
+  min-width: 0;
 }
 
 .cart-item-name {
   font-size: 0.88rem;
+
   color: #0f172a;
+
   font-weight: 600;
+
+  overflow-wrap: anywhere;
 }
 
 .unit-price {
   font-size: 0.75rem;
+
   color: #64748b;
 }
 
 .qty-controls {
   display: flex;
+
   align-items: center;
+
   gap: 0.4rem;
+
+  flex-shrink: 0;
 }
 
 .qty-controls button {
   width: 26px;
+
   height: 26px;
+
   padding: 0;
+
   display: flex;
+
   align-items: center;
+
   justify-content: center;
+
   background: #0284c7;
+
   color: #ffffff;
+
   border: none;
+
   border-radius: 4px;
+
   font-weight: bold;
+
   cursor: pointer;
 }
 
@@ -535,38 +967,66 @@ body {
 
 .qty-controls span {
   font-size: 0.88rem;
+
   font-weight: 600;
+
   min-width: 18px;
+
   text-align: center;
 }
 
+/* ============================================================
+   CART SUMMARY
+   ============================================================ */
+
 .cart-summary {
   display: flex;
+
   flex-direction: column;
+
   gap: 0.5rem;
-  border-top: 2px solid #f1f5f9;
+
+  border-top:
+    2px solid #f1f5f9;
+
   padding-top: 0.6rem;
 }
 
 .total-display {
   display: flex;
+
   justify-content: space-between;
+
   align-items: center;
+
+  gap: 10px;
+
   font-size: 0.95rem;
+
   font-weight: 700;
+
   color: #0f172a;
 }
 
 .checkout-btn {
   background: #16a34a;
+
   color: #ffffff;
+
   border: none;
+
   padding: 0.65rem;
+
   border-radius: 6px;
+
   font-size: 0.9rem;
+
   font-weight: 700;
+
   cursor: pointer;
-  transition: background 0.2s ease;
+
+  transition:
+    background 0.2s ease;
 }
 
 .checkout-btn:hover {
@@ -575,31 +1035,53 @@ body {
 
 .empty-cart-message {
   color: #94a3b8;
+
   font-size: 0.82rem;
+
   text-align: center;
+
   padding: 1rem 0.5rem;
 }
 
 /* ============================================================
-   MOBILE (below 768px): cart is a fixed drawer at the bottom
+   MOBILE CART
    ============================================================ */
+
 @media (max-width: 767px) {
+
   .cart-sidebar-wrapper {
     position: fixed;
+
     left: 0;
     right: 0;
     bottom: 0;
+
     z-index: 1000;
   }
 
   .cart-drawer {
     width: 100%;
+
     max-height: 70vh;
+
     overflow: hidden;
+
     gap: 0.5rem;
-    padding: 0.7rem 0.75rem;
-    padding-bottom: calc(0.7rem + env(safe-area-inset-bottom));
-    border-radius: 12px 12px 0 0;
+
+    padding:
+      0.65rem 0.7rem;
+
+    padding-bottom:
+      calc(
+        0.65rem +
+        env(
+          safe-area-inset-bottom
+        )
+      );
+
+    border-radius:
+      12px 12px 0 0;
+
     border-bottom: none;
   }
 
@@ -607,251 +1089,579 @@ body {
     font-size: 0.85rem;
   }
 
-  /* 5-6 rows visible on most phones, then scroll */
   .cart-items-list {
-    max-height: min(280px, 32vh);
+    max-height:
+      min(280px, 32vh);
   }
 
   .cart-summary {
     flex-direction: row;
-    justify-content: space-between;
+
+    justify-content:
+      space-between;
+
     align-items: center;
+
     padding-top: 0.5rem;
   }
 
   .total-display {
     flex-direction: column;
+
     align-items: flex-start;
+
     gap: 0;
+
     font-size: 0.9rem;
   }
 
   .total-display span {
     font-size: 0.7rem;
+
     font-weight: 600;
+
     color: #64748b;
   }
 
   .checkout-btn {
-    padding: 0.6rem 1.1rem;
+    padding:
+      0.6rem 1.1rem;
+
     font-size: 0.85rem;
   }
 
   .empty-cart-message {
-    padding: 0.4rem 0.5rem;
+    padding:
+      0.4rem 0.5rem;
+
     font-size: 0.75rem;
   }
 
-  /* Clearance so the last drug cards are never hidden behind the drawer */
+  /*
+    These values are intentionally smaller than
+    the original 470px clearance.
+  */
+
   .pos-screen.cart-empty {
-    padding-bottom: 110px;
+    padding-bottom: 100px;
   }
 
   .pos-screen.cart-active {
-    padding-bottom: 470px;
+    padding-bottom: 390px;
   }
 }
 
 /* ============================================================
-   TABLET & DESKTOP (768px and up): split view, cart on the right
+   SMALL MOBILE — iPHONE SE / NARROW PHONES
    ============================================================ */
-@media (min-width: 768px) {
+
+@media (max-width: 480px) {
+
   .app-container {
-    padding: 0.75rem;
-    gap: 0.75rem;
+    padding: 3px;
+
+    gap: 4px;
+  }
+
+  .header {
+    padding: 5px 6px;
+
+    gap: 4px;
+
+    border-radius: 6px;
+  }
+
+  .user-profile-header {
+    padding-bottom: 3px;
+  }
+
+  .user-email {
+    font-size: 0.64rem;
+  }
+
+  .user-role-badge {
+    font-size: 0.52rem;
+
+    padding:
+      1px 4px;
+  }
+
+  .logout-btn {
+    padding:
+      2px 6px;
+
+    font-size: 0.6rem;
+  }
+
+  .header-title-row h1 {
+    font-size: 0.72rem;
+  }
+
+  .status-badge {
+    font-size: 0.58rem;
+
+    padding:
+      1px 5px;
+  }
+
+  /*
+    Compact single-row controls:
+
+    POS/History | Retail/Wholesale | +Drug
+  */
+
+  .controls-bar {
+    grid-template-columns:
+      minmax(0, 1.45fr)
+      minmax(0, 1fr)
+      auto;
+
+    gap: 3px;
+  }
+
+  .nav-tabs,
+  .price-mode-toggle {
+    gap: 1px;
+
+    padding: 1px;
+  }
+
+  .nav-tabs button,
+  .price-mode-toggle button {
+    padding:
+      4px 2px;
+
+    font-size: 0.6rem;
+  }
+
+  .add-drug-btn {
+    min-width: 42px;
+
+    padding:
+      4px 6px;
+
+    font-size: 0.6rem;
+  }
+
+  .add-drug-full {
+    display: none;
+  }
+
+  .add-drug-short {
+    display: inline;
+  }
+
+  .add-drug-icon {
+    font-size: 0.8rem;
+  }
+
+  .search-input {
+    padding:
+      6px 8px;
+
+    font-size: 0.78rem;
+  }
+
+  /*
+    Make drug cards slightly tighter.
+  */
+
+  .drug-list {
+    grid-template-columns: 1fr;
+
+    gap: 4px;
+  }
+
+  .drug-card {
+    padding:
+      7px 8px;
+
+    gap: 5px;
+  }
+
+  .drug-name {
+    font-size: 0.78rem;
+  }
+
+  .unit-tag,
+  .stock-tag {
+    font-size: 0.58rem;
+  }
+
+  .price-stack {
+    min-width: 82px;
+
+    font-size: 0.68rem;
+  }
+
+  .price-item.highlight {
+    font-size: 0.74rem;
+  }
+
+  .manager-actions button {
+    padding:
+      2px 5px;
+
+    font-size: 0.6rem;
+  }
+
+  .customer-input-row {
+    flex-direction: column;
+
+    gap: 4px;
+  }
+
+  .customer-input-row input {
+    font-size: 0.76rem;
+
+    padding:
+      0.38rem 0.5rem;
+  }
+
+  .cart-item-name {
+    font-size: 0.78rem;
+  }
+
+  .unit-price {
+    font-size: 0.67rem;
+  }
+
+  .qty-controls {
+    gap: 0.25rem;
+  }
+
+  .qty-controls button {
+    width: 25px;
+
+    height: 25px;
+  }
+}
+
+/* ============================================================
+   TABLET + DESKTOP
+   ============================================================ */
+
+@media (min-width: 768px) {
+
+  .app-container {
+    padding: 8px;
+
+    gap: 8px;
   }
 
   .pos-screen {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 340px;
-    align-items: start;
-    gap: 1rem;
-  }
 
-  .add-drug-btn {
-    flex: 0 0 auto;
-    padding: 5px 14px;
+    grid-template-columns:
+      minmax(0, 1fr)
+      340px;
+
+    align-items: start;
+
+    gap: 12px;
   }
 
   .cart-sidebar-wrapper {
     position: sticky;
-    top: 9.5rem; /* sits just below the sticky header */
+
+    top: 8px;
   }
 
   .cart-items-list {
-    max-height: max(200px, calc(100vh - 480px)); /* scales with the monitor height */
+    max-height:
+      calc(100vh - 430px);
   }
 
-  /* Desktop cards stack the prices under the name */
+  /*
+    Keep drug cards horizontal on desktop.
+    This is more efficient for a POS.
+  */
+
   .drug-card {
-    flex-direction: column;
-    justify-content: space-between;
-    gap: 6px;
+    flex-direction: row;
+
+    align-items: flex-start;
   }
 
   .price-stack {
     text-align: right;
-    font-size: 0.78rem;
-    border-top: 1px dashed #f1f5f9;
-    padding-top: 0.4rem;
-    min-width: 0;
-  }
 
-  .drug-name {
-    font-size: 0.88rem;
+    border-top: none;
+
+    padding-top: 0;
+
+    min-width: 100px;
   }
 }
 
+/* ============================================================
+   DESKTOP
+   ============================================================ */
+
 @media (min-width: 1024px) {
-  .pos-screen {
-    grid-template-columns: minmax(0, 1fr) 380px;
-    gap: 1.25rem;
-  }
 
   .header {
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1.25rem;
-  }
+    display: grid;
 
-  .search-row {
-    order: 4;
-    flex: 1 1 100%;
+    grid-template-columns:
+      auto
+      minmax(0, 1fr)
+      auto;
+
+    grid-template-areas:
+      "title controls user"
+      "search search search";
+
+    column-gap: 12px;
+
+    row-gap: 6px;
+
+    align-items: center;
+
+    padding:
+      7px 10px;
   }
 
   .header-title-row {
-    order: 1;
-    gap: 1rem;
-  }
-
-  .header-title-row h1 {
-    font-size: 1rem;
+    grid-area: title;
   }
 
   .controls-bar {
-    order: 2;
-    width: auto;
-    min-width: 420px;
+    grid-area: controls;
+
+    width: 100%;
+
+    min-width: 0;
+
+    grid-template-columns:
+      minmax(180px, 1.4fr)
+      minmax(150px, 1fr)
+      auto;
   }
 
   .user-profile-header {
-    order: 3;
-    gap: 1rem;
+    grid-area: user;
+
     border-bottom: none;
+
     padding-bottom: 0;
+
+    white-space: nowrap;
+  }
+
+  .search-row {
+    grid-area: search;
+  }
+
+  .header-title-row h1 {
+    font-size: 0.9rem;
+  }
+
+  .nav-tabs button,
+  .price-mode-toggle button {
+    font-size: 0.68rem;
+
+    padding:
+      5px 7px;
+  }
+
+  .add-drug-btn {
+    padding:
+      5px 10px;
   }
 }
 
-/* MODAL OVERLAY & RESPONSIVE CARDS */
+/* ============================================================
+   LARGE DESKTOP
+   ============================================================ */
+
+@media (min-width: 1200px) {
+
+  .pos-screen {
+    grid-template-columns:
+      minmax(0, 1fr)
+      380px;
+  }
+
+  .header {
+    padding:
+      8px 12px;
+  }
+
+  .header-title-row h1 {
+    font-size: 0.95rem;
+  }
+}
+
+/* ============================================================
+   MODALS
+   ============================================================ */
+
 .modal-overlay,
 .receipt-container {
   position: fixed;
+
   top: 0;
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(15, 23, 42, 0.6);
+
+  background:
+    rgba(15, 23, 42, 0.6);
+
   display: flex;
+
   align-items: center;
+
   justify-content: center;
+
   z-index: 2000;
+
   padding: 12px;
 }
 
 .modal-card {
   background: #ffffff;
+
   border-radius: 12px;
+
   padding: 16px;
+
   width: 100%;
+
   max-width: 420px;
+
   max-height: 90vh;
+
   overflow-y: auto;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+
+  box-shadow:
+    0 4px 20px
+    rgba(0, 0, 0, 0.15);
 }
 
 .modal-card h3 {
   margin-top: 0;
+
   font-size: 1.05rem;
 }
 
 .crud-form {
   display: flex;
+
   flex-direction: column;
+
   gap: 8px;
 }
 
 .crud-form label {
   font-size: 0.75rem;
+
   font-weight: 600;
+
   color: #475569;
 }
 
 .crud-form input,
 .crud-form select {
   padding: 7px;
-  border: 1px solid #cbd5e1;
+
+  border:
+    1px solid #cbd5e1;
+
   border-radius: 6px;
+
   width: 100%;
+
   font-size: 0.85rem;
 }
 
 .form-row {
   display: flex;
+
   gap: 8px;
 }
 
 .form-row > div {
   flex: 1;
+
+  min-width: 0;
 }
 
 .modal-actions {
   display: flex;
+
   gap: 8px;
+
   margin-top: 10px;
 }
 
 .save-btn {
   flex: 1;
+
   background: #059669;
+
   color: #ffffff;
+
   border: none;
+
   padding: 8px;
+
   border-radius: 6px;
+
   font-weight: 600;
+
   cursor: pointer;
 }
 
 .cancel-btn {
   flex: 1;
+
   background: #e2e8f0;
+
   color: #334155;
+
   border: none;
+
   padding: 8px;
+
   border-radius: 6px;
+
   font-weight: 600;
+
   cursor: pointer;
 }
 
-/* Printable Receipt Modal */
+/* ============================================================
+   RECEIPT
+   ============================================================ */
+
 .receipt-card {
   background: #ffffff;
+
   padding: 14px;
+
   border-radius: 8px;
+
   width: 100%;
+
   max-width: 340px;
+
   max-height: 90vh;
+
   overflow-y: auto;
 }
 
 .receipt-header {
   text-align: center;
+
   font-size: 0.75rem;
 }
 
 .receipt-header h2 {
-  margin: 0 0 4px 0;
+  margin:
+    0 0 4px 0;
+
   font-size: 1rem;
 }
 
@@ -865,134 +1675,231 @@ body {
 
 .receipt-item-row {
   display: flex;
+
   justify-content: space-between;
+
+  gap: 8px;
+
   font-size: 0.8rem;
+
   margin: 3px 0;
+}
+
+.receipt-item-row span:first-child {
+  min-width: 0;
+
+  overflow-wrap: anywhere;
+}
+
+.receipt-item-row span:last-child {
+  flex-shrink: 0;
 }
 
 .receipt-total {
   display: flex;
+
   justify-content: space-between;
+
+  gap: 8px;
+
   font-size: 0.88rem;
+
   margin-top: 6px;
+
   font-weight: 700;
 }
 
 .receipt-footer {
   text-align: center;
+
   font-size: 0.7rem;
+
   margin-top: 8px;
+
   color: #64748b;
 }
 
 .receipt-actions {
   display: flex;
+
   gap: 6px;
+
   margin-top: 10px;
 }
 
 .print-btn {
   flex: 1;
+
   background: #2563eb;
+
   color: #ffffff;
+
   border: none;
+
   padding: 8px;
+
   border-radius: 6px;
+
   font-weight: 600;
+
   font-size: 0.8rem;
+
   cursor: pointer;
 }
 
 .close-btn {
   flex: 1;
+
   background: #e2e8f0;
+
   color: #0f172a;
+
   border: none;
+
   padding: 8px;
+
   border-radius: 6px;
+
   font-weight: 600;
+
   font-size: 0.8rem;
+
   cursor: pointer;
 }
 
-/* SALES HISTORY VIEW & RESPONSIVE GRID */
+/* ============================================================
+   SALES HISTORY
+   ============================================================ */
+
 .history-screen {
   background: #ffffff;
+
   padding: 0.75rem;
+
   border-radius: 10px;
+
   border: 1px solid #e2e8f0;
+
+  min-width: 0;
 }
 
 .history-header-row {
   display: flex;
+
   flex-direction: column;
+
   gap: 0.5rem;
+
   margin-bottom: 0.75rem;
 }
 
 .history-header-row h2 {
   font-size: 0.95rem;
+
   margin: 0;
 }
 
 .history-filter-controls {
   display: flex;
+
   gap: 6px;
+
   width: 100%;
+
+  min-width: 0;
 }
 
 .history-search-input,
 .history-cashier-select {
-  padding: 6px 8px;
-  border: 1px solid #cbd5e0;
+  padding:
+    6px 8px;
+
+  border:
+    1px solid #cbd5e0;
+
   border-radius: 5px;
+
   font-size: 0.78rem;
+
   width: 100%;
+
+  min-width: 0;
 }
 
 .sales-list {
   display: grid;
+
   grid-template-columns: 1fr;
+
   gap: 0.6rem;
 }
 
 @media (min-width: 768px) {
+
   .history-screen {
     padding: 1rem;
   }
 
   .history-header-row {
     flex-direction: row;
-    justify-content: space-between;
+
+    justify-content:
+      space-between;
+
     align-items: center;
   }
 
   .history-filter-controls {
     width: auto;
+
     min-width: 340px;
   }
 }
 
 @media (min-width: 1024px) {
+
   .sales-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns:
+      repeat(
+        2,
+        minmax(0, 1fr)
+      );
   }
 }
 
 .sale-history-card {
   background: #ffffff;
-  border: 1px solid #e2e8f0;
+
+  border:
+    1px solid #e2e8f0;
+
   border-radius: 6px;
-  padding: 8px 10px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  padding:
+    8px 10px;
+
+  box-shadow:
+    0 1px 2px
+    rgba(0, 0, 0, 0.04);
+
+  min-width: 0;
 }
 
 .sale-card-header {
   display: flex;
-  justify-content: space-between;
+
+  justify-content:
+    space-between;
+
   align-items: center;
-  border-bottom: 1px solid #edf2f7;
+
+  gap: 8px;
+
+  border-bottom:
+    1px solid #edf2f7;
+
   padding-bottom: 4px;
+
   margin-bottom: 4px;
 }
 
@@ -1002,76 +1909,183 @@ body {
 
 .sale-date {
   font-size: 0.7rem;
+
   color: #64748b;
 }
 
 .sale-type-pill {
+  flex-shrink: 0;
+
   background: #e2e8f0;
-  padding: 1px 5px;
+
+  padding:
+    1px 5px;
+
   border-radius: 3px;
+
   font-size: 0.65rem;
+
   font-weight: bold;
 }
 
 .sale-customer-details {
   display: flex;
+
   flex-direction: column;
+
   gap: 1px;
+
   font-size: 0.75rem;
+
   color: #4a5568;
+
   margin-bottom: 6px;
 }
 
 .sale-items-table {
   background: #f8f9fa;
-  padding: 4px 8px;
+
+  padding:
+    4px 8px;
+
   border-radius: 4px;
+
   font-size: 0.75rem;
+
   margin-bottom: 6px;
 }
 
 .sale-item-row {
   display: flex;
-  justify-content: space-between;
+
+  justify-content:
+    space-between;
+
+  gap: 8px;
+
   padding: 1px 0;
+}
+
+.sale-item-row span:first-child {
+  min-width: 0;
+
+  overflow-wrap: anywhere;
+}
+
+.sale-item-row span:last-child {
+  flex-shrink: 0;
 }
 
 .sale-card-footer {
   display: flex;
-  justify-content: space-between;
+
+  justify-content:
+    space-between;
+
   align-items: center;
+
+  gap: 8px;
+
   font-size: 0.8rem;
 }
 
 .receipt-btn {
   background: #edf2f7;
-  border: 1px solid #cbd5e0;
-  padding: 4px 8px;
+
+  border:
+    1px solid #cbd5e0;
+
+  padding:
+    4px 8px;
+
   border-radius: 4px;
+
   cursor: pointer;
+
   font-size: 0.72rem;
+
+  white-space: nowrap;
 }
 
 .empty-state {
   text-align: center;
+
   padding: 16px;
+
   color: #64748b;
+
   font-size: 0.82rem;
 }
 
+/* ============================================================
+   VERY NARROW HISTORY SCREEN
+   ============================================================ */
+
+@media (max-width: 480px) {
+
+  .history-screen {
+    padding: 7px;
+  }
+
+  .history-filter-controls {
+    flex-direction: column;
+  }
+
+  .history-header-row h2 {
+    font-size: 0.82rem;
+  }
+
+  .sale-history-card {
+    padding:
+      7px 8px;
+  }
+
+  .sale-card-header strong {
+    font-size: 0.72rem;
+  }
+
+  .sale-date {
+    font-size: 0.62rem;
+  }
+
+  .sale-customer-details {
+    font-size: 0.68rem;
+  }
+
+  .sale-items-table {
+    font-size: 0.68rem;
+  }
+
+  .sale-card-footer {
+    font-size: 0.7rem;
+  }
+}
+
+/* ============================================================
+   PRINT
+   ============================================================ */
+
 @media print {
+
   .no-print {
     display: none !important;
   }
+
   .receipt-container {
     position: absolute;
+
     background: #ffffff;
+
     padding: 0;
   }
+
   .receipt-card {
     box-shadow: none;
+
     border: none;
+
     width: 100%;
+
     max-width: 100%;
   }
 }

@@ -1,39 +1,61 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { db, supabase, syncDrugsFromCloud, syncPendingSalesToCloud, pruneSalesOlderThanOneYear } from './db';
+import {
+  db,
+  supabase,
+  syncDrugsFromCloud,
+  syncPendingSalesToCloud,
+  pruneSalesOlderThanOneYear
+} from './db';
 import './App.css';
 
 export default function App() {
-  // Auth State
+  // ============================================================
+  // AUTH STATE
+  // ============================================================
+
   const [session, setSession] = useState(null);
-  const [userRole, setUserRole] = useState('salesperson'); // 'salesperson' or 'manager'
+  const [userRole, setUserRole] = useState('salesperson');
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [authError, setAuthError] = useState('');
 
-  // Navigation View State
-  const [activeTab, setActiveTab] = useState('pos'); // 'pos' | 'history'
+  // ============================================================
+  // NAVIGATION VIEW STATE
+  // ============================================================
 
-  // POS State
+  const [activeTab, setActiveTab] = useState('pos');
+
+  // ============================================================
+  // POS STATE
+  // ============================================================
+
   const [searchTerm, setSearchTerm] = useState('');
   const [cart, setCart] = useState([]);
   const [saleType, setSaleType] = useState('retail');
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
-  
-  // Sale Confirmation Modal State
+
+  // ============================================================
+  // SALE CONFIRMATION / RECEIPT MODAL
+  // ============================================================
+
   const [saleSuccessData, setSaleSuccessData] = useState(null);
   const [showReceiptModal, setShowReceiptModal] = useState(false);
-  
+
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
-  // Cart list ref (scrolls the list itself, not the whole page)
+  // Cart list ref
   const cartListRef = useRef(null);
 
-  // Manager CRUD Modal
+  // ============================================================
+  // MANAGER CRUD MODAL
+  // ============================================================
+
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingDrug, setEditingDrug] = useState(null);
+
   const [formData, setFormData] = useState({
     name: '',
     unitType: 'Sachet',
@@ -44,12 +66,18 @@ export default function App() {
     barcode: ''
   });
 
-  // Sales History Filter & Cloud Sync State
+  // ============================================================
+  // SALES HISTORY
+  // ============================================================
+
   const [historySearchTerm, setHistorySearchTerm] = useState('');
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
   const [cloudSales, setCloudSales] = useState([]);
 
-  // Auto-scroll to bottom of the cart list when items change
+  // ============================================================
+  // AUTO-SCROLL CART
+  // ============================================================
+
   useEffect(() => {
     if (cart.length > 0 && cartListRef.current) {
       cartListRef.current.scrollTo({
@@ -59,20 +87,46 @@ export default function App() {
     }
   }, [cart]);
 
-  // Handle Supabase Auth Session
+  // ============================================================
+  // SUPABASE AUTH SESSION
+  // ============================================================
+
   useEffect(() => {
+    let mounted = true;
+
     supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!mounted) return;
+
       setSession(session);
-      if (session) fetchUserProfile(session.user.id);
+
+      if (session) {
+        fetchUserProfile(session.user.id);
+      }
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+
       setSession(session);
-      if (session) fetchUserProfile(session.user.id);
+
+      if (session) {
+        fetchUserProfile(session.user.id);
+      } else {
+        setUserRole('salesperson');
+      }
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
+
+  // ============================================================
+  // FETCH USER PROFILE / ROLE
+  // ============================================================
 
   const fetchUserProfile = async (userId) => {
     try {
@@ -83,36 +137,61 @@ export default function App() {
         .single();
 
       if (error) throw error;
-      if (data && data.role) {
+
+      if (data?.role) {
         setUserRole(data.role);
       }
     } catch (err) {
-      console.warn('Could not fetch user profile role, defaulting to salesperson:', err.message);
+      console.warn(
+        'Could not fetch user profile role, defaulting to salesperson:',
+        err.message
+      );
+
       setUserRole('salesperson');
     }
   };
 
+  // ============================================================
+  // LOGIN
+  // ============================================================
+
   const handleLogin = async (e) => {
     e.preventDefault();
+
     setAuthError('');
+
     const { error } = await supabase.auth.signInWithPassword({
       email: loginEmail,
-      password: loginPassword,
+      password: loginPassword
     });
-    if (error) setAuthError(error.message);
+
+    if (error) {
+      setAuthError(error.message);
+    }
   };
+
+  // ============================================================
+  // LOGOUT
+  // ============================================================
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
+
     setCart([]);
     setSession(null);
+    setUserRole('salesperson');
   };
 
-  // Fetch Central Sales History directly from Supabase
+  // ============================================================
+  // FETCH CENTRAL SALES HISTORY
+  // ============================================================
+
   const fetchCloudSales = async () => {
     if (!navigator.onLine || !session) return;
+
     try {
       const oneYearAgo = new Date();
+
       oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
       let query = supabase
@@ -126,6 +205,7 @@ export default function App() {
       }
 
       const { data, error } = await query;
+
       if (error) throw error;
 
       if (data) {
@@ -135,12 +215,18 @@ export default function App() {
           saleType: s.sale_type || s.saleType || 'retail',
           cashierId: s.cashier_id || s.cashierId,
           cashierEmail: s.cashier_email || s.cashierEmail,
-          customerName: s.customer_name || s.customerName || 'Walk-in Customer',
-          customerPhone: s.customer_phone || s.customerPhone || 'N/A',
+          customerName:
+            s.customer_name || s.customerName || 'Walk-in Customer',
+          customerPhone:
+            s.customer_phone || s.customerPhone || 'N/A',
           createdAt: s.created_at || s.createdAt,
-          items: typeof s.items === 'string' ? JSON.parse(s.items) : (s.items || []),
+          items:
+            typeof s.items === 'string'
+              ? JSON.parse(s.items)
+              : s.items || [],
           synced: 1
         }));
+
         setCloudSales(formatted);
       }
     } catch (err) {
@@ -148,21 +234,37 @@ export default function App() {
     }
   };
 
+  // ============================================================
+  // ONLINE / OFFLINE + SYNC
+  // ============================================================
+
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
+
       syncDrugsFromCloud();
-      syncPendingSalesToCloud().then(() => fetchCloudSales());
+
+      syncPendingSalesToCloud().then(() => {
+        fetchCloudSales();
+      });
+
       pruneSalesOlderThanOneYear();
     };
-    const handleOffline = () => setIsOnline(false);
+
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
     if (navigator.onLine) {
       syncDrugsFromCloud();
-      syncPendingSalesToCloud().then(() => fetchCloudSales());
+
+      syncPendingSalesToCloud().then(() => {
+        fetchCloudSales();
+      });
+
       pruneSalesOlderThanOneYear();
     }
 
@@ -172,97 +274,202 @@ export default function App() {
     };
   }, [session, userRole]);
 
+  // ============================================================
+  // FETCH HISTORY WHEN OPENING HISTORY TAB
+  // ============================================================
+
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
     }
   }, [activeTab, isOnline]);
 
-  // Live Query for Drugs Inventory
+  // ============================================================
+  // LIVE QUERY — DRUG INVENTORY
+  // ============================================================
+
   const drugs = useLiveQuery(async () => {
     if (!searchTerm.trim()) {
       return db.drugs.toArray();
     }
+
     const term = searchTerm.toLowerCase().trim();
+
     return db.drugs
       .filter((drug) => {
-        const nameMatch = drug.name?.toLowerCase().includes(term);
-        const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
+        const nameMatch = drug.name
+          ?.toLowerCase()
+          .includes(term);
+
+        const barcodeMatch = drug.barcode
+          ?.toLowerCase()
+          .includes(term);
+
         return Boolean(nameMatch || barcodeMatch);
       })
       .toArray();
   }, [searchTerm]);
 
-  // Query Local Dexie Sales
+  // ============================================================
+  // LIVE QUERY — LOCAL SALES
+  // ============================================================
+
   const localSales = useLiveQuery(async () => {
     if (!session) return [];
-    let records = await db.sales.orderBy('createdAt').reverse().toArray();
+
+    let records = await db.sales
+      .orderBy('createdAt')
+      .reverse()
+      .toArray();
 
     const oneYearAgo = new Date();
+
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-    records = records.filter(s => new Date(s.createdAt) >= oneYearAgo);
+
+    records = records.filter(
+      (s) => new Date(s.createdAt) >= oneYearAgo
+    );
 
     if (userRole !== 'manager') {
       records = records.filter(
-        (s) => s.cashierId === session.user.id || s.cashierEmail === session.user.email
+        (s) =>
+          s.cashierId === session.user.id ||
+          s.cashierEmail === session.user.email
       );
     }
+
     return records;
   }, [session, userRole]);
 
-  // Merge Local & Cloud Sales
+  // ============================================================
+  // MERGE LOCAL + CLOUD SALES
+  // ============================================================
+
   const salesHistory = React.useMemo(() => {
     const combinedMap = new Map();
-    cloudSales.forEach((s) => combinedMap.set(String(s.id), s));
-    (localSales || []).forEach((s) => combinedMap.set(String(s.id), s));
+
+    cloudSales.forEach((s) => {
+      combinedMap.set(String(s.id), s);
+    });
+
+    (localSales || []).forEach((s) => {
+      combinedMap.set(String(s.id), s);
+    });
 
     let records = Array.from(combinedMap.values());
-    records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-    if (userRole === 'manager' && historyCashierFilter !== 'all') {
-      records = records.filter((s) => s.cashierEmail === historyCashierFilter);
+    records.sort(
+      (a, b) =>
+        new Date(b.createdAt) - new Date(a.createdAt)
+    );
+
+    if (
+      userRole === 'manager' &&
+      historyCashierFilter !== 'all'
+    ) {
+      records = records.filter(
+        (s) => s.cashierEmail === historyCashierFilter
+      );
     }
 
     if (historySearchTerm.trim()) {
-      const term = historySearchTerm.toLowerCase();
+      const term = historySearchTerm
+        .toLowerCase()
+        .trim();
+
       records = records.filter(
         (s) =>
-          (s.customerName && s.customerName.toLowerCase().includes(term)) ||
-          (s.customerPhone && s.customerPhone.includes(term)) ||
-          (s.id && String(s.id).toLowerCase().includes(term))
+          (s.customerName &&
+            s.customerName
+              .toLowerCase()
+              .includes(term)) ||
+          (s.customerPhone &&
+            s.customerPhone.includes(term)) ||
+          (s.id &&
+            String(s.id)
+              .toLowerCase()
+              .includes(term))
       );
     }
 
     return records;
-  }, [localSales, cloudSales, userRole, historyCashierFilter, historySearchTerm]);
+  }, [
+    localSales,
+    cloudSales,
+    userRole,
+    historyCashierFilter,
+    historySearchTerm
+  ]);
 
-  // Cart Operations
+  // ============================================================
+  // CART OPERATIONS
+  // ============================================================
+
   const addToCart = (drug) => {
-    const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
-    const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
-    const activePrice = saleType === 'wholesale' ? wholesale : retail;
+    const retail = Number(
+      drug.retailPrice ??
+        drug.retail_price ??
+        0
+    );
 
-    const existingIndex = cart.findIndex((item) => String(item.id) === String(drug.id));
+    const wholesale = Number(
+      drug.wholesalePrice ??
+        drug.wholesale_price ??
+        0
+    );
+
+    const activePrice =
+      saleType === 'wholesale'
+        ? wholesale
+        : retail;
+
+    const existingIndex = cart.findIndex(
+      (item) =>
+        String(item.id) === String(drug.id)
+    );
 
     if (existingIndex > -1) {
       const updated = [...cart];
+
       updated[existingIndex].quantity += 1;
+
       setCart(updated);
     } else {
-      setCart([...cart, { ...drug, activePrice, quantity: 1 }]);
+      setCart([
+        ...cart,
+        {
+          ...drug,
+          activePrice,
+          quantity: 1
+        }
+      ]);
     }
   };
 
   const handleSaleTypeChange = (type) => {
     setSaleType(type);
+
     if (cart.length > 0) {
       setCart(
         cart.map((item) => {
-          const retail = Number(item.retailPrice ?? item.retail_price ?? 0);
-          const wholesale = Number(item.wholesalePrice ?? item.wholesale_price ?? 0);
+          const retail = Number(
+            item.retailPrice ??
+              item.retail_price ??
+              0
+          );
+
+          const wholesale = Number(
+            item.wholesalePrice ??
+              item.wholesale_price ??
+              0
+          );
+
           return {
             ...item,
-            activePrice: type === 'wholesale' ? wholesale : retail
+            activePrice:
+              type === 'wholesale'
+                ? wholesale
+                : retail
           };
         })
       );
@@ -274,64 +481,127 @@ export default function App() {
       cart
         .map((item) => {
           if (String(item.id) === String(id)) {
-            const newQty = item.quantity + delta;
-            return newQty > 0 ? { ...item, quantity: newQty } : null;
+            const newQty =
+              item.quantity + delta;
+
+            return newQty > 0
+              ? {
+                  ...item,
+                  quantity: newQty
+                }
+              : null;
           }
+
           return item;
         })
         .filter(Boolean)
     );
   };
 
-  const cartTotal = cart.reduce((sum, item) => sum + (item.activePrice || 0) * item.quantity, 0);
+  const cartTotal = cart.reduce(
+    (sum, item) =>
+      sum +
+      (item.activePrice || 0) *
+        item.quantity,
+    0
+  );
 
-  // Complete Sale Logic
+  // ============================================================
+  // COMPLETE SALE
+  // ============================================================
+
   const handleCheckout = async () => {
     if (cart.length === 0) return;
 
     try {
       const saleId = `REC-${Date.now()}`;
+
       const saleData = {
         id: saleId,
         total: cartTotal,
         saleType,
-        cashierId: session?.user?.id || 'offline_id',
-        cashierEmail: session?.user?.email || 'offline_cashier',
-        customerName: customerName.trim() || 'Walk-in Customer',
-        customerPhone: customerPhone.trim() || 'N/A',
-        createdAt: new Date().toISOString(),
+        cashierId:
+          session?.user?.id ||
+          'offline_id',
+        cashierEmail:
+          session?.user?.email ||
+          'offline_cashier',
+        customerName:
+          customerName.trim() ||
+          'Walk-in Customer',
+        customerPhone:
+          customerPhone.trim() ||
+          'N/A',
+        createdAt:
+          new Date().toISOString(),
         items: [...cart],
         synced: 0
       };
 
-      await db.transaction('rw', db.drugs, db.sales, async () => {
-        for (const item of cart) {
-          if (item.id) {
-            const drugKey = String(item.id);
-            const existingDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
-            
-            if (existingDrug) {
-              const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
-              await db.drugs.update(existingDrug.id, { stock: newStock });
+      await db.transaction(
+        'rw',
+        db.drugs,
+        db.sales,
+        async () => {
+          for (const item of cart) {
+            if (item.id) {
+              const drugKey = String(item.id);
+
+              const existingDrug =
+                (await db.drugs.get(drugKey)) ||
+                (await db.drugs.get(
+                  Number(item.id)
+                ));
+
+              if (existingDrug) {
+                const newStock = Math.max(
+                  0,
+                  (existingDrug.stock || 0) -
+                    item.quantity
+                );
+
+                await db.drugs.update(
+                  existingDrug.id,
+                  {
+                    stock: newStock
+                  }
+                );
+              }
             }
           }
-        }
-        await db.sales.add(saleData);
-      });
 
+          await db.sales.add(saleData);
+        }
+      );
+
+      // Update cloud stock
       if (isOnline) {
         for (const item of cart) {
           if (item.id) {
             const drugKey = String(item.id);
-            const updatedDrug = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+
+            const updatedDrug =
+              (await db.drugs.get(drugKey)) ||
+              (await db.drugs.get(
+                Number(item.id)
+              ));
+
             if (updatedDrug) {
               try {
                 await supabase
                   .from('drugs')
-                  .update({ stock: updatedDrug.stock })
-                  .eq('id', updatedDrug.id);
+                  .update({
+                    stock: updatedDrug.stock
+                  })
+                  .eq(
+                    'id',
+                    updatedDrug.id
+                  );
               } catch (cloudErr) {
-                console.warn(`Stock update postponed for ${item.name}:`, cloudErr.message);
+                console.warn(
+                  `Stock update postponed for ${item.name}:`,
+                  cloudErr.message
+                );
               }
             }
           }
@@ -341,38 +611,75 @@ export default function App() {
           id: saleData.id,
           total: saleData.total,
           sale_type: saleData.saleType,
-          cashier_id: saleData.cashierId,
-          cashier_email: saleData.cashierEmail,
-          customer_name: saleData.customerName,
-          customer_phone: saleData.customerPhone,
-          created_at: saleData.createdAt,
-          items: JSON.stringify(saleData.items)
+          cashier_id:
+            saleData.cashierId,
+          cashier_email:
+            saleData.cashierEmail,
+          customer_name:
+            saleData.customerName,
+          customer_phone:
+            saleData.customerPhone,
+          created_at:
+            saleData.createdAt,
+          items: JSON.stringify(
+            saleData.items
+          )
         };
 
-        const { error } = await supabase.from('sales').insert([supabasePayload]);
+        const { error } =
+          await supabase
+            .from('sales')
+            .insert([
+              supabasePayload
+            ]);
+
         if (!error) {
-          await db.sales.update(saleId, { synced: 1 });
+          await db.sales.update(
+            saleId,
+            {
+              synced: 1
+            }
+          );
+
           saleData.synced = 1;
+
           fetchCloudSales();
         } else {
-          console.warn('Cloud insert pending, queued locally:', error.message);
+          console.warn(
+            'Cloud insert pending, queued locally:',
+            error.message
+          );
         }
       }
 
       setSaleSuccessData(saleData);
       setShowReceiptModal(true);
+
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
     } catch (err) {
-      console.error('Checkout error:', err);
-      alert(`Checkout failed: ${err.message || 'Error processing database transaction'}`);
+      console.error(
+        'Checkout error:',
+        err
+      );
+
+      alert(
+        `Checkout failed: ${
+          err.message ||
+          'Error processing database transaction'
+        }`
+      );
     }
   };
 
-  // Manager CRUD Handlers
+  // ============================================================
+  // MANAGER CRUD
+  // ============================================================
+
   const handleOpenAddModal = () => {
     setEditingDrug(null);
+
     setFormData({
       name: '',
       unitType: 'Sachet',
@@ -382,157 +689,316 @@ export default function App() {
       stock: '',
       barcode: ''
     });
+
     setIsModalOpen(true);
   };
 
-  const handleOpenEditModal = (drug, e) => {
+  const handleOpenEditModal = (
+    drug,
+    e
+  ) => {
     e.stopPropagation();
+
     setEditingDrug(drug);
+
     setFormData({
       name: drug.name || '',
-      unitType: drug.unitType || drug.unit_type || 'Sachet',
-      costPrice: drug.costPrice ?? drug.cost_price ?? '',
-      retailPrice: drug.retailPrice ?? drug.retail_price ?? '',
-      wholesalePrice: drug.wholesalePrice ?? drug.wholesale_price ?? '',
-      stock: drug.stock ?? '',
-      barcode: drug.barcode || ''
+      unitType:
+        drug.unitType ||
+        drug.unit_type ||
+        'Sachet',
+      costPrice:
+        drug.costPrice ??
+        drug.cost_price ??
+        '',
+      retailPrice:
+        drug.retailPrice ??
+        drug.retail_price ??
+        '',
+      wholesalePrice:
+        drug.wholesalePrice ??
+        drug.wholesale_price ??
+        '',
+      stock:
+        drug.stock ?? '',
+      barcode:
+        drug.barcode || ''
     });
+
     setIsModalOpen(true);
   };
 
-  const handleDeleteDrug = async (id, e) => {
+  const handleDeleteDrug = async (
+    id,
+    e
+  ) => {
     e.stopPropagation();
-    if (window.confirm('Are you sure you want to delete this drug from inventory?')) {
+
+    if (
+      window.confirm(
+        'Are you sure you want to delete this drug from inventory?'
+      )
+    ) {
       const drugKey = String(id);
-      await db.drugs.delete(drugKey);
-      await db.drugs.delete(Number(id));
+
+      await db.drugs.delete(
+        drugKey
+      );
+
+      await db.drugs.delete(
+        Number(id)
+      );
+
       if (isOnline) {
-        await supabase.from('drugs').delete().eq('id', drugKey);
+        await supabase
+          .from('drugs')
+          .delete()
+          .eq('id', drugKey);
       }
     }
   };
 
   const handleSaveDrug = async (e) => {
     e.preventDefault();
-    const drugId = editingDrug ? String(editingDrug.id) : Date.now().toString();
+
+    const drugId = editingDrug
+      ? String(editingDrug.id)
+      : Date.now().toString();
+
     const drugPayload = {
       id: drugId,
       name: formData.name,
-      unitType: formData.unitType,
-      costPrice: Number(formData.costPrice),
-      retailPrice: Number(formData.retailPrice),
-      wholesalePrice: Number(formData.wholesalePrice),
-      stock: Number(formData.stock),
+      unitType:
+        formData.unitType,
+      costPrice: Number(
+        formData.costPrice
+      ),
+      retailPrice: Number(
+        formData.retailPrice
+      ),
+      wholesalePrice: Number(
+        formData.wholesalePrice
+      ),
+      stock: Number(
+        formData.stock
+      ),
       barcode: formData.barcode
     };
 
     if (editingDrug) {
-      await db.drugs.update(editingDrug.id, drugPayload);
+      await db.drugs.update(
+        editingDrug.id,
+        drugPayload
+      );
     } else {
-      await db.drugs.add(drugPayload);
+      await db.drugs.add(
+        drugPayload
+      );
     }
 
     if (isOnline) {
       const cloudPayload = {
         id: drugId,
         name: formData.name,
-        unit_type: formData.unitType,
-        cost_price: Number(formData.costPrice),
-        retail_price: Number(formData.retailPrice),
-        wholesale_price: Number(formData.wholesalePrice),
-        stock: Number(formData.stock),
+        unit_type:
+          formData.unitType,
+        cost_price: Number(
+          formData.costPrice
+        ),
+        retail_price: Number(
+          formData.retailPrice
+        ),
+        wholesale_price: Number(
+          formData.wholesalePrice
+        ),
+        stock: Number(
+          formData.stock
+        ),
         barcode: formData.barcode
       };
-      await supabase.from('drugs').upsert([cloudPayload]);
+
+      await supabase
+        .from('drugs')
+        .upsert([
+          cloudPayload
+        ]);
     }
 
     setIsModalOpen(false);
   };
 
-  // ------------------- LOGIN SCREEN -------------------
+  // ============================================================
+  // LOGIN SCREEN
+  // ============================================================
+
   if (!session) {
     return (
       <div className="login-container">
         <div className="login-card">
           <h2>AZU PHARMACY POS</h2>
-          <p>Please log in to continue</p>
-          {authError && <div className="auth-error">{authError}</div>}
-          <form onSubmit={handleLogin}>
-            <label>Email Address:</label>
+
+          <p>
+            Please log in to continue
+          </p>
+
+          {authError && (
+            <div className="auth-error">
+              {authError}
+            </div>
+          )}
+
+          <form
+            onSubmit={handleLogin}
+          >
+            <label>
+              Email Address:
+            </label>
+
             <input
               type="email"
               required
               placeholder="cashier@azupharmacy.com"
               value={loginEmail}
-              onChange={(e) => setLoginEmail(e.target.value)}
+              onChange={(e) =>
+                setLoginEmail(
+                  e.target.value
+                )
+              }
             />
-            
-            <label>Password:</label>
-            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+
+            <label>
+              Password:
+            </label>
+
+            <div className="password-field">
               <input
-                type={showPassword ? 'text' : 'password'}
+                type={
+                  showPassword
+                    ? 'text'
+                    : 'password'
+                }
                 required
                 placeholder="••••••••"
-                value={loginPassword}
-                onChange={(e) => setLoginPassword(e.target.value)}
-                style={{ width: '100%', paddingRight: '2.5rem' }}
+                value={
+                  loginPassword
+                }
+                onChange={(e) =>
+                  setLoginPassword(
+                    e.target.value
+                  )
+                }
               />
+
               <button
                 type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                style={{
-                  position: 'absolute',
-                  right: '10px',
-                  background: 'none',
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: '0.8rem',
-                  fontWeight: 'bold',
-                  color: '#666'
-                }}
+                className="password-toggle"
+                onClick={() =>
+                  setShowPassword(
+                    !showPassword
+                  )
+                }
               >
-                {showPassword ? 'HIDE' : 'SHOW'}
+                {showPassword
+                  ? 'HIDE'
+                  : 'SHOW'}
               </button>
             </div>
 
-            <button type="submit" className="login-btn">Sign In</button>
+            <button
+              type="submit"
+              className="login-btn"
+            >
+              Sign In
+            </button>
           </form>
         </div>
       </div>
     );
   }
 
-  // ------------------- MAIN POS APP SCREEN -------------------
+  // ============================================================
+  // MAIN POS APP
+  // ============================================================
+
   return (
     <div className="app-container">
-      {/* HEADER */}
+
+      {/* ========================================================
+          HEADER
+          ======================================================== */}
+
       <header className="header no-print">
+
+        {/* USER */}
         <div className="user-profile-header">
           <div className="user-info-group">
-            <span className="user-email">{session?.user?.email}</span>
-            <span className="user-role-badge">{userRole.toUpperCase()} ACCOUNT</span>
+            <span className="user-email">
+              {session?.user?.email}
+            </span>
+
+            <span className="user-role-badge">
+              {userRole.toUpperCase()} ACCOUNT
+            </span>
           </div>
-          <button className="logout-btn" onClick={handleLogout}>Sign Out</button>
+
+          <button
+            className="logout-btn"
+            onClick={handleLogout}
+            type="button"
+          >
+            Sign Out
+          </button>
         </div>
 
+        {/* TITLE */}
         <div className="header-title-row">
-          <h1>AZU PHARMACY POS</h1>
-          <span className={`status-badge ${isOnline ? 'online' : 'offline'}`}>
-            {isOnline ? '● Online' : '○ Offline'}
+          <h1>
+            AZU PHARMACY POS
+          </h1>
+
+          <span
+            className={`status-badge ${
+              isOnline
+                ? 'online'
+                : 'offline'
+            }`}
+          >
+            {isOnline
+              ? '● Online'
+              : '○ Offline'}
           </span>
         </div>
 
+        {/* MAIN CONTROLS */}
         <div className="controls-bar">
+
           <div className="nav-tabs">
-            <button 
-              className={activeTab === 'pos' ? 'active-tab' : ''} 
-              onClick={() => setActiveTab('pos')}
+            <button
+              className={
+                activeTab === 'pos'
+                  ? 'active-tab'
+                  : ''
+              }
+              onClick={() =>
+                setActiveTab('pos')
+              }
+              type="button"
             >
               🛒 POS Terminal
             </button>
-            <button 
-              className={activeTab === 'history' ? 'active-tab' : ''} 
-              onClick={() => setActiveTab('history')}
+
+            <button
+              className={
+                activeTab === 'history'
+                  ? 'active-tab'
+                  : ''
+              }
+              onClick={() =>
+                setActiveTab(
+                  'history'
+                )
+              }
+              type="button"
             >
               📋 Sales History
             </button>
@@ -540,28 +1006,66 @@ export default function App() {
 
           {activeTab === 'pos' && (
             <div className="price-mode-toggle">
-              <button 
-                className={saleType === 'retail' ? 'active' : ''} 
-                onClick={() => handleSaleTypeChange('retail')}
+              <button
+                className={
+                  saleType === 'retail'
+                    ? 'active'
+                    : ''
+                }
+                onClick={() =>
+                  handleSaleTypeChange(
+                    'retail'
+                  )
+                }
+                type="button"
               >
                 🛒 Retail
               </button>
-              <button 
-                className={saleType === 'wholesale' ? 'active' : ''} 
-                onClick={() => handleSaleTypeChange('wholesale')}
+
+              <button
+                className={
+                  saleType === 'wholesale'
+                    ? 'active'
+                    : ''
+                }
+                onClick={() =>
+                  handleSaleTypeChange(
+                    'wholesale'
+                  )
+                }
+                type="button"
               >
                 📦 Wholesale
               </button>
             </div>
           )}
 
-          {activeTab === 'pos' && userRole === 'manager' && (
-            <button className="add-drug-btn" onClick={handleOpenAddModal}>
-              + Add Drug
-            </button>
-          )}
+          {activeTab === 'pos' &&
+            userRole === 'manager' && (
+              <button
+                className="add-drug-btn"
+                onClick={
+                  handleOpenAddModal
+                }
+                type="button"
+                title="Add a new drug"
+              >
+                <span className="add-drug-icon">
+                  +
+                </span>
+
+                <span className="add-drug-full">
+                  Add Drug
+                </span>
+
+                <span className="add-drug-short">
+                  Drug
+                </span>
+              </button>
+            )}
         </div>
 
+        {/* SEARCH */}
         {activeTab === 'pos' && (
           <div className="search-row">
             <input
@@ -569,55 +1073,173 @@ export default function App() {
               className="search-input"
               placeholder="Search drug name or barcode..."
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              onChange={(e) =>
+                setSearchTerm(
+                  e.target.value
+                )
+              }
               autoFocus
             />
           </div>
         )}
       </header>
 
-      {/* POS TERMINAL TAB */}
+      {/* ========================================================
+          POS TERMINAL
+          ======================================================== */}
+
       {activeTab === 'pos' && (
-        <div className={`pos-screen no-print ${cart.length > 0 ? 'cart-active' : 'cart-empty'}`}>
-          {/* Main Inventory & Catalog Column */}
+        <div
+          className={`pos-screen no-print ${
+            cart.length > 0
+              ? 'cart-active'
+              : 'cart-empty'
+          }`}
+        >
+
+          {/* INVENTORY */}
           <div className="pos-catalog-section">
+
             <div className="drug-list">
-              {drugs && drugs.length > 0 ? (
+
+              {drugs &&
+              drugs.length > 0 ? (
                 drugs.map((drug) => {
-                  const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
-                  const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
-                  const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
-                  const unit = drug.unitType || drug.unit_type || 'Sachet';
+                  const cost =
+                    Number(
+                      drug.costPrice ??
+                        drug.cost_price ??
+                        0
+                    );
+
+                  const retail =
+                    Number(
+                      drug.retailPrice ??
+                        drug.retail_price ??
+                        0
+                    );
+
+                  const wholesale =
+                    Number(
+                      drug.wholesalePrice ??
+                        drug.wholesale_price ??
+                        0
+                    );
+
+                  const unit =
+                    drug.unitType ||
+                    drug.unit_type ||
+                    'Sachet';
 
                   return (
-                    <div key={drug.id} className="drug-card" onClick={() => addToCart(drug)}>
+                    <div
+                      key={drug.id}
+                      className="drug-card"
+                      onClick={() =>
+                        addToCart(drug)
+                      }
+                    >
+
                       <div className="drug-info">
-                        <div className="drug-name">{drug.name}</div>
+
+                        <div className="drug-name">
+                          {drug.name}
+                        </div>
+
                         <div className="tags-row">
-                          <span className="unit-tag">{unit}</span>
-                          <span className={`stock-tag ${drug.stock < 10 ? 'low-stock' : ''}`}>
-                            Stock: {drug.stock}
+                          <span className="unit-tag">
+                            {unit}
+                          </span>
+
+                          <span
+                            className={`stock-tag ${
+                              drug.stock < 10
+                                ? 'low-stock'
+                                : ''
+                            }`}
+                          >
+                            Stock:{' '}
+                            {drug.stock}
                           </span>
                         </div>
                       </div>
 
                       <div className="price-stack">
-                        {userRole === 'manager' && (
+
+                        {userRole ===
+                          'manager' && (
                           <div className="price-item cost-price">
-                            <small>Cost:</small> ₦{cost.toLocaleString()}
+                            <small>
+                              Cost:
+                            </small>{' '}
+                            ₦
+                            {cost.toLocaleString()}
                           </div>
                         )}
-                        <div className={`price-item ${saleType === 'retail' ? 'highlight' : ''}`}>
-                          <small>Retail:</small> ₦{retail.toLocaleString()}
-                        </div>
-                        <div className={`price-item ${saleType === 'wholesale' ? 'highlight' : ''}`}>
-                          <small>Wholesale:</small> ₦{wholesale.toLocaleString()}
+
+                        <div
+                          className={`price-item ${
+                            saleType ===
+                            'retail'
+                              ? 'highlight'
+                              : ''
+                          }`}
+                        >
+                          <small>
+                            Retail:
+                          </small>{' '}
+                          ₦
+                          {retail.toLocaleString()}
                         </div>
 
-                        {userRole === 'manager' && (
+                        <div
+                          className={`price-item ${
+                            saleType ===
+                            'wholesale'
+                              ? 'highlight'
+                              : ''
+                          }`}
+                        >
+                          <small>
+                            Wholesale:
+                          </small>{' '}
+                          ₦
+                          {wholesale.toLocaleString()}
+                        </div>
+
+                        {userRole ===
+                          'manager' && (
                           <div className="manager-actions">
-                            <button onClick={(e) => handleOpenEditModal(drug, e)}>✏️ Edit</button>
-                            <button onClick={(e) => handleDeleteDrug(drug.id, e)} className="del-btn">🗑️</button>
+
+                            <button
+                              onClick={(
+                                e
+                              ) =>
+                                handleOpenEditModal(
+                                  drug,
+                                  e
+                                )
+                              }
+                              type="button"
+                            >
+                              ✏️ Edit
+                            </button>
+
+                            <button
+                              onClick={(
+                                e
+                              ) =>
+                                handleDeleteDrug(
+                                  drug.id,
+                                  e
+                                )
+                              }
+                              className="del-btn"
+                              type="button"
+                            >
+                              🗑️
+                            </button>
+
                           </div>
                         )}
                       </div>
@@ -625,18 +1247,40 @@ export default function App() {
                   );
                 })
               ) : (
-                <div className="empty-state">No drugs found.</div>
+                <div className="empty-state">
+                  No drugs found.
+                </div>
               )}
             </div>
           </div>
 
-          {/* Cart Sidebar Column */}
+          {/* CART */}
           <div className="cart-sidebar-wrapper">
-            <div className={`cart-drawer ${cart.length === 0 ? 'empty-cart-drawer' : ''}`}>
+
+            <div
+              className={`cart-drawer ${
+                cart.length === 0
+                  ? 'empty-cart-drawer'
+                  : ''
+              }`}
+            >
+
               <div className="cart-header">
-                <h3>Current Cart ({saleType.toUpperCase()})</h3>
+
+                <h3>
+                  Current Cart (
+                  {saleType.toUpperCase()}
+                  )
+                </h3>
+
                 {cart.length > 0 && (
-                  <button className="clear-cart-btn" onClick={() => setCart([])}>
+                  <button
+                    className="clear-cart-btn"
+                    onClick={() =>
+                      setCart([])
+                    }
+                    type="button"
+                  >
                     Clear
                   </button>
                 )}
@@ -644,52 +1288,137 @@ export default function App() {
 
               {cart.length > 0 ? (
                 <>
+
                   <div className="customer-info-section">
+
                     <div className="customer-input-row">
+
                       <input
                         type="text"
                         placeholder="Customer Name (Optional)"
-                        value={customerName}
-                        onChange={(e) => setCustomerName(e.target.value)}
+                        value={
+                          customerName
+                        }
+                        onChange={(e) =>
+                          setCustomerName(
+                            e.target.value
+                          )
+                        }
                       />
+
                       <input
                         type="tel"
                         placeholder="Phone Number (Optional)"
-                        value={customerPhone}
-                        onChange={(e) => setCustomerPhone(e.target.value)}
+                        value={
+                          customerPhone
+                        }
+                        onChange={(e) =>
+                          setCustomerPhone(
+                            e.target.value
+                          )
+                        }
                       />
+
                     </div>
                   </div>
 
-                  <div className="cart-items-list" ref={cartListRef}>
-                    {cart.map((item) => (
-                      <div key={item.id} className="cart-item">
-                        <div className="cart-item-info">
-                          <strong className="cart-item-name">{item.name}</strong>
-                          <div className="unit-price">
-                            ₦{(item.activePrice || 0).toLocaleString()} / {item.unitType || item.unit_type}
+                  <div
+                    className="cart-items-list"
+                    ref={cartListRef}
+                  >
+
+                    {cart.map(
+                      (item) => (
+                        <div
+                          key={item.id}
+                          className="cart-item"
+                        >
+
+                          <div className="cart-item-info">
+
+                            <strong className="cart-item-name">
+                              {item.name}
+                            </strong>
+
+                            <div className="unit-price">
+                              ₦
+                              {(
+                                item.activePrice ||
+                                0
+                              ).toLocaleString()}{' '}
+                              /{' '}
+                              {item.unitType ||
+                                item.unit_type}
+                            </div>
+                          </div>
+
+                          <div className="qty-controls">
+
+                            <button
+                              onClick={() =>
+                                updateQuantity(
+                                  item.id,
+                                  -1
+                                )
+                              }
+                              type="button"
+                            >
+                              -
+                            </button>
+
+                            <span>
+                              {item.quantity}
+                            </span>
+
+                            <button
+                              onClick={() =>
+                                updateQuantity(
+                                  item.id,
+                                  1
+                                )
+                              }
+                              type="button"
+                            >
+                              +
+                            </button>
+
                           </div>
                         </div>
-                        <div className="qty-controls">
-                          <button onClick={() => updateQuantity(item.id, -1)}>-</button>
-                          <span>{item.quantity}</span>
-                          <button onClick={() => updateQuantity(item.id, 1)}>+</button>
-                        </div>
-                      </div>
-                    ))}
+                      )
+                    )}
+
                   </div>
 
                   <div className="cart-summary">
+
                     <div className="total-display">
-                      <span>Total Due:</span>
-                      <strong>₦{cartTotal.toLocaleString()}</strong>
+                      <span>
+                        Total Due:
+                      </span>
+
+                      <strong>
+                        ₦
+                        {cartTotal.toLocaleString()}
+                      </strong>
                     </div>
-                    <button className="checkout-btn" onClick={handleCheckout}>Complete Sale</button>
+
+                    <button
+                      className="checkout-btn"
+                      onClick={
+                        handleCheckout
+                      }
+                      type="button"
+                    >
+                      Complete Sale
+                    </button>
+
                   </div>
+
                 </>
               ) : (
                 <div className="empty-cart-message">
-                  🛒 Cart is empty. Tap any drug to add items.
+                  🛒 Cart is empty. Tap any
+                  drug to add items.
                 </div>
               )}
             </div>
@@ -697,212 +1426,584 @@ export default function App() {
         </div>
       )}
 
-      {/* SALES HISTORY TAB */}
+      {/* ========================================================
+          SALES HISTORY
+          ======================================================== */}
+
       {activeTab === 'history' && (
         <div className="history-screen no-print">
+
           <div className="history-header-row">
+
             <h2>
-              {userRole === 'manager' ? 'All Customer Sales History (1 Year)' : 'My Sales History (1 Year)'}
+              {userRole === 'manager'
+                ? 'All Customer Sales History (1 Year)'
+                : 'My Sales History (1 Year)'}
             </h2>
+
             <div className="history-filter-controls">
+
               <input
                 type="text"
                 placeholder="Search Customer Name or Phone..."
-                value={historySearchTerm}
-                onChange={(e) => setHistorySearchTerm(e.target.value)}
+                value={
+                  historySearchTerm
+                }
+                onChange={(e) =>
+                  setHistorySearchTerm(
+                    e.target.value
+                  )
+                }
                 className="history-search-input"
               />
 
-              {userRole === 'manager' && (
+              {userRole ===
+                'manager' && (
                 <select
-                  value={historyCashierFilter}
-                  onChange={(e) => setHistoryCashierFilter(e.target.value)}
+                  value={
+                    historyCashierFilter
+                  }
+                  onChange={(e) =>
+                    setHistoryCashierFilter(
+                      e.target.value
+                    )
+                  }
                   className="history-cashier-select"
                 >
-                  <option value="all">All Cashiers</option>
-                  {Array.from(new Set(salesHistory?.map((s) => s.cashierEmail))).map((email) => (
-                    <option key={email} value={email}>{email}</option>
-                  ))}
+                  <option value="all">
+                    All Cashiers
+                  </option>
+
+                  {Array.from(
+                    new Set(
+                      salesHistory?.map(
+                        (s) =>
+                          s.cashierEmail
+                      )
+                    )
+                  ).map(
+                    (email) => (
+                      <option
+                        key={email}
+                        value={email}
+                      >
+                        {email}
+                      </option>
+                    )
+                  )}
                 </select>
               )}
+
             </div>
           </div>
 
           <div className="sales-list">
-            {salesHistory && salesHistory.length > 0 ? (
-              salesHistory.map((sale) => (
-                <div key={sale.id} className="sale-history-card">
-                  <div className="sale-card-header">
-                    <div>
-                      <strong>Receipt #{sale.id}</strong>
-                      <span className="sale-date"> - {new Date(sale.createdAt).toLocaleString()}</span>
-                    </div>
-                    <span className="sale-type-pill">{sale.saleType.toUpperCase()}</span>
-                  </div>
 
-                  <div className="sale-customer-details">
-                    <span>👤 <strong>Customer:</strong> {sale.customerName || 'Walk-in Customer'}</span>
-                    <span>📞 <strong>Phone:</strong> {sale.customerPhone || 'N/A'}</span>
-                    <span>💳 <strong>Cashier:</strong> {sale.cashierEmail}</span>
-                  </div>
+            {salesHistory &&
+            salesHistory.length > 0 ? (
+              salesHistory.map(
+                (sale) => (
+                  <div
+                    key={sale.id}
+                    className="sale-history-card"
+                  >
 
-                  <div className="sale-items-table">
-                    {sale.items && sale.items.map((item, idx) => (
-                      <div key={item.id || idx} className="sale-item-row">
-                        <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
-                        <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
+                    <div className="sale-card-header">
+
+                      <div>
+                        <strong>
+                          Receipt #
+                          {sale.id}
+                        </strong>
+
+                        <span className="sale-date">
+                          {' '}
+                          -{' '}
+                          {new Date(
+                            sale.createdAt
+                          ).toLocaleString()}
+                        </span>
                       </div>
-                    ))}
-                  </div>
 
-                  <div className="sale-card-footer">
-                    <div>Total Amount: <strong>₦{sale.total.toLocaleString()}</strong></div>
-                    <button
-                      className="receipt-btn"
-                      onClick={() => {
-                        setSaleSuccessData(sale);
-                        setShowReceiptModal(true);
-                      }}
-                    >
-                      🖨️ View Receipt
-                    </button>
+                      <span className="sale-type-pill">
+                        {sale.saleType.toUpperCase()}
+                      </span>
+                    </div>
+
+                    <div className="sale-customer-details">
+
+                      <span>
+                        👤{' '}
+                        <strong>
+                          Customer:
+                        </strong>{' '}
+                        {sale.customerName ||
+                          'Walk-in Customer'}
+                      </span>
+
+                      <span>
+                        📞{' '}
+                        <strong>
+                          Phone:
+                        </strong>{' '}
+                        {sale.customerPhone ||
+                          'N/A'}
+                      </span>
+
+                      <span>
+                        💳{' '}
+                        <strong>
+                          Cashier:
+                        </strong>{' '}
+                        {sale.cashierEmail}
+                      </span>
+
+                    </div>
+
+                    <div className="sale-items-table">
+
+                      {sale.items &&
+                        sale.items.map(
+                          (
+                            item,
+                            idx
+                          ) => (
+                            <div
+                              key={
+                                item.id ||
+                                idx
+                              }
+                              className="sale-item-row"
+                            >
+
+                              <span>
+                                {item.name}{' '}
+                                (
+                                {item.unitType ||
+                                  item.unit_type}
+                                ) x
+                                {
+                                  item.quantity
+                                }
+                              </span>
+
+                              <span>
+                                ₦
+                                {(
+                                  (item.activePrice ||
+                                    0) *
+                                  item.quantity
+                                ).toLocaleString()}
+                              </span>
+
+                            </div>
+                          )
+                        )}
+
+                    </div>
+
+                    <div className="sale-card-footer">
+
+                      <div>
+                        Total Amount:{' '}
+                        <strong>
+                          ₦
+                          {sale.total.toLocaleString()}
+                        </strong>
+                      </div>
+
+                      <button
+                        className="receipt-btn"
+                        onClick={() => {
+                          setSaleSuccessData(
+                            sale
+                          );
+
+                          setShowReceiptModal(
+                            true
+                          );
+                        }}
+                        type="button"
+                      >
+                        🖨️ View Receipt
+                      </button>
+
+                    </div>
                   </div>
-                </div>
-              ))
+                )
+              )
             ) : (
-              <div className="empty-state">No sales history found.</div>
+              <div className="empty-state">
+                No sales history found.
+              </div>
             )}
+
           </div>
         </div>
       )}
 
-      {/* PRINTABLE RECEIPT MODAL */}
-      {showReceiptModal && saleSuccessData && (
-        <div className="receipt-container">
-          <div className="receipt-card">
-            <div className="receipt-header">
-              <h2>AZU PHARMACY</h2>
-              <p>Sales Receipt ({saleSuccessData.saleType.toUpperCase()})</p>
-              <p><strong>Receipt #:</strong> {saleSuccessData.id}</p>
-              <p><strong>Cashier:</strong> {saleSuccessData.cashierEmail}</p>
-              <p><strong>Customer:</strong> {saleSuccessData.customerName} ({saleSuccessData.customerPhone})</p>
-              <p><strong>Date:</strong> {new Date(saleSuccessData.createdAt).toLocaleString()}</p>
-            </div>
-            <hr />
-            <div className="receipt-items">
-              {saleSuccessData.items.map((item, index) => (
-                <div key={item.id || index} className="receipt-item-row">
-                  <span>{item.name} ({item.unitType || item.unit_type}) x{item.quantity}</span>
-                  <span>₦{((item.activePrice || 0) * item.quantity).toLocaleString()}</span>
-                </div>
-              ))}
-            </div>
-            <hr />
-            <div className="receipt-total">
-              <strong>TOTAL PAID:</strong>
-              <strong>₦{saleSuccessData.total.toLocaleString()}</strong>
-            </div>
-            <p className="receipt-footer">Thank you for your patronage!</p>
+      {/* ========================================================
+          RECEIPT MODAL
+          ======================================================== */}
 
-            <div className="receipt-actions no-print">
-              <button className="print-btn" onClick={() => window.print()}>
-                🖨️ Print Receipt
-              </button>
-              <button
-                className="close-btn"
-                onClick={() => {
-                  setShowReceiptModal(false);
-                  setSaleSuccessData(null);
-                }}
+      {showReceiptModal &&
+        saleSuccessData && (
+          <div className="receipt-container">
+
+            <div className="receipt-card">
+
+              <div className="receipt-header">
+
+                <h2>
+                  AZU PHARMACY
+                </h2>
+
+                <p>
+                  Sales Receipt (
+                  {saleSuccessData.saleType.toUpperCase()}
+                  )
+                </p>
+
+                <p>
+                  <strong>
+                    Receipt #:
+                  </strong>{' '}
+                  {saleSuccessData.id}
+                </p>
+
+                <p>
+                  <strong>
+                    Cashier:
+                  </strong>{' '}
+                  {
+                    saleSuccessData.cashierEmail
+                  }
+                </p>
+
+                <p>
+                  <strong>
+                    Customer:
+                  </strong>{' '}
+                  {
+                    saleSuccessData.customerName
+                  }{' '}
+                  (
+                  {
+                    saleSuccessData.customerPhone
+                  }
+                  )
+                </p>
+
+                <p>
+                  <strong>
+                    Date:
+                  </strong>{' '}
+                  {new Date(
+                    saleSuccessData.createdAt
+                  ).toLocaleString()}
+                </p>
+
+              </div>
+
+              <hr />
+
+              <div className="receipt-items">
+
+                {saleSuccessData.items.map(
+                  (item, index) => (
+                    <div
+                      key={
+                        item.id ||
+                        index
+                      }
+                      className="receipt-item-row"
+                    >
+
+                      <span>
+                        {item.name} (
+                        {item.unitType ||
+                          item.unit_type}
+                        ) x
+                        {
+                          item.quantity
+                        }
+                      </span>
+
+                      <span>
+                        ₦
+                        {(
+                          (item.activePrice ||
+                            0) *
+                          item.quantity
+                        ).toLocaleString()}
+                      </span>
+
+                    </div>
+                  )
+                )}
+
+              </div>
+
+              <hr />
+
+              <div className="receipt-total">
+
+                <strong>
+                  TOTAL PAID:
+                </strong>
+
+                <strong>
+                  ₦
+                  {saleSuccessData.total.toLocaleString()}
+                </strong>
+
+              </div>
+
+              <p className="receipt-footer">
+                Thank you for your patronage!
+              </p>
+
+              <div className="receipt-actions no-print">
+
+                <button
+                  className="print-btn"
+                  onClick={() =>
+                    window.print()
+                  }
+                  type="button"
+                >
+                  🖨️ Print Receipt
+                </button>
+
+                <button
+                  className="close-btn"
+                  onClick={() => {
+                    setShowReceiptModal(
+                      false
+                    );
+
+                    setSaleSuccessData(
+                      null
+                    );
+                  }}
+                  type="button"
+                >
+                  Close & Start New Sale
+                </button>
+
+              </div>
+
+            </div>
+          </div>
+        )}
+
+      {/* ========================================================
+          MANAGER ADD / EDIT DRUG MODAL
+          ======================================================== */}
+
+      {isModalOpen &&
+        userRole === 'manager' && (
+          <div className="modal-overlay">
+
+            <div className="modal-card">
+
+              <h3>
+                {editingDrug
+                  ? 'Edit Drug Details'
+                  : 'Add New Drug'}
+              </h3>
+
+              <form
+                onSubmit={
+                  handleSaveDrug
+                }
+                className="crud-form"
               >
-                Close & Start New Sale
-              </button>
+
+                <label>
+                  Drug Name:
+                </label>
+
+                <input
+                  type="text"
+                  required
+                  value={
+                    formData.name
+                  }
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      name: e.target.value
+                    })
+                  }
+                />
+
+                <label>
+                  Unit Type:
+                </label>
+
+                <select
+                  value={
+                    formData.unitType
+                  }
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      unitType:
+                        e.target.value
+                    })
+                  }
+                >
+                  <option value="Sachet">
+                    Sachet
+                  </option>
+
+                  <option value="Pack">
+                    Pack
+                  </option>
+
+                  <option value="Bottle">
+                    Bottle
+                  </option>
+                </select>
+
+                <div className="form-row">
+
+                  <div>
+                    <label>
+                      Cost Price (₦):
+                    </label>
+
+                    <input
+                      type="number"
+                      required
+                      value={
+                        formData.costPrice
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          costPrice:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>
+                      Retail Price (₦):
+                    </label>
+
+                    <input
+                      type="number"
+                      required
+                      value={
+                        formData.retailPrice
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          retailPrice:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                </div>
+
+                <div className="form-row">
+
+                  <div>
+                    <label>
+                      Wholesale Price (₦):
+                    </label>
+
+                    <input
+                      type="number"
+                      required
+                      value={
+                        formData.wholesalePrice
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          wholesalePrice:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>
+                      Stock Qty:
+                    </label>
+
+                    <input
+                      type="number"
+                      required
+                      value={
+                        formData.stock
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          stock:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                </div>
+
+                <label>
+                  Barcode (Optional):
+                </label>
+
+                <input
+                  type="text"
+                  value={
+                    formData.barcode
+                  }
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      barcode:
+                        e.target.value
+                    })
+                  }
+                />
+
+                <div className="modal-actions">
+
+                  <button
+                    type="submit"
+                    className="save-btn"
+                  >
+                    Save Changes
+                  </button>
+
+                  <button
+                    type="button"
+                    className="cancel-btn"
+                    onClick={() =>
+                      setIsModalOpen(
+                        false
+                      )
+                    }
+                  >
+                    Cancel
+                  </button>
+
+                </div>
+
+              </form>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Manager Add / Edit Drug Modal */}
-      {isModalOpen && userRole === 'manager' && (
-        <div className="modal-overlay">
-          <div className="modal-card">
-            <h3>{editingDrug ? 'Edit Drug Details' : 'Add New Drug'}</h3>
-            <form onSubmit={handleSaveDrug} className="crud-form">
-              <label>Drug Name:</label>
-              <input
-                type="text"
-                required
-                value={formData.name}
-                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              />
-
-              <label>Unit Type:</label>
-              <select
-                value={formData.unitType}
-                onChange={(e) => setFormData({ ...formData, unitType: e.target.value })}
-              >
-                <option value="Sachet">Sachet</option>
-                <option value="Pack">Pack</option>
-                <option value="Bottle">Bottle</option>
-              </select>
-
-              <div className="form-row">
-                <div>
-                  <label>Cost Price (₦):</label>
-                  <input
-                    type="number"
-                    required
-                    value={formData.costPrice}
-                    onChange={(e) => setFormData({ ...formData, costPrice: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label>Retail Price (₦):</label>
-                  <input
-                    type="number"
-                    required
-                    value={formData.retailPrice}
-                    onChange={(e) => setFormData({ ...formData, retailPrice: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div>
-                  <label>Wholesale Price (₦):</label>
-                  <input
-                    type="number"
-                    required
-                    value={formData.wholesalePrice}
-                    onChange={(e) => setFormData({ ...formData, wholesalePrice: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label>Stock Qty:</label>
-                  <input
-                    type="number"
-                    required
-                    value={formData.stock}
-                    onChange={(e) => setFormData({ ...formData, stock: e.target.value })}
-                  />
-                </div>
-              </div>
-
-              <label>Barcode (Optional):</label>
-              <input
-                type="text"
-                value={formData.barcode}
-                onChange={(e) => setFormData({ ...formData, barcode: e.target.value })}
-              />
-
-              <div className="modal-actions">
-                <button type="submit" className="save-btn">Save Changes</button>
-                <button type="button" className="cancel-btn" onClick={() => setIsModalOpen(false)}>Cancel</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+        )}
     </div>
   );
 }
