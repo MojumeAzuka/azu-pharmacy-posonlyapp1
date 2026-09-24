@@ -554,7 +554,26 @@ export default function App() {
               </button>
             </div>
           )}
+
+          {activeTab === 'pos' && userRole === 'manager' && (
+            <button className="add-drug-btn" onClick={handleOpenAddModal}>
+              + Add Drug
+            </button>
+          )}
         </div>
+
+        {activeTab === 'pos' && (
+          <div className="search-row">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search drug name or barcode..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              autoFocus
+            />
+          </div>
+        )}
       </header>
 
       {/* POS TERMINAL TAB */}
@@ -562,22 +581,6 @@ export default function App() {
         <div className={`pos-screen no-print ${cart.length > 0 ? 'cart-active' : 'cart-empty'}`}>
           {/* Main Inventory & Catalog Column */}
           <div className="pos-catalog-section">
-            <div className="search-row">
-              <input
-                type="text"
-                className="search-input"
-                placeholder="Search drug name or barcode..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                autoFocus
-              />
-              {userRole === 'manager' && (
-                <button className="add-drug-btn" onClick={handleOpenAddModal}>
-                  + Add Drug
-                </button>
-              )}
-            </div>
-
             <div className="drug-list">
               {drugs && drugs.length > 0 ? (
                 drugs.map((drug) => {
