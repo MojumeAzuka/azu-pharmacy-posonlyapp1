@@ -1,23 +1,28 @@
 /* ============================================================
    GLOBAL RESET
-   ============================================================ */
+============================================================ */
 
 * {
   box-sizing: border-box;
 }
 
 html,
-body {
+body,
+#root {
   margin: 0;
   padding: 0;
   width: 100%;
   min-width: 0;
 }
 
+html {
+  overflow-x: hidden;
+}
+
 body {
   display: block;
-
   min-width: 0;
+  overflow-x: hidden;
 
   font-family:
     -apple-system,
@@ -29,7 +34,7 @@ body {
     Cantarell,
     sans-serif;
 
-  background-color: #f8fafc;
+  background: #f8fafc;
   color: #0f172a;
 
   -webkit-tap-highlight-color: transparent;
@@ -42,48 +47,54 @@ select {
 }
 
 button {
-  -webkit-tap-highlight-color: transparent;
+  -webkit-appearance: none;
 }
 
-#root {
-  max-width: none;
-  width: 100%;
-  margin: 0;
-  padding: 0;
-  text-align: left;
-}
-
-/* ============================================================
-   BASE APP CONTAINER
-   ============================================================ */
-
-.app-container {
-  width: 100%;
-  max-width: 1440px;
-
-  margin: 0 auto;
-  padding: 5px;
-
-  display: flex;
-  flex-direction: column;
-
-  gap: 5px;
-
-  min-height: 100vh;
-
+button,
+input,
+select {
   min-width: 0;
 }
 
 /* ============================================================
+   ROOT APP
+============================================================ */
+
+#root {
+  max-width: none;
+  text-align: left;
+}
+
+.app-container {
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 auto;
+
+  padding:
+    6px
+    max(6px, env(safe-area-inset-left))
+    6px
+    max(6px, env(safe-area-inset-right));
+
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ============================================================
    LOGIN
-   ============================================================ */
+============================================================ */
 
 .login-container {
+  min-height: 100vh;
+  min-height: 100dvh;
+
   display: flex;
   justify-content: center;
   align-items: center;
-
-  min-height: 100vh;
 
   padding: 16px;
 
@@ -91,49 +102,45 @@ button {
 }
 
 .login-card {
+  width: 100%;
+  max-width: 360px;
+
   background: #ffffff;
 
   padding: 24px 20px;
 
   border-radius: 12px;
 
-  width: 100%;
-  max-width: 360px;
-
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.08);
 }
 
 .login-card h2 {
-  margin: 0 0 6px 0;
-
+  margin: 0 0 6px;
   font-size: 1.25rem;
 }
 
 .login-card p {
-  margin: 0 0 16px 0;
-
+  margin: 0 0 16px;
   color: #64748b;
-
   font-size: 0.85rem;
 }
 
 .login-card form {
   display: flex;
   flex-direction: column;
-
   gap: 10px;
 }
 
 .login-card label {
   font-size: 0.8rem;
-
   font-weight: 600;
-
   color: #334155;
 }
 
 .login-card input {
+  width: 100%;
+
   padding: 10px;
 
   border: 1px solid #cbd5e1;
@@ -141,62 +148,57 @@ button {
 
   font-size: 0.95rem;
 
-  width: 100%;
+  outline: none;
 }
 
-.password-field {
-  position: relative;
+.login-card input:focus {
+  border-color: #0284c7;
+}
 
+.password-input-wrapper {
+  position: relative;
   display: flex;
   align-items: center;
-
-  width: 100%;
 }
 
-.password-field input {
-  padding-right: 3.5rem;
+.password-input-wrapper input {
+  padding-right: 60px;
 }
 
 .password-toggle {
   position: absolute;
-
   right: 8px;
 
-  background: none;
   border: none;
-
-  cursor: pointer;
-
-  font-size: 0.72rem;
-
-  font-weight: 700;
+  background: transparent;
 
   color: #64748b;
+
+  font-size: 0.7rem;
+  font-weight: 700;
+
+  cursor: pointer;
 }
 
 .login-btn {
-  background: #2563eb;
+  margin-top: 8px;
 
+  background: #2563eb;
   color: #ffffff;
 
   border: none;
+  border-radius: 6px;
 
   padding: 12px;
 
-  border-radius: 6px;
-
+  font-size: 0.95rem;
   font-weight: 600;
 
-  margin-top: 8px;
-
   cursor: pointer;
-
-  font-size: 0.95rem;
 }
 
 .auth-error {
   background: #fee2e2;
-
   color: #dc2626;
 
   padding: 8px;
@@ -210,22 +212,22 @@ button {
 
 /* ============================================================
    HEADER
-   ============================================================ */
+============================================================ */
 
 .header {
   position: sticky;
-
   top: 0;
 
   z-index: 900;
 
+  width: 100%;
+
   background: #ffffff;
 
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
 
-  padding: 7px 10px;
-
-  border: 1px solid #e2e8f0;
+  padding: 7px 8px;
 
   box-shadow:
     0 2px 8px rgba(15, 23, 42, 0.08);
@@ -235,14 +237,13 @@ button {
 
   gap: 5px;
 
-  min-width: 0;
+  isolation: isolate;
 }
 
 .user-profile-header {
   display: flex;
-
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
 
   gap: 6px;
 
@@ -250,50 +251,42 @@ button {
 
   padding-bottom: 5px;
 
-  border-bottom:
-    1px dashed #e2e8f0;
+  border-bottom: 1px dashed #e2e8f0;
 }
 
 .user-info-group {
   display: flex;
-
   align-items: center;
 
   gap: 5px;
 
   min-width: 0;
-
   overflow: hidden;
 }
 
 .user-email {
   min-width: 0;
 
-  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 
+  font-size: 0.68rem;
   font-weight: 600;
 
   color: #334155;
-
-  overflow: hidden;
-
-  text-overflow: ellipsis;
-
-  white-space: nowrap;
 }
 
 .user-role-badge {
-  flex-shrink: 0;
+  flex: 0 0 auto;
 
-  font-size: 0.6rem;
-
-  color: #0369a1;
-
+  font-size: 0.58rem;
   font-weight: 700;
 
+  color: #0369a1;
   background: #e0f2fe;
 
-  padding: 1px 5px;
+  padding: 1px 4px;
 
   border-radius: 4px;
 
@@ -301,36 +294,27 @@ button {
 }
 
 .logout-btn {
-  flex-shrink: 0;
+  flex: 0 0 auto;
 
   background: #fee2e2;
-
   color: #dc2626;
 
   border: 1px solid #fca5a5;
+  border-radius: 4px;
 
   padding: 3px 7px;
 
-  border-radius: 4px;
-
-  font-size: 0.68rem;
-
+  font-size: 0.64rem;
   font-weight: 600;
 
   cursor: pointer;
-
   white-space: nowrap;
 }
 
-/* ============================================================
-   TITLE / STATUS
-   ============================================================ */
-
 .header-title-row {
   display: flex;
-
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
 
   gap: 6px;
 
@@ -342,73 +326,55 @@ button {
 
   margin: 0;
 
-  font-size: 0.82rem;
-
+  font-size: 0.78rem;
   line-height: 1.1;
 
   font-weight: 700;
 
   color: #1e293b;
-
-  overflow: hidden;
-
-  text-overflow: ellipsis;
-
-  white-space: nowrap;
 }
 
 .status-badge {
-  flex-shrink: 0;
+  flex: 0 0 auto;
 
-  font-size: 0.65rem;
-
+  font-size: 0.62rem;
   font-weight: 600;
 
-  padding: 1px 7px;
+  padding: 1px 6px;
 
-  border-radius: 10px;
+  border-radius: 12px;
 
   white-space: nowrap;
 }
 
 .status-badge.online {
   background: #dcfce7;
-
   color: #15803d;
 }
 
 .status-badge.offline {
   background: #fee2e2;
-
   color: #dc2626;
 }
 
 /* ============================================================
-   MAIN CONTROL BAR
-   ============================================================ */
+   TOP CONTROLS
+============================================================ */
 
 .controls-bar {
-  display: grid;
+  width: 100%;
 
-  grid-template-columns:
-    minmax(0, 1.35fr)
-    minmax(0, 1fr)
-    auto;
+  display: flex;
+  align-items: stretch;
 
   gap: 4px;
 
-  width: 100%;
-
   min-width: 0;
-
-  align-items: stretch;
 }
 
 .nav-tabs,
 .price-mode-toggle {
   display: flex;
-
-  min-width: 0;
 
   gap: 2px;
 
@@ -417,17 +383,26 @@ button {
   padding: 2px;
 
   border-radius: 6px;
+
+  min-width: 0;
+}
+
+.nav-tabs {
+  flex: 1.15 1 0;
+}
+
+.price-mode-toggle {
+  flex: 1 1 0;
 }
 
 .nav-tabs button,
 .price-mode-toggle button {
-  flex: 1;
+  flex: 1 1 0;
 
   min-width: 0;
 
-  background: transparent;
-
   border: none;
+  background: transparent;
 
   color: #475569;
 
@@ -437,9 +412,8 @@ button {
 
   cursor: pointer;
 
+  font-size: 0.68rem;
   font-weight: 600;
-
-  font-size: 0.7rem;
 
   text-align: center;
 
@@ -447,13 +421,13 @@ button {
 
   transition:
     background 0.15s ease,
-    color 0.15s ease;
+    color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .nav-tabs button.active-tab,
 .price-mode-toggle button.active {
   background: #ffffff;
-
   color: #0284c7;
 
   box-shadow:
@@ -461,136 +435,108 @@ button {
 }
 
 /* ============================================================
-   ADD DRUG
-   ============================================================ */
+   ADD DRUG BUTTON
+============================================================ */
 
 .add-drug-btn {
-  display: inline-flex;
+  flex: 0 0 auto;
 
-  align-items: center;
-
-  justify-content: center;
-
-  gap: 4px;
-
-  min-width: 72px;
+  min-width: max-content;
 
   background: #059669;
-
   color: #ffffff;
 
   border: none;
-
   border-radius: 6px;
 
   padding: 5px 9px;
 
+  font-size: 0.68rem;
   font-weight: 700;
-
-  font-size: 0.7rem;
 
   cursor: pointer;
 
   white-space: nowrap;
-
-  transition:
-    background 0.15s ease;
 }
 
 .add-drug-btn:hover {
   background: #047857;
 }
 
-.add-drug-icon {
-  font-size: 0.9rem;
-
-  line-height: 1;
-}
-
-.add-drug-short {
-  display: none;
-}
-
-.add-drug-full {
-  display: inline;
-}
-
 /* ============================================================
    SEARCH
-   ============================================================ */
+============================================================ */
 
 .search-row {
-  display: flex;
-
   width: 100%;
 
-  min-width: 0;
+  display: flex;
+  gap: 5px;
 }
 
 .search-input {
   width: 100%;
 
-  min-width: 0;
+  min-height: 34px;
 
   padding: 7px 9px;
 
-  font-size: 0.84rem;
-
-  border:
-    1.5px solid #cbd5e1;
-
+  border: 1.5px solid #cbd5e1;
   border-radius: 6px;
 
   outline: none;
 
   background: #ffffff;
+
+  font-size: 0.82rem;
 }
 
 .search-input:focus {
   border-color: #0284c7;
 
   box-shadow:
-    0 0 0 3px
-    rgba(2, 132, 199, 0.15);
+    0 0 0 3px rgba(2, 132, 199, 0.12);
 }
 
 /* ============================================================
-   POS LAYOUT
-   ============================================================ */
+   POS
+============================================================ */
 
 .pos-screen {
-  display: flex;
+  width: 100%;
 
+  display: flex;
   flex-direction: column;
 
-  gap: 0.6rem;
+  gap: 8px;
 
   min-width: 0;
 }
 
 .pos-catalog-section {
-  display: flex;
+  min-width: 0;
 
+  display: flex;
   flex-direction: column;
 
-  gap: 0.5rem;
+  gap: 6px;
 
   flex: 1;
-
-  min-width: 0;
 }
 
 /* ============================================================
-   DRUG LIST
-   ============================================================ */
+   DRUG GRID
+============================================================ */
 
 .drug-list {
+  width: 100%;
+
   display: grid;
 
   grid-template-columns:
     repeat(
       auto-fill,
-      minmax(260px, 1fr)
+      minmax(250px, 1fr)
     );
 
   gap: 6px;
@@ -598,60 +544,61 @@ button {
   min-width: 0;
 }
 
-.drug-card {
-  display: flex;
+/* ============================================================
+   DRUG CARD
+============================================================ */
 
+.drug-card {
+  min-width: 0;
+
+  display: flex;
   flex-direction: row;
 
+  align-items: flex-start;
   justify-content: space-between;
 
-  align-items: flex-start;
+  gap: 7px;
 
-  padding: 8px 10px;
+  padding: 7px 8px;
 
   background: #ffffff;
 
+  border: 1px solid #e2e8f0;
   border-radius: 6px;
 
-  border: 1px solid #e2e8f0;
-
   cursor: pointer;
-
-  gap: 6px;
-
-  min-width: 0;
 
   transition:
     border-color 0.2s ease,
     box-shadow 0.2s ease;
+
+  -webkit-tap-highlight-color: transparent;
 }
 
 .drug-card:hover {
   border-color: #0284c7;
 
   box-shadow:
-    0 4px 12px
-    rgba(2, 132, 199, 0.08);
+    0 4px 12px rgba(2, 132, 199, 0.08);
 }
 
 .drug-info {
-  display: flex;
-
-  flex-direction: column;
-
-  gap: 4px;
-
+  min-width: 0;
   flex: 1;
 
-  min-width: 0;
+  display: flex;
+  flex-direction: column;
+
+  gap: 3px;
 }
 
 .drug-name {
+  min-width: 0;
+
+  font-size: 0.8rem;
+  line-height: 1.15;
+
   font-weight: 700;
-
-  font-size: 0.85rem;
-
-  line-height: 1.2;
 
   color: #0f172a;
 
@@ -660,57 +607,54 @@ button {
 
 .tags-row {
   display: flex;
-
   flex-wrap: wrap;
 
-  gap: 4px;
+  gap: 3px;
 }
 
 .unit-tag,
 .stock-tag {
-  font-size: 0.65rem;
+  font-size: 0.59rem;
 
   background: #f1f5f9;
-
   color: #334155;
 
-  padding: 1px 5px;
+  padding: 1px 4px;
 
   border-radius: 4px;
 
   font-weight: 600;
+
+  white-space: nowrap;
 }
 
 .stock-tag {
   background: #fef3c7;
-
   color: #92400e;
 }
 
 .stock-tag.low-stock {
   background: #fee2e2;
-
   color: #991b1b;
 }
 
 /* ============================================================
-   DRUG PRICES
-   ============================================================ */
+   PRICES
+============================================================ */
 
 .price-stack {
-  text-align: right;
+  flex: 0 0 auto;
 
-  font-size: 0.75rem;
+  min-width: 90px;
 
   display: flex;
-
   flex-direction: column;
 
   gap: 1px;
 
-  min-width: 90px;
+  text-align: right;
 
-  flex-shrink: 0;
+  font-size: 0.68rem;
 }
 
 .price-item small {
@@ -719,39 +663,39 @@ button {
 
 .price-item.cost-price {
   color: #d97706;
-
   font-weight: 600;
 }
 
 .price-item.highlight {
-  font-weight: 700;
-
   color: #0284c7;
 
-  font-size: 0.82rem;
+  font-size: 0.73rem;
+  font-weight: 700;
 }
+
+/* ============================================================
+   MANAGER ACTIONS
+============================================================ */
 
 .manager-actions {
   display: flex;
 
-  gap: 4px;
-
-  margin-top: 4px;
-
   justify-content: flex-end;
+
+  gap: 3px;
+
+  margin-top: 3px;
 }
 
 .manager-actions button {
   background: #f1f5f9;
 
-  border:
-    1px solid #cbd5e1;
-
+  border: 1px solid #cbd5e1;
   border-radius: 4px;
 
-  padding: 2px 6px;
+  padding: 2px 5px;
 
-  font-size: 0.68rem;
+  font-size: 0.62rem;
 
   cursor: pointer;
 }
@@ -765,8 +709,8 @@ button {
 }
 
 /* ============================================================
-   CART
-   ============================================================ */
+   CART — BASE
+============================================================ */
 
 .cart-sidebar-wrapper {
   width: 100%;
@@ -775,23 +719,23 @@ button {
 }
 
 .cart-drawer {
+  width: 100%;
+
   background: #ffffff;
 
+  border: 1px solid #e2e8f0;
   border-radius: 10px;
 
-  padding: 0.85rem;
+  padding: 9px;
 
   box-shadow:
     0 -2px 10px rgba(0, 0, 0, 0.08),
     0 4px 12px rgba(0, 0, 0, 0.05);
 
-  border: 1px solid #e2e8f0;
-
   display: flex;
-
   flex-direction: column;
 
-  gap: 0.6rem;
+  gap: 6px;
 
   min-width: 0;
 }
@@ -800,18 +744,22 @@ button {
   display: flex;
 
   justify-content: space-between;
-
   align-items: center;
 
-  gap: 8px;
+  min-height: 24px;
 }
 
 .cart-header h3 {
   margin: 0;
 
-  font-size: 1rem;
+  font-size: 0.88rem;
 
   color: #1e293b;
+}
+
+.cart-mode-label {
+  color: #64748b;
+  font-size: 0.68rem;
 }
 
 .clear-cart-btn {
@@ -821,24 +769,28 @@ button {
 
   color: #ef4444;
 
+  font-size: 0.72rem;
   font-weight: 600;
-
-  font-size: 0.78rem;
 
   cursor: pointer;
 }
 
-.customer-info-section {
-  padding-bottom: 0.4rem;
+/* ============================================================
+   CUSTOMER
+============================================================ */
 
-  border-bottom:
-    1px solid #f1f5f9;
+.customer-info-section {
+  padding-bottom: 4px;
+
+  border-bottom: 1px solid #f1f5f9;
 }
 
 .customer-input-row {
   display: flex;
 
-  gap: 0.5rem;
+  gap: 5px;
+
+  min-width: 0;
 }
 
 .customer-input-row input {
@@ -846,117 +798,114 @@ button {
 
   min-width: 0;
 
-  padding: 0.4rem 0.6rem;
+  width: 0;
 
-  font-size: 0.82rem;
+  padding: 6px 7px;
 
-  border:
-    1px solid #cbd5e1;
-
+  border: 1px solid #cbd5e1;
   border-radius: 6px;
 
   background: #ffffff;
+
+  font-size: 0.72rem;
 }
 
 /* ============================================================
    CART ITEMS
-   ============================================================ */
+============================================================ */
 
 .cart-items-list {
-  max-height: 280px;
-
   min-height: 0;
 
   overflow-y: auto;
+  overflow-x: hidden;
 
   display: flex;
-
   flex-direction: column;
 
-  gap: 0.4rem;
+  gap: 4px;
 
-  padding-right: 4px;
+  padding-right: 3px;
 
-  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .cart-item {
+  flex: 0 0 auto;
+
   display: flex;
 
   align-items: center;
-
   justify-content: space-between;
 
-  gap: 8px;
+  gap: 6px;
 
-  padding: 0.45rem 0.6rem;
+  padding: 5px 6px;
 
   background: #f8fafc;
 
-  border:
-    1px solid #e2e8f0;
-
+  border: 1px solid #e2e8f0;
   border-radius: 6px;
-
-  flex-shrink: 0;
 }
 
 .cart-item-info {
-  display: flex;
+  min-width: 0;
 
+  flex: 1;
+
+  display: flex;
   flex-direction: column;
 
-  min-width: 0;
+  gap: 1px;
 }
 
 .cart-item-name {
-  font-size: 0.88rem;
+  min-width: 0;
+
+  font-size: 0.75rem;
 
   color: #0f172a;
 
   font-weight: 600;
 
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .unit-price {
-  font-size: 0.75rem;
-
+  font-size: 0.63rem;
   color: #64748b;
 }
 
 .qty-controls {
+  flex: 0 0 auto;
+
   display: flex;
 
   align-items: center;
 
-  gap: 0.4rem;
-
-  flex-shrink: 0;
+  gap: 3px;
 }
 
 .qty-controls button {
-  width: 26px;
-
-  height: 26px;
+  width: 25px;
+  height: 25px;
 
   padding: 0;
 
   display: flex;
-
   align-items: center;
-
   justify-content: center;
 
   background: #0284c7;
-
   color: #ffffff;
 
   border: none;
-
   border-radius: 4px;
 
-  font-weight: bold;
+  font-weight: 700;
 
   cursor: pointer;
 }
@@ -966,42 +915,36 @@ button {
 }
 
 .qty-controls span {
-  font-size: 0.88rem;
-
-  font-weight: 600;
-
   min-width: 18px;
 
   text-align: center;
+
+  font-size: 0.76rem;
+  font-weight: 600;
 }
 
 /* ============================================================
    CART SUMMARY
-   ============================================================ */
+============================================================ */
 
 .cart-summary {
   display: flex;
-
   flex-direction: column;
 
-  gap: 0.5rem;
+  gap: 5px;
 
-  border-top:
-    2px solid #f1f5f9;
+  border-top: 2px solid #f1f5f9;
 
-  padding-top: 0.6rem;
+  padding-top: 6px;
 }
 
 .total-display {
   display: flex;
 
   justify-content: space-between;
-
   align-items: center;
 
-  gap: 10px;
-
-  font-size: 0.95rem;
+  font-size: 0.82rem;
 
   font-weight: 700;
 
@@ -1009,24 +952,20 @@ button {
 }
 
 .checkout-btn {
-  background: #16a34a;
+  width: 100%;
 
+  background: #16a34a;
   color: #ffffff;
 
   border: none;
-
-  padding: 0.65rem;
-
   border-radius: 6px;
 
-  font-size: 0.9rem;
+  padding: 8px;
 
+  font-size: 0.8rem;
   font-weight: 700;
 
   cursor: pointer;
-
-  transition:
-    background 0.2s ease;
 }
 
 .checkout-btn:hover {
@@ -1036,18 +975,131 @@ button {
 .empty-cart-message {
   color: #94a3b8;
 
-  font-size: 0.82rem;
+  font-size: 0.7rem;
 
   text-align: center;
 
-  padding: 1rem 0.5rem;
+  padding: 4px;
 }
 
 /* ============================================================
-   MOBILE CART
-   ============================================================ */
+   MOBILE CART FIX
+   ------------------------------------------------------------
+   This is the important fix for the iPhone SE.
+
+   The cart is allowed to occupy only a controlled portion of
+   the viewport. Its own item list scrolls internally.
+
+   Therefore adding 10, 20 or 30 drugs does NOT make the cart
+   keep growing and cover the drug catalog.
+============================================================ */
 
 @media (max-width: 767px) {
+
+  .app-container {
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+
+  .header {
+    padding: 6px 7px;
+
+    gap: 4px;
+
+    border-radius: 7px;
+  }
+
+  .user-profile-header {
+    padding-bottom: 4px;
+  }
+
+  .user-email {
+    font-size: 0.63rem;
+  }
+
+  .user-role-badge {
+    font-size: 0.53rem;
+  }
+
+  .logout-btn {
+    font-size: 0.59rem;
+    padding: 3px 6px;
+  }
+
+  .header-title-row h1 {
+    font-size: 0.73rem;
+  }
+
+  .status-badge {
+    font-size: 0.58rem;
+    padding: 1px 5px;
+  }
+
+  .nav-tabs button,
+  .price-mode-toggle button {
+    font-size: 0.62rem;
+    padding: 4px 2px;
+  }
+
+  .add-drug-btn {
+    padding: 4px 7px;
+    font-size: 0.61rem;
+  }
+
+  .search-input {
+    min-height: 32px;
+    padding: 6px 8px;
+    font-size: 0.78rem;
+  }
+
+  /* ----------------------------------------------------------
+     CATALOG
+
+     Keep it above the fixed cart and give it a predictable
+     amount of usable space.
+  ---------------------------------------------------------- */
+
+  .pos-screen {
+    gap: 5px;
+  }
+
+  .drug-list {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .drug-card {
+    padding: 6px 7px;
+    gap: 5px;
+  }
+
+  .drug-name {
+    font-size: 0.76rem;
+  }
+
+  .price-stack {
+    min-width: 84px;
+    font-size: 0.63rem;
+  }
+
+  .price-item.highlight {
+    font-size: 0.68rem;
+  }
+
+  .unit-tag,
+  .stock-tag {
+    font-size: 0.55rem;
+  }
+
+  /* ----------------------------------------------------------
+     FIXED MOBILE CART
+
+     The cart itself never exceeds 39% of the viewport.
+     On a 667px iPhone SE screen this is about 260px.
+
+     This leaves roughly 61% of the viewport for the catalog
+     and header.
+  ---------------------------------------------------------- */
 
   .cart-sidebar-wrapper {
     position: fixed;
@@ -1056,119 +1108,198 @@ button {
     right: 0;
     bottom: 0;
 
+    width: 100%;
+
     z-index: 1000;
+
+    padding:
+      0
+      env(safe-area-inset-right)
+      env(safe-area-inset-bottom)
+      env(safe-area-inset-left);
+
+    pointer-events: none;
   }
 
   .cart-drawer {
+    pointer-events: auto;
+
     width: 100%;
 
-    max-height: 70vh;
-
-    overflow: hidden;
-
-    gap: 0.5rem;
+    max-height: 39dvh;
+    max-height: 39vh;
 
     padding:
-      0.65rem 0.7rem;
+      6px 7px
+      calc(6px + env(safe-area-inset-bottom));
 
-    padding-bottom:
-      calc(
-        0.65rem +
-        env(
-          safe-area-inset-bottom
-        )
-      );
+    gap: 5px;
 
-    border-radius:
-      12px 12px 0 0;
+    border-radius: 11px 11px 0 0;
 
     border-bottom: none;
+
+    box-shadow:
+      0 -4px 18px rgba(15, 23, 42, 0.14);
+
+    overflow: hidden;
+  }
+
+  .cart-header {
+    flex: 0 0 auto;
+
+    min-height: 21px;
   }
 
   .cart-header h3 {
-    font-size: 0.85rem;
+    font-size: 0.76rem;
   }
 
+  .cart-mode-label {
+    font-size: 0.59rem;
+  }
+
+  .clear-cart-btn {
+    font-size: 0.64rem;
+  }
+
+  .customer-info-section {
+    flex: 0 0 auto;
+  }
+
+  .customer-input-row {
+    gap: 4px;
+  }
+
+  .customer-input-row input {
+    padding: 5px 6px;
+    font-size: 0.64rem;
+  }
+
+  /* ----------------------------------------------------------
+     CRITICAL:
+     The list itself scrolls rather than the cart growing.
+  ---------------------------------------------------------- */
+
   .cart-items-list {
-    max-height:
-      min(280px, 32vh);
+    flex: 1 1 auto;
+
+    min-height: 0;
+
+    max-height: 15dvh;
+    max-height: 15vh;
+
+    overflow-y: auto;
+
+    gap: 3px;
+  }
+
+  .cart-item {
+    padding: 4px 5px;
+  }
+
+  .cart-item-name {
+    font-size: 0.68rem;
+  }
+
+  .unit-price {
+    font-size: 0.57rem;
+  }
+
+  .qty-controls {
+    gap: 2px;
+  }
+
+  .qty-controls button {
+    width: 23px;
+    height: 23px;
+
+    font-size: 0.78rem;
+  }
+
+  .qty-controls span {
+    font-size: 0.68rem;
   }
 
   .cart-summary {
-    flex-direction: row;
+    flex: 0 0 auto;
 
-    justify-content:
-      space-between;
+    display: grid;
+
+    grid-template-columns:
+      minmax(0, 1fr)
+      auto;
 
     align-items: center;
 
-    padding-top: 0.5rem;
+    gap: 7px;
+
+    padding-top: 5px;
   }
 
   .total-display {
+    min-width: 0;
+
+    display: flex;
+
     flex-direction: column;
 
     align-items: flex-start;
 
     gap: 0;
 
-    font-size: 0.9rem;
+    font-size: 0.76rem;
   }
 
   .total-display span {
-    font-size: 0.7rem;
-
-    font-weight: 600;
-
+    font-size: 0.57rem;
     color: #64748b;
   }
 
   .checkout-btn {
-    padding:
-      0.6rem 1.1rem;
+    width: auto;
 
-    font-size: 0.85rem;
+    min-width: 115px;
+
+    padding: 7px 10px;
+
+    font-size: 0.7rem;
   }
 
-  .empty-cart-message {
-    padding:
-      0.4rem 0.5rem;
+  /* ----------------------------------------------------------
+     IMPORTANT CATALOG CLEARANCE
 
-    font-size: 0.75rem;
-  }
+     The catalog needs enough bottom space to ensure the fixed
+     cart never hides the last drug cards.
 
-  /*
-    These values are intentionally smaller than
-    the original 470px clearance.
-  */
+     Use viewport-relative space rather than the old fixed
+     470px value.
+  ---------------------------------------------------------- */
 
   .pos-screen.cart-empty {
-    padding-bottom: 100px;
+    padding-bottom: 65px;
   }
 
   .pos-screen.cart-active {
-    padding-bottom: 390px;
+    padding-bottom: 42vh;
+    padding-bottom: 42dvh;
   }
 }
 
 /* ============================================================
-   SMALL MOBILE — iPHONE SE / NARROW PHONES
-   ============================================================ */
+   VERY SMALL PHONE
+   iPhone SE 2020 = 375 x 667 CSS pixels
+============================================================ */
 
-@media (max-width: 480px) {
+@media (max-width: 380px) and (max-height: 700px) {
 
   .app-container {
-    padding: 3px;
-
     gap: 4px;
   }
 
   .header {
+    gap: 3px;
     padding: 5px 6px;
-
-    gap: 4px;
-
-    border-radius: 6px;
   }
 
   .user-profile-header {
@@ -1176,177 +1307,131 @@ button {
   }
 
   .user-email {
-    font-size: 0.64rem;
+    font-size: 0.58rem;
   }
 
   .user-role-badge {
-    font-size: 0.52rem;
-
-    padding:
-      1px 4px;
+    display: none;
   }
 
   .logout-btn {
-    padding:
-      2px 6px;
-
-    font-size: 0.6rem;
+    font-size: 0.56rem;
+    padding: 2px 5px;
   }
 
   .header-title-row h1 {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
   }
 
   .status-badge {
-    font-size: 0.58rem;
-
-    padding:
-      1px 5px;
-  }
-
-  /*
-    Compact single-row controls:
-
-    POS/History | Retail/Wholesale | +Drug
-  */
-
-  .controls-bar {
-    grid-template-columns:
-      minmax(0, 1.45fr)
-      minmax(0, 1fr)
-      auto;
-
-    gap: 3px;
-  }
-
-  .nav-tabs,
-  .price-mode-toggle {
-    gap: 1px;
-
-    padding: 1px;
+    font-size: 0.54rem;
   }
 
   .nav-tabs button,
   .price-mode-toggle button {
-    padding:
-      4px 2px;
-
-    font-size: 0.6rem;
+    font-size: 0.57rem;
+    padding: 3px 1px;
   }
 
   .add-drug-btn {
-    min-width: 42px;
-
-    padding:
-      4px 6px;
-
-    font-size: 0.6rem;
-  }
-
-  .add-drug-full {
-    display: none;
-  }
-
-  .add-drug-short {
-    display: inline;
-  }
-
-  .add-drug-icon {
-    font-size: 0.8rem;
+    font-size: 0.56rem;
+    padding: 3px 5px;
   }
 
   .search-input {
-    padding:
-      6px 8px;
-
-    font-size: 0.78rem;
+    min-height: 30px;
+    font-size: 0.72rem;
+    padding: 5px 7px;
   }
 
-  /*
-    Make drug cards slightly tighter.
-  */
-
   .drug-list {
-    grid-template-columns: 1fr;
-
-    gap: 4px;
+    gap: 3px;
   }
 
   .drug-card {
-    padding:
-      7px 8px;
-
-    gap: 5px;
+    padding: 5px 6px;
   }
 
   .drug-name {
-    font-size: 0.78rem;
+    font-size: 0.72rem;
+  }
+
+  .price-stack {
+    min-width: 78px;
+    font-size: 0.59rem;
+  }
+
+  .price-item.highlight {
+    font-size: 0.63rem;
   }
 
   .unit-tag,
   .stock-tag {
-    font-size: 0.58rem;
+    font-size: 0.51rem;
   }
 
-  .price-stack {
-    min-width: 82px;
+  /*
+    On the 375 x 667 iPhone SE:
+    37vh ≈ 247px.
 
-    font-size: 0.68rem;
+    The cart therefore stays compact even with many items.
+  */
+
+  .cart-drawer {
+    max-height: 37vh;
+    max-height: 37dvh;
+
+    padding: 5px 6px;
   }
 
-  .price-item.highlight {
-    font-size: 0.74rem;
+  .cart-items-list {
+    max-height: 13vh;
+    max-height: 13dvh;
   }
 
-  .manager-actions button {
-    padding:
-      2px 5px;
-
-    font-size: 0.6rem;
-  }
-
-  .customer-input-row {
-    flex-direction: column;
-
-    gap: 4px;
+  .cart-header h3 {
+    font-size: 0.7rem;
   }
 
   .customer-input-row input {
-    font-size: 0.76rem;
-
-    padding:
-      0.38rem 0.5rem;
+    font-size: 0.59rem;
+    padding: 4px 5px;
   }
 
   .cart-item-name {
-    font-size: 0.78rem;
+    font-size: 0.63rem;
   }
 
   .unit-price {
-    font-size: 0.67rem;
-  }
-
-  .qty-controls {
-    gap: 0.25rem;
+    font-size: 0.53rem;
   }
 
   .qty-controls button {
-    width: 25px;
+    width: 22px;
+    height: 22px;
+  }
 
-    height: 25px;
+  .checkout-btn {
+    min-width: 105px;
+    padding: 6px 8px;
+    font-size: 0.64rem;
+  }
+
+  .pos-screen.cart-active {
+    padding-bottom: 40vh;
+    padding-bottom: 40dvh;
   }
 }
 
 /* ============================================================
-   TABLET + DESKTOP
-   ============================================================ */
+   TABLET / DESKTOP
+============================================================ */
 
 @media (min-width: 768px) {
 
   .app-container {
-    padding: 8px;
-
-    gap: 8px;
+    padding: 10px;
+    gap: 10px;
   }
 
   .pos-screen {
@@ -1364,7 +1449,14 @@ button {
   .cart-sidebar-wrapper {
     position: sticky;
 
-    top: 8px;
+    top: 10px;
+  }
+
+  .cart-drawer {
+    max-height:
+      calc(100vh - 20px);
+
+    overflow: hidden;
   }
 
   .cart-items-list {
@@ -1372,33 +1464,26 @@ button {
       calc(100vh - 430px);
   }
 
-  /*
-    Keep drug cards horizontal on desktop.
-    This is more efficient for a POS.
-  */
-
   .drug-card {
-    flex-direction: row;
-
-    align-items: flex-start;
+    flex-direction: column;
   }
 
   .price-stack {
-    text-align: right;
+    width: 100%;
 
-    border-top: none;
+    min-width: 0;
 
-    padding-top: 0;
+    padding-top: 5px;
 
-    min-width: 100px;
+    border-top: 1px dashed #f1f5f9;
   }
 }
 
 /* ============================================================
-   DESKTOP
-   ============================================================ */
+   DESKTOP HEADER
+============================================================ */
 
-@media (min-width: 1024px) {
+@media (min-width: 900px) {
 
   .header {
     display: grid;
@@ -1412,31 +1497,22 @@ button {
       "title controls user"
       "search search search";
 
-    column-gap: 12px;
-
-    row-gap: 6px;
-
     align-items: center;
 
-    padding:
-      7px 10px;
+    column-gap: 14px;
+    row-gap: 7px;
+
+    padding: 8px 12px;
   }
 
   .header-title-row {
     grid-area: title;
+
+    justify-content: flex-start;
   }
 
-  .controls-bar {
-    grid-area: controls;
-
-    width: 100%;
-
-    min-width: 0;
-
-    grid-template-columns:
-      minmax(180px, 1.4fr)
-      minmax(150px, 1fr)
-      auto;
+  .header-title-row h1 {
+    font-size: 0.95rem;
   }
 
   .user-profile-header {
@@ -1446,34 +1522,51 @@ button {
 
     padding-bottom: 0;
 
-    white-space: nowrap;
+    justify-content: flex-end;
+  }
+
+  .controls-bar {
+    grid-area: controls;
+
+    width: 100%;
+
+    display: flex;
+
+    flex-wrap: nowrap;
+
+    align-items: center;
+
+    min-width: 0;
+
+    justify-content: center;
+  }
+
+  .nav-tabs {
+    flex: 0 1 210px;
+  }
+
+  .price-mode-toggle {
+    flex: 0 1 190px;
+  }
+
+  .add-drug-btn {
+    flex: 0 0 auto;
+
+    min-width: 82px;
+
+    padding: 5px 10px;
   }
 
   .search-row {
     grid-area: search;
-  }
 
-  .header-title-row h1 {
-    font-size: 0.9rem;
-  }
-
-  .nav-tabs button,
-  .price-mode-toggle button {
-    font-size: 0.68rem;
-
-    padding:
-      5px 7px;
-  }
-
-  .add-drug-btn {
-    padding:
-      5px 10px;
+    width: 100%;
   }
 }
 
 /* ============================================================
-   LARGE DESKTOP
-   ============================================================ */
+   LARGER DESKTOP
+============================================================ */
 
 @media (min-width: 1200px) {
 
@@ -1481,30 +1574,44 @@ button {
     grid-template-columns:
       minmax(0, 1fr)
       380px;
+
+    gap: 16px;
+  }
+
+  .drug-list {
+    grid-template-columns:
+      repeat(
+        auto-fill,
+        minmax(270px, 1fr)
+      );
   }
 
   .header {
-    padding:
-      8px 12px;
+    padding: 9px 14px;
   }
 
   .header-title-row h1 {
-    font-size: 0.95rem;
+    font-size: 1rem;
+  }
+
+  .nav-tabs {
+    flex-basis: 230px;
+  }
+
+  .price-mode-toggle {
+    flex-basis: 210px;
   }
 }
 
 /* ============================================================
    MODALS
-   ============================================================ */
+============================================================ */
 
 .modal-overlay,
 .receipt-container {
   position: fixed;
 
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  inset: 0;
 
   background:
     rgba(15, 23, 42, 0.6);
@@ -1512,7 +1619,6 @@ button {
   display: flex;
 
   align-items: center;
-
   justify-content: center;
 
   z-index: 2000;
@@ -1521,23 +1627,22 @@ button {
 }
 
 .modal-card {
+  width: 100%;
+  max-width: 420px;
+
+  max-height: 90vh;
+  max-height: 90dvh;
+
+  overflow-y: auto;
+
   background: #ffffff;
 
   border-radius: 12px;
 
   padding: 16px;
 
-  width: 100%;
-
-  max-width: 420px;
-
-  max-height: 90vh;
-
-  overflow-y: auto;
-
   box-shadow:
-    0 4px 20px
-    rgba(0, 0, 0, 0.15);
+    0 4px 20px rgba(0, 0, 0, 0.15);
 }
 
 .modal-card h3 {
@@ -1548,7 +1653,6 @@ button {
 
 .crud-form {
   display: flex;
-
   flex-direction: column;
 
   gap: 8px;
@@ -1564,14 +1668,12 @@ button {
 
 .crud-form input,
 .crud-form select {
+  width: 100%;
+
   padding: 7px;
 
-  border:
-    1px solid #cbd5e1;
-
+  border: 1px solid #cbd5e1;
   border-radius: 6px;
-
-  width: 100%;
 
   font-size: 0.85rem;
 }
@@ -1584,7 +1686,6 @@ button {
 
 .form-row > div {
   flex: 1;
-
   min-width: 0;
 }
 
@@ -1596,12 +1697,9 @@ button {
   margin-top: 10px;
 }
 
-.save-btn {
+.save-btn,
+.cancel-btn {
   flex: 1;
-
-  background: #059669;
-
-  color: #ffffff;
 
   border: none;
 
@@ -1614,42 +1712,34 @@ button {
   cursor: pointer;
 }
 
+.save-btn {
+  background: #059669;
+  color: #ffffff;
+}
+
 .cancel-btn {
-  flex: 1;
-
   background: #e2e8f0;
-
   color: #334155;
-
-  border: none;
-
-  padding: 8px;
-
-  border-radius: 6px;
-
-  font-weight: 600;
-
-  cursor: pointer;
 }
 
 /* ============================================================
    RECEIPT
-   ============================================================ */
+============================================================ */
 
 .receipt-card {
+  width: 100%;
+  max-width: 340px;
+
+  max-height: 90vh;
+  max-height: 90dvh;
+
+  overflow-y: auto;
+
   background: #ffffff;
 
   padding: 14px;
 
   border-radius: 8px;
-
-  width: 100%;
-
-  max-width: 340px;
-
-  max-height: 90vh;
-
-  overflow-y: auto;
 }
 
 .receipt-header {
@@ -1659,8 +1749,7 @@ button {
 }
 
 .receipt-header h2 {
-  margin:
-    0 0 4px 0;
+  margin: 0 0 4px;
 
   font-size: 1rem;
 }
@@ -1687,12 +1776,10 @@ button {
 
 .receipt-item-row span:first-child {
   min-width: 0;
-
-  overflow-wrap: anywhere;
 }
 
 .receipt-item-row span:last-child {
-  flex-shrink: 0;
+  flex: 0 0 auto;
 }
 
 .receipt-total {
@@ -1727,12 +1814,9 @@ button {
   margin-top: 10px;
 }
 
-.print-btn {
+.print-btn,
+.close-btn {
   flex: 1;
-
-  background: #2563eb;
-
-  color: #ffffff;
 
   border: none;
 
@@ -1747,34 +1831,26 @@ button {
   cursor: pointer;
 }
 
+.print-btn {
+  background: #2563eb;
+  color: #ffffff;
+}
+
 .close-btn {
-  flex: 1;
-
   background: #e2e8f0;
-
   color: #0f172a;
-
-  border: none;
-
-  padding: 8px;
-
-  border-radius: 6px;
-
-  font-weight: 600;
-
-  font-size: 0.8rem;
-
-  cursor: pointer;
 }
 
 /* ============================================================
    SALES HISTORY
-   ============================================================ */
+============================================================ */
 
 .history-screen {
+  width: 100%;
+
   background: #ffffff;
 
-  padding: 0.75rem;
+  padding: 9px;
 
   border-radius: 10px;
 
@@ -1788,13 +1864,13 @@ button {
 
   flex-direction: column;
 
-  gap: 0.5rem;
+  gap: 6px;
 
-  margin-bottom: 0.75rem;
+  margin-bottom: 9px;
 }
 
 .history-header-row h2 {
-  font-size: 0.95rem;
+  font-size: 0.9rem;
 
   margin: 0;
 }
@@ -1802,7 +1878,7 @@ button {
 .history-filter-controls {
   display: flex;
 
-  gap: 6px;
+  gap: 5px;
 
   width: 100%;
 
@@ -1811,19 +1887,17 @@ button {
 
 .history-search-input,
 .history-cashier-select {
-  padding:
-    6px 8px;
-
-  border:
-    1px solid #cbd5e0;
-
-  border-radius: 5px;
-
-  font-size: 0.78rem;
+  min-width: 0;
 
   width: 100%;
 
-  min-width: 0;
+  padding: 6px 8px;
+
+  border: 1px solid #cbd5e0;
+
+  border-radius: 5px;
+
+  font-size: 0.72rem;
 }
 
 .sales-list {
@@ -1831,56 +1905,20 @@ button {
 
   grid-template-columns: 1fr;
 
-  gap: 0.6rem;
-}
-
-@media (min-width: 768px) {
-
-  .history-screen {
-    padding: 1rem;
-  }
-
-  .history-header-row {
-    flex-direction: row;
-
-    justify-content:
-      space-between;
-
-    align-items: center;
-  }
-
-  .history-filter-controls {
-    width: auto;
-
-    min-width: 340px;
-  }
-}
-
-@media (min-width: 1024px) {
-
-  .sales-list {
-    grid-template-columns:
-      repeat(
-        2,
-        minmax(0, 1fr)
-      );
-  }
+  gap: 6px;
 }
 
 .sale-history-card {
   background: #ffffff;
 
-  border:
-    1px solid #e2e8f0;
+  border: 1px solid #e2e8f0;
 
   border-radius: 6px;
 
-  padding:
-    8px 10px;
+  padding: 8px 10px;
 
   box-shadow:
-    0 1px 2px
-    rgba(0, 0, 0, 0.04);
+    0 1px 2px rgba(0, 0, 0, 0.04);
 
   min-width: 0;
 }
@@ -1888,15 +1926,12 @@ button {
 .sale-card-header {
   display: flex;
 
-  justify-content:
-    space-between;
-
+  justify-content: space-between;
   align-items: center;
 
-  gap: 8px;
+  gap: 6px;
 
-  border-bottom:
-    1px solid #edf2f7;
+  border-bottom: 1px solid #edf2f7;
 
   padding-bottom: 4px;
 
@@ -1909,17 +1944,15 @@ button {
 
 .sale-date {
   font-size: 0.7rem;
-
   color: #64748b;
 }
 
 .sale-type-pill {
-  flex-shrink: 0;
+  flex: 0 0 auto;
 
   background: #e2e8f0;
 
-  padding:
-    1px 5px;
+  padding: 1px 5px;
 
   border-radius: 3px;
 
@@ -1945,8 +1978,7 @@ button {
 .sale-items-table {
   background: #f8f9fa;
 
-  padding:
-    4px 8px;
+  padding: 4px 8px;
 
   border-radius: 4px;
 
@@ -1958,30 +1990,17 @@ button {
 .sale-item-row {
   display: flex;
 
-  justify-content:
-    space-between;
+  justify-content: space-between;
 
   gap: 8px;
 
   padding: 1px 0;
 }
 
-.sale-item-row span:first-child {
-  min-width: 0;
-
-  overflow-wrap: anywhere;
-}
-
-.sale-item-row span:last-child {
-  flex-shrink: 0;
-}
-
 .sale-card-footer {
   display: flex;
 
-  justify-content:
-    space-between;
-
+  justify-content: space-between;
   align-items: center;
 
   gap: 8px;
@@ -1990,21 +2009,19 @@ button {
 }
 
 .receipt-btn {
+  flex: 0 0 auto;
+
   background: #edf2f7;
 
-  border:
-    1px solid #cbd5e0;
+  border: 1px solid #cbd5e0;
 
-  padding:
-    4px 8px;
+  padding: 4px 8px;
 
   border-radius: 4px;
 
   cursor: pointer;
 
   font-size: 0.72rem;
-
-  white-space: nowrap;
 }
 
 .empty-state {
@@ -2018,52 +2035,44 @@ button {
 }
 
 /* ============================================================
-   VERY NARROW HISTORY SCREEN
-   ============================================================ */
+   HISTORY DESKTOP
+============================================================ */
 
-@media (max-width: 480px) {
+@media (min-width: 768px) {
 
   .history-screen {
-    padding: 7px;
+    padding: 12px;
+  }
+
+  .history-header-row {
+    flex-direction: row;
+
+    justify-content: space-between;
+
+    align-items: center;
   }
 
   .history-filter-controls {
-    flex-direction: column;
-  }
+    width: auto;
 
-  .history-header-row h2 {
-    font-size: 0.82rem;
+    min-width: 340px;
   }
+}
 
-  .sale-history-card {
-    padding:
-      7px 8px;
-  }
+@media (min-width: 1024px) {
 
-  .sale-card-header strong {
-    font-size: 0.72rem;
-  }
-
-  .sale-date {
-    font-size: 0.62rem;
-  }
-
-  .sale-customer-details {
-    font-size: 0.68rem;
-  }
-
-  .sale-items-table {
-    font-size: 0.68rem;
-  }
-
-  .sale-card-footer {
-    font-size: 0.7rem;
+  .sales-list {
+    grid-template-columns:
+      repeat(
+        2,
+        minmax(0, 1fr)
+      );
   }
 }
 
 /* ============================================================
    PRINT
-   ============================================================ */
+============================================================ */
 
 @media print {
 
@@ -2080,12 +2089,11 @@ button {
   }
 
   .receipt-card {
+    width: 100%;
+    max-width: 100%;
+
     box-shadow: none;
 
     border: none;
-
-    width: 100%;
-
-    max-width: 100%;
   }
 }

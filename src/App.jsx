@@ -13,7 +13,6 @@ export default function App() {
   // ============================================================
   // AUTH STATE
   // ============================================================
-
   const [session, setSession] = useState(null);
   const [userRole, setUserRole] = useState('salesperson');
   const [loginEmail, setLoginEmail] = useState('');
@@ -22,15 +21,13 @@ export default function App() {
   const [authError, setAuthError] = useState('');
 
   // ============================================================
-  // NAVIGATION VIEW STATE
+  // NAVIGATION
   // ============================================================
-
   const [activeTab, setActiveTab] = useState('pos');
 
   // ============================================================
   // POS STATE
   // ============================================================
-
   const [searchTerm, setSearchTerm] = useState('');
   const [cart, setCart] = useState([]);
   const [saleType, setSaleType] = useState('retail');
@@ -38,21 +35,24 @@ export default function App() {
   const [customerPhone, setCustomerPhone] = useState('');
 
   // ============================================================
-  // SALE CONFIRMATION / RECEIPT MODAL
+  // RECEIPT STATE
   // ============================================================
-
   const [saleSuccessData, setSaleSuccessData] = useState(null);
   const [showReceiptModal, setShowReceiptModal] = useState(false);
 
+  // ============================================================
+  // NETWORK STATE
+  // ============================================================
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
-  // Cart list ref
+  // ============================================================
+  // CART LIST REF
+  // ============================================================
   const cartListRef = useRef(null);
 
   // ============================================================
   // MANAGER CRUD MODAL
   // ============================================================
-
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingDrug, setEditingDrug] = useState(null);
 
@@ -69,7 +69,6 @@ export default function App() {
   // ============================================================
   // SALES HISTORY
   // ============================================================
-
   const [historySearchTerm, setHistorySearchTerm] = useState('');
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
   const [cloudSales, setCloudSales] = useState([]);
@@ -77,26 +76,22 @@ export default function App() {
   // ============================================================
   // AUTO-SCROLL CART
   // ============================================================
-
   useEffect(() => {
     if (cart.length > 0 && cartListRef.current) {
-      cartListRef.current.scrollTo({
-        top: cartListRef.current.scrollHeight,
-        behavior: 'smooth'
+      requestAnimationFrame(() => {
+        cartListRef.current.scrollTo({
+          top: cartListRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
       });
     }
   }, [cart]);
 
   // ============================================================
-  // SUPABASE AUTH SESSION
+  // SUPABASE AUTH
   // ============================================================
-
   useEffect(() => {
-    let mounted = true;
-
     supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!mounted) return;
-
       setSession(session);
 
       if (session) {
@@ -107,26 +102,15 @@ export default function App() {
     const {
       data: { subscription }
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return;
-
       setSession(session);
 
       if (session) {
         fetchUserProfile(session.user.id);
-      } else {
-        setUserRole('salesperson');
       }
     });
 
-    return () => {
-      mounted = false;
-      subscription.unsubscribe();
-    };
+    return () => subscription.unsubscribe();
   }, []);
-
-  // ============================================================
-  // FETCH USER PROFILE / ROLE
-  // ============================================================
 
   const fetchUserProfile = async (userId) => {
     try {
@@ -151,13 +135,8 @@ export default function App() {
     }
   };
 
-  // ============================================================
-  // LOGIN
-  // ============================================================
-
   const handleLogin = async (e) => {
     e.preventDefault();
-
     setAuthError('');
 
     const { error } = await supabase.auth.signInWithPassword({
@@ -170,28 +149,20 @@ export default function App() {
     }
   };
 
-  // ============================================================
-  // LOGOUT
-  // ============================================================
-
   const handleLogout = async () => {
     await supabase.auth.signOut();
-
     setCart([]);
     setSession(null);
-    setUserRole('salesperson');
   };
 
   // ============================================================
-  // FETCH CENTRAL SALES HISTORY
+  // CLOUD SALES
   // ============================================================
-
   const fetchCloudSales = async () => {
     if (!navigator.onLine || !session) return;
 
     try {
       const oneYearAgo = new Date();
-
       oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
       let query = supabase
@@ -217,8 +188,7 @@ export default function App() {
           cashierEmail: s.cashier_email || s.cashierEmail,
           customerName:
             s.customer_name || s.customerName || 'Walk-in Customer',
-          customerPhone:
-            s.customer_phone || s.customerPhone || 'N/A',
+          customerPhone: s.customer_phone || s.customerPhone || 'N/A',
           createdAt: s.created_at || s.createdAt,
           items:
             typeof s.items === 'string'
@@ -235,9 +205,8 @@ export default function App() {
   };
 
   // ============================================================
-  // ONLINE / OFFLINE + SYNC
+  // ONLINE / OFFLINE SYNC
   // ============================================================
-
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
@@ -274,10 +243,6 @@ export default function App() {
     };
   }, [session, userRole]);
 
-  // ============================================================
-  // FETCH HISTORY WHEN OPENING HISTORY TAB
-  // ============================================================
-
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
@@ -285,9 +250,8 @@ export default function App() {
   }, [activeTab, isOnline]);
 
   // ============================================================
-  // LIVE QUERY — DRUG INVENTORY
+  // DRUG INVENTORY
   // ============================================================
-
   const drugs = useLiveQuery(async () => {
     if (!searchTerm.trim()) {
       return db.drugs.toArray();
@@ -297,13 +261,8 @@ export default function App() {
 
     return db.drugs
       .filter((drug) => {
-        const nameMatch = drug.name
-          ?.toLowerCase()
-          .includes(term);
-
-        const barcodeMatch = drug.barcode
-          ?.toLowerCase()
-          .includes(term);
+        const nameMatch = drug.name?.toLowerCase().includes(term);
+        const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
 
         return Boolean(nameMatch || barcodeMatch);
       })
@@ -311,19 +270,14 @@ export default function App() {
   }, [searchTerm]);
 
   // ============================================================
-  // LIVE QUERY — LOCAL SALES
+  // LOCAL SALES
   // ============================================================
-
   const localSales = useLiveQuery(async () => {
     if (!session) return [];
 
-    let records = await db.sales
-      .orderBy('createdAt')
-      .reverse()
-      .toArray();
+    let records = await db.sales.orderBy('createdAt').reverse().toArray();
 
     const oneYearAgo = new Date();
-
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
     records = records.filter(
@@ -342,9 +296,8 @@ export default function App() {
   }, [session, userRole]);
 
   // ============================================================
-  // MERGE LOCAL + CLOUD SALES
+  // MERGE SALES
   // ============================================================
-
   const salesHistory = React.useMemo(() => {
     const combinedMap = new Map();
 
@@ -373,22 +326,16 @@ export default function App() {
     }
 
     if (historySearchTerm.trim()) {
-      const term = historySearchTerm
-        .toLowerCase()
-        .trim();
+      const term = historySearchTerm.toLowerCase();
 
       records = records.filter(
         (s) =>
           (s.customerName &&
-            s.customerName
-              .toLowerCase()
-              .includes(term)) ||
+            s.customerName.toLowerCase().includes(term)) ||
           (s.customerPhone &&
             s.customerPhone.includes(term)) ||
           (s.id &&
-            String(s.id)
-              .toLowerCase()
-              .includes(term))
+            String(s.id).toLowerCase().includes(term))
       );
     }
 
@@ -404,18 +351,13 @@ export default function App() {
   // ============================================================
   // CART OPERATIONS
   // ============================================================
-
   const addToCart = (drug) => {
     const retail = Number(
-      drug.retailPrice ??
-        drug.retail_price ??
-        0
+      drug.retailPrice ?? drug.retail_price ?? 0
     );
 
     const wholesale = Number(
-      drug.wholesalePrice ??
-        drug.wholesale_price ??
-        0
+      drug.wholesalePrice ?? drug.wholesale_price ?? 0
     );
 
     const activePrice =
@@ -507,9 +449,8 @@ export default function App() {
   );
 
   // ============================================================
-  // COMPLETE SALE
+  // CHECKOUT
   // ============================================================
-
   const handleCheckout = async () => {
     if (cart.length === 0) return;
 
@@ -521,8 +462,7 @@ export default function App() {
         total: cartTotal,
         saleType,
         cashierId:
-          session?.user?.id ||
-          'offline_id',
+          session?.user?.id || 'offline_id',
         cashierEmail:
           session?.user?.email ||
           'offline_cashier',
@@ -530,10 +470,8 @@ export default function App() {
           customerName.trim() ||
           'Walk-in Customer',
         customerPhone:
-          customerPhone.trim() ||
-          'N/A',
-        createdAt:
-          new Date().toISOString(),
+          customerPhone.trim() || 'N/A',
+        createdAt: new Date().toISOString(),
         items: [...cart],
         synced: 0
       };
@@ -574,7 +512,6 @@ export default function App() {
         }
       );
 
-      // Update cloud stock
       if (isOnline) {
         for (const item of cart) {
           if (item.id) {
@@ -611,16 +548,13 @@ export default function App() {
           id: saleData.id,
           total: saleData.total,
           sale_type: saleData.saleType,
-          cashier_id:
-            saleData.cashierId,
-          cashier_email:
-            saleData.cashierEmail,
+          cashier_id: saleData.cashierId,
+          cashier_email: saleData.cashierEmail,
           customer_name:
             saleData.customerName,
           customer_phone:
             saleData.customerPhone,
-          created_at:
-            saleData.createdAt,
+          created_at: saleData.createdAt,
           items: JSON.stringify(
             saleData.items
           )
@@ -676,7 +610,6 @@ export default function App() {
   // ============================================================
   // MANAGER CRUD
   // ============================================================
-
   const handleOpenAddModal = () => {
     setEditingDrug(null);
 
@@ -693,10 +626,7 @@ export default function App() {
     setIsModalOpen(true);
   };
 
-  const handleOpenEditModal = (
-    drug,
-    e
-  ) => {
+  const handleOpenEditModal = (drug, e) => {
     e.stopPropagation();
 
     setEditingDrug(drug);
@@ -719,19 +649,14 @@ export default function App() {
         drug.wholesalePrice ??
         drug.wholesale_price ??
         '',
-      stock:
-        drug.stock ?? '',
-      barcode:
-        drug.barcode || ''
+      stock: drug.stock ?? '',
+      barcode: drug.barcode || ''
     });
 
     setIsModalOpen(true);
   };
 
-  const handleDeleteDrug = async (
-    id,
-    e
-  ) => {
+  const handleDeleteDrug = async (id, e) => {
     e.stopPropagation();
 
     if (
@@ -741,13 +666,8 @@ export default function App() {
     ) {
       const drugKey = String(id);
 
-      await db.drugs.delete(
-        drugKey
-      );
-
-      await db.drugs.delete(
-        Number(id)
-      );
+      await db.drugs.delete(drugKey);
+      await db.drugs.delete(Number(id));
 
       if (isOnline) {
         await supabase
@@ -768,8 +688,7 @@ export default function App() {
     const drugPayload = {
       id: drugId,
       name: formData.name,
-      unitType:
-        formData.unitType,
+      unitType: formData.unitType,
       costPrice: Number(
         formData.costPrice
       ),
@@ -779,9 +698,7 @@ export default function App() {
       wholesalePrice: Number(
         formData.wholesalePrice
       ),
-      stock: Number(
-        formData.stock
-      ),
+      stock: Number(formData.stock),
       barcode: formData.barcode
     };
 
@@ -800,8 +717,7 @@ export default function App() {
       const cloudPayload = {
         id: drugId,
         name: formData.name,
-        unit_type:
-          formData.unitType,
+        unit_type: formData.unitType,
         cost_price: Number(
           formData.costPrice
         ),
@@ -811,9 +727,7 @@ export default function App() {
         wholesale_price: Number(
           formData.wholesalePrice
         ),
-        stock: Number(
-          formData.stock
-        ),
+        stock: Number(formData.stock),
         barcode: formData.barcode
       };
 
@@ -830,7 +744,6 @@ export default function App() {
   // ============================================================
   // LOGIN SCREEN
   // ============================================================
-
   if (!session) {
     return (
       <div className="login-container">
@@ -847,9 +760,7 @@ export default function App() {
             </div>
           )}
 
-          <form
-            onSubmit={handleLogin}
-          >
+          <form onSubmit={handleLogin}>
             <label>
               Email Address:
             </label>
@@ -870,7 +781,7 @@ export default function App() {
               Password:
             </label>
 
-            <div className="password-field">
+            <div className="password-input-wrapper">
               <input
                 type={
                   showPassword
@@ -879,9 +790,7 @@ export default function App() {
                 }
                 required
                 placeholder="••••••••"
-                value={
-                  loginPassword
-                }
+                value={loginPassword}
                 onChange={(e) =>
                   setLoginPassword(
                     e.target.value
@@ -917,19 +826,16 @@ export default function App() {
   }
 
   // ============================================================
-  // MAIN POS APP
+  // MAIN APP
   // ============================================================
-
   return (
     <div className="app-container">
 
       {/* ========================================================
           HEADER
-          ======================================================== */}
-
+      ======================================================== */}
       <header className="header no-print">
 
-        {/* USER */}
         <div className="user-profile-header">
           <div className="user-info-group">
             <span className="user-email">
@@ -937,20 +843,18 @@ export default function App() {
             </span>
 
             <span className="user-role-badge">
-              {userRole.toUpperCase()} ACCOUNT
+              {userRole.toUpperCase()}
             </span>
           </div>
 
           <button
             className="logout-btn"
             onClick={handleLogout}
-            type="button"
           >
             Sign Out
           </button>
         </div>
 
-        {/* TITLE */}
         <div className="header-title-row">
           <h1>
             AZU PHARMACY POS
@@ -969,7 +873,6 @@ export default function App() {
           </span>
         </div>
 
-        {/* MAIN CONTROLS */}
         <div className="controls-bar">
 
           <div className="nav-tabs">
@@ -982,9 +885,8 @@ export default function App() {
               onClick={() =>
                 setActiveTab('pos')
               }
-              type="button"
             >
-              🛒 POS Terminal
+              🛒 POS
             </button>
 
             <button
@@ -998,9 +900,8 @@ export default function App() {
                   'history'
                 )
               }
-              type="button"
             >
-              📋 Sales History
+              📋 History
             </button>
           </div>
 
@@ -1017,9 +918,8 @@ export default function App() {
                     'retail'
                   )
                 }
-                type="button"
               >
-                🛒 Retail
+                Retail
               </button>
 
               <button
@@ -1033,9 +933,8 @@ export default function App() {
                     'wholesale'
                   )
                 }
-                type="button"
               >
-                📦 Wholesale
+                Wholesale
               </button>
             </div>
           )}
@@ -1047,25 +946,12 @@ export default function App() {
                 onClick={
                   handleOpenAddModal
                 }
-                type="button"
-                title="Add a new drug"
               >
-                <span className="add-drug-icon">
-                  +
-                </span>
-
-                <span className="add-drug-full">
-                  Add Drug
-                </span>
-
-                <span className="add-drug-short">
-                  Drug
-                </span>
+                + Add Drug
               </button>
             )}
         </div>
 
-        {/* SEARCH */}
         {activeTab === 'pos' && (
           <div className="search-row">
             <input
@@ -1086,38 +972,34 @@ export default function App() {
 
       {/* ========================================================
           POS TERMINAL
-          ======================================================== */}
-
+      ======================================================== */}
       {activeTab === 'pos' && (
         <div
-          className={`pos-screen no-print ${
+          className={`pos-screen ${
             cart.length > 0
               ? 'cart-active'
               : 'cart-empty'
           }`}
         >
 
-          {/* INVENTORY */}
+          {/* DRUG CATALOG */}
           <div className="pos-catalog-section">
-
             <div className="drug-list">
 
               {drugs &&
               drugs.length > 0 ? (
                 drugs.map((drug) => {
-                  const cost =
-                    Number(
-                      drug.costPrice ??
-                        drug.cost_price ??
-                        0
-                    );
+                  const cost = Number(
+                    drug.costPrice ??
+                      drug.cost_price ??
+                      0
+                  );
 
-                  const retail =
-                    Number(
-                      drug.retailPrice ??
-                        drug.retail_price ??
-                        0
-                    );
+                  const retail = Number(
+                    drug.retailPrice ??
+                      drug.retail_price ??
+                      0
+                  );
 
                   const wholesale =
                     Number(
@@ -1141,7 +1023,6 @@ export default function App() {
                     >
 
                       <div className="drug-info">
-
                         <div className="drug-name">
                           {drug.name}
                         </div>
@@ -1212,36 +1093,31 @@ export default function App() {
                           <div className="manager-actions">
 
                             <button
-                              onClick={(
-                                e
-                              ) =>
+                              onClick={(e) =>
                                 handleOpenEditModal(
                                   drug,
                                   e
                                 )
                               }
-                              type="button"
                             >
                               ✏️ Edit
                             </button>
 
                             <button
-                              onClick={(
-                                e
-                              ) =>
+                              onClick={(e) =>
                                 handleDeleteDrug(
                                   drug.id,
                                   e
                                 )
                               }
                               className="del-btn"
-                              type="button"
                             >
                               🗑️
                             </button>
 
                           </div>
                         )}
+
                       </div>
                     </div>
                   );
@@ -1251,10 +1127,13 @@ export default function App() {
                   No drugs found.
                 </div>
               )}
+
             </div>
           </div>
 
-          {/* CART */}
+          {/* ====================================================
+              CART
+          ==================================================== */}
           <div className="cart-sidebar-wrapper">
 
             <div
@@ -1268,9 +1147,12 @@ export default function App() {
               <div className="cart-header">
 
                 <h3>
-                  Current Cart (
-                  {saleType.toUpperCase()}
-                  )
+                  Cart
+                  <span className="cart-mode-label">
+                    {' '}
+                    ·{' '}
+                    {saleType.toUpperCase()}
+                  </span>
                 </h3>
 
                 {cart.length > 0 && (
@@ -1279,23 +1161,22 @@ export default function App() {
                     onClick={() =>
                       setCart([])
                     }
-                    type="button"
                   >
                     Clear
                   </button>
                 )}
+
               </div>
 
               {cart.length > 0 ? (
                 <>
 
                   <div className="customer-info-section">
-
                     <div className="customer-input-row">
 
                       <input
                         type="text"
-                        placeholder="Customer Name (Optional)"
+                        placeholder="Customer name"
                         value={
                           customerName
                         }
@@ -1308,7 +1189,7 @@ export default function App() {
 
                       <input
                         type="tel"
-                        placeholder="Phone Number (Optional)"
+                        placeholder="Phone"
                         value={
                           customerPhone
                         }
@@ -1326,74 +1207,72 @@ export default function App() {
                     className="cart-items-list"
                     ref={cartListRef}
                   >
+                    {cart.map((item) => (
+                      <div
+                        key={item.id}
+                        className="cart-item"
+                      >
 
-                    {cart.map(
-                      (item) => (
-                        <div
-                          key={item.id}
-                          className="cart-item"
-                        >
+                        <div className="cart-item-info">
 
-                          <div className="cart-item-info">
+                          <strong className="cart-item-name">
+                            {item.name}
+                          </strong>
 
-                            <strong className="cart-item-name">
-                              {item.name}
-                            </strong>
-
-                            <div className="unit-price">
-                              ₦
-                              {(
-                                item.activePrice ||
-                                0
-                              ).toLocaleString()}{' '}
-                              /{' '}
-                              {item.unitType ||
-                                item.unit_type}
-                            </div>
+                          <div className="unit-price">
+                            ₦
+                            {(
+                              item.activePrice ||
+                              0
+                            ).toLocaleString()}{' '}
+                            /{' '}
+                            {item.unitType ||
+                              item.unit_type}
                           </div>
 
-                          <div className="qty-controls">
-
-                            <button
-                              onClick={() =>
-                                updateQuantity(
-                                  item.id,
-                                  -1
-                                )
-                              }
-                              type="button"
-                            >
-                              -
-                            </button>
-
-                            <span>
-                              {item.quantity}
-                            </span>
-
-                            <button
-                              onClick={() =>
-                                updateQuantity(
-                                  item.id,
-                                  1
-                                )
-                              }
-                              type="button"
-                            >
-                              +
-                            </button>
-
-                          </div>
                         </div>
-                      )
-                    )}
 
+                        <div className="qty-controls">
+
+                          <button
+                            onClick={() =>
+                              updateQuantity(
+                                item.id,
+                                -1
+                              )
+                            }
+                            aria-label="Decrease quantity"
+                          >
+                            -
+                          </button>
+
+                          <span>
+                            {item.quantity}
+                          </span>
+
+                          <button
+                            onClick={() =>
+                              updateQuantity(
+                                item.id,
+                                1
+                              )
+                            }
+                            aria-label="Increase quantity"
+                          >
+                            +
+                          </button>
+
+                        </div>
+
+                      </div>
+                    ))}
                   </div>
 
                   <div className="cart-summary">
 
                     <div className="total-display">
                       <span>
-                        Total Due:
+                        Total Due
                       </span>
 
                       <strong>
@@ -1407,7 +1286,6 @@ export default function App() {
                       onClick={
                         handleCheckout
                       }
-                      type="button"
                     >
                       Complete Sale
                     </button>
@@ -1417,19 +1295,19 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-cart-message">
-                  🛒 Cart is empty. Tap any
-                  drug to add items.
+                  🛒 Tap a drug to add it
                 </div>
               )}
+
             </div>
           </div>
+
         </div>
       )}
 
       {/* ========================================================
           SALES HISTORY
-          ======================================================== */}
-
+      ======================================================== */}
       {activeTab === 'history' && (
         <div className="history-screen no-print">
 
@@ -1481,16 +1359,14 @@ export default function App() {
                           s.cashierEmail
                       )
                     )
-                  ).map(
-                    (email) => (
-                      <option
-                        key={email}
-                        value={email}
-                      >
-                        {email}
-                      </option>
-                    )
-                  )}
+                  ).map((email) => (
+                    <option
+                      key={email}
+                      value={email}
+                    >
+                      {email}
+                    </option>
+                  ))}
                 </select>
               )}
 
@@ -1501,137 +1377,129 @@ export default function App() {
 
             {salesHistory &&
             salesHistory.length > 0 ? (
-              salesHistory.map(
-                (sale) => (
-                  <div
-                    key={sale.id}
-                    className="sale-history-card"
-                  >
+              salesHistory.map((sale) => (
+                <div
+                  key={sale.id}
+                  className="sale-history-card"
+                >
 
-                    <div className="sale-card-header">
+                  <div className="sale-card-header">
 
-                      <div>
-                        <strong>
-                          Receipt #
-                          {sale.id}
-                        </strong>
+                    <div>
+                      <strong>
+                        Receipt #{sale.id}
+                      </strong>
 
-                        <span className="sale-date">
-                          {' '}
-                          -{' '}
-                          {new Date(
-                            sale.createdAt
-                          ).toLocaleString()}
-                        </span>
-                      </div>
-
-                      <span className="sale-type-pill">
-                        {sale.saleType.toUpperCase()}
+                      <span className="sale-date">
+                        {' '}
+                        -{' '}
+                        {new Date(
+                          sale.createdAt
+                        ).toLocaleString()}
                       </span>
                     </div>
 
-                    <div className="sale-customer-details">
+                    <span className="sale-type-pill">
+                      {sale.saleType.toUpperCase()}
+                    </span>
 
-                      <span>
-                        👤{' '}
-                        <strong>
-                          Customer:
-                        </strong>{' '}
-                        {sale.customerName ||
-                          'Walk-in Customer'}
-                      </span>
-
-                      <span>
-                        📞{' '}
-                        <strong>
-                          Phone:
-                        </strong>{' '}
-                        {sale.customerPhone ||
-                          'N/A'}
-                      </span>
-
-                      <span>
-                        💳{' '}
-                        <strong>
-                          Cashier:
-                        </strong>{' '}
-                        {sale.cashierEmail}
-                      </span>
-
-                    </div>
-
-                    <div className="sale-items-table">
-
-                      {sale.items &&
-                        sale.items.map(
-                          (
-                            item,
-                            idx
-                          ) => (
-                            <div
-                              key={
-                                item.id ||
-                                idx
-                              }
-                              className="sale-item-row"
-                            >
-
-                              <span>
-                                {item.name}{' '}
-                                (
-                                {item.unitType ||
-                                  item.unit_type}
-                                ) x
-                                {
-                                  item.quantity
-                                }
-                              </span>
-
-                              <span>
-                                ₦
-                                {(
-                                  (item.activePrice ||
-                                    0) *
-                                  item.quantity
-                                ).toLocaleString()}
-                              </span>
-
-                            </div>
-                          )
-                        )}
-
-                    </div>
-
-                    <div className="sale-card-footer">
-
-                      <div>
-                        Total Amount:{' '}
-                        <strong>
-                          ₦
-                          {sale.total.toLocaleString()}
-                        </strong>
-                      </div>
-
-                      <button
-                        className="receipt-btn"
-                        onClick={() => {
-                          setSaleSuccessData(
-                            sale
-                          );
-
-                          setShowReceiptModal(
-                            true
-                          );
-                        }}
-                        type="button"
-                      >
-                        🖨️ View Receipt
-                      </button>
-
-                    </div>
                   </div>
-                )
-              )
+
+                  <div className="sale-customer-details">
+
+                    <span>
+                      👤{' '}
+                      <strong>
+                        Customer:
+                      </strong>{' '}
+                      {sale.customerName ||
+                        'Walk-in Customer'}
+                    </span>
+
+                    <span>
+                      📞{' '}
+                      <strong>
+                        Phone:
+                      </strong>{' '}
+                      {sale.customerPhone ||
+                        'N/A'}
+                    </span>
+
+                    <span>
+                      💳{' '}
+                      <strong>
+                        Cashier:
+                      </strong>{' '}
+                      {sale.cashierEmail}
+                    </span>
+
+                  </div>
+
+                  <div className="sale-items-table">
+
+                    {sale.items &&
+                      sale.items.map(
+                        (item, idx) => (
+                          <div
+                            key={
+                              item.id ||
+                              idx
+                            }
+                            className="sale-item-row"
+                          >
+                            <span>
+                              {item.name} (
+                              {item.unitType ||
+                                item.unit_type}
+                              ) x
+                              {
+                                item.quantity
+                              }
+                            </span>
+
+                            <span>
+                              ₦
+                              {(
+                                (item.activePrice ||
+                                  0) *
+                                item.quantity
+                              ).toLocaleString()}
+                            </span>
+                          </div>
+                        )
+                      )}
+
+                  </div>
+
+                  <div className="sale-card-footer">
+
+                    <div>
+                      Total Amount:{' '}
+                      <strong>
+                        ₦
+                        {sale.total.toLocaleString()}
+                      </strong>
+                    </div>
+
+                    <button
+                      className="receipt-btn"
+                      onClick={() => {
+                        setSaleSuccessData(
+                          sale
+                        );
+
+                        setShowReceiptModal(
+                          true
+                        );
+                      }}
+                    >
+                      🖨️ Receipt
+                    </button>
+
+                  </div>
+
+                </div>
+              ))
             ) : (
               <div className="empty-state">
                 No sales history found.
@@ -1644,8 +1512,7 @@ export default function App() {
 
       {/* ========================================================
           RECEIPT MODAL
-          ======================================================== */}
-
+      ======================================================== */}
       {showReceiptModal &&
         saleSuccessData && (
           <div className="receipt-container">
@@ -1718,7 +1585,6 @@ export default function App() {
                       }
                       className="receipt-item-row"
                     >
-
                       <span>
                         {item.name} (
                         {item.unitType ||
@@ -1737,7 +1603,6 @@ export default function App() {
                           item.quantity
                         ).toLocaleString()}
                       </span>
-
                     </div>
                   )
                 )}
@@ -1760,7 +1625,8 @@ export default function App() {
               </div>
 
               <p className="receipt-footer">
-                Thank you for your patronage!
+                Thank you for your
+                patronage!
               </p>
 
               <div className="receipt-actions no-print">
@@ -1770,7 +1636,6 @@ export default function App() {
                   onClick={() =>
                     window.print()
                   }
-                  type="button"
                 >
                   🖨️ Print Receipt
                 </button>
@@ -1786,9 +1651,8 @@ export default function App() {
                       null
                     );
                   }}
-                  type="button"
                 >
-                  Close & Start New Sale
+                  Close & New Sale
                 </button>
 
               </div>
@@ -1798,9 +1662,8 @@ export default function App() {
         )}
 
       {/* ========================================================
-          MANAGER ADD / EDIT DRUG MODAL
-          ======================================================== */}
-
+          ADD / EDIT DRUG MODAL
+      ======================================================== */}
       {isModalOpen &&
         userRole === 'manager' && (
           <div className="modal-overlay">
@@ -2001,6 +1864,7 @@ export default function App() {
                 </div>
 
               </form>
+
             </div>
           </div>
         )}
