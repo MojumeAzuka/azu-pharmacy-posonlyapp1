@@ -557,122 +557,138 @@ export default function App() {
       {/* POS TERMINAL TAB */}
       {activeTab === 'pos' && (
         <div className="pos-screen no-print">
-          <div className="search-row">
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Search drug name or barcode..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              autoFocus
-            />
-            {userRole === 'manager' && (
-              <button className="add-drug-btn" onClick={handleOpenAddModal}>
-                + Add Drug
-              </button>
-            )}
-          </div>
+          {/* Main Inventory & Catalog Column */}
+          <div className="pos-catalog-section">
+            <div className="search-row">
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search drug name or barcode..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                autoFocus
+              />
+              {userRole === 'manager' && (
+                <button className="add-drug-btn" onClick={handleOpenAddModal}>
+                  + Add Drug
+                </button>
+              )}
+            </div>
 
-          <div className="drug-list">
-            {drugs && drugs.length > 0 ? (
-              drugs.map((drug) => {
-                const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
-                const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
-                const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
-                const unit = drug.unitType || drug.unit_type || 'Sachet';
+            <div className="drug-list">
+              {drugs && drugs.length > 0 ? (
+                drugs.map((drug) => {
+                  const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
+                  const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
+                  const wholesale = Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0);
+                  const unit = drug.unitType || drug.unit_type || 'Sachet';
 
-                return (
-                  <div key={drug.id} className="drug-card" onClick={() => addToCart(drug)}>
-                    <div className="drug-info">
-                      <div className="drug-name">{drug.name}</div>
-                      <div className="tags-row">
-                        <span className="unit-tag">{unit}</span>
-                        <span className={`stock-tag ${drug.stock < 10 ? 'low-stock' : ''}`}>
-                          Stock: {drug.stock}
-                        </span>
+                  return (
+                    <div key={drug.id} className="drug-card" onClick={() => addToCart(drug)}>
+                      <div className="drug-info">
+                        <div className="drug-name">{drug.name}</div>
+                        <div className="tags-row">
+                          <span className="unit-tag">{unit}</span>
+                          <span className={`stock-tag ${drug.stock < 10 ? 'low-stock' : ''}`}>
+                            Stock: {drug.stock}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="price-stack">
+                        {userRole === 'manager' && (
+                          <div className="price-item cost-price">
+                            <small>Cost:</small> ₦{cost.toLocaleString()}
+                          </div>
+                        )}
+                        <div className={`price-item ${saleType === 'retail' ? 'highlight' : ''}`}>
+                          <small>Retail:</small> ₦{retail.toLocaleString()}
+                        </div>
+                        <div className={`price-item ${saleType === 'wholesale' ? 'highlight' : ''}`}>
+                          <small>Wholesale:</small> ₦{wholesale.toLocaleString()}
+                        </div>
+
+                        {userRole === 'manager' && (
+                          <div className="manager-actions">
+                            <button onClick={(e) => handleOpenEditModal(drug, e)}>✏️ Edit</button>
+                            <button onClick={(e) => handleDeleteDrug(drug.id, e)} className="del-btn">🗑️</button>
+                          </div>
+                        )}
                       </div>
                     </div>
-
-                    <div className="price-stack">
-                      {userRole === 'manager' && (
-                        <div className="price-item cost-price">
-                          <small>Cost:</small> ₦{cost.toLocaleString()}
-                        </div>
-                      )}
-                      <div className={`price-item ${saleType === 'retail' ? 'highlight' : ''}`}>
-                        <small>Retail:</small> ₦{retail.toLocaleString()}
-                      </div>
-                      <div className={`price-item ${saleType === 'wholesale' ? 'highlight' : ''}`}>
-                        <small>Wholesale:</small> ₦{wholesale.toLocaleString()}
-                      </div>
-
-                      {userRole === 'manager' && (
-                        <div className="manager-actions">
-                          <button onClick={(e) => handleOpenEditModal(drug, e)}>✏️ Edit</button>
-                          <button onClick={(e) => handleDeleteDrug(drug.id, e)} className="del-btn">🗑️</button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
-            ) : (
-              <div className="empty-state">No drugs found.</div>
-            )}
+                  );
+                })
+              ) : (
+                <div className="empty-state">No drugs found.</div>
+              )}
+            </div>
           </div>
 
-          {/* Cart & Customer Drawer */}
-          {cart.length > 0 && (
-            <div className="cart-drawer">
+          {/* Cart Sidebar Column */}
+          <div className="cart-sidebar-wrapper">
+            <div className={`cart-drawer ${cart.length === 0 ? 'empty-cart-drawer' : ''}`}>
               <div className="cart-header">
                 <h3>Current Cart ({saleType.toUpperCase()})</h3>
+                {cart.length > 0 && (
+                  <button className="clear-cart-btn" onClick={() => setCart([])}>
+                    Clear
+                  </button>
+                )}
               </div>
 
-              {/* Customer Details Form */}
-              <div className="customer-info-section">
-                <div className="customer-input-row">
-                  <input
-                    type="text"
-                    placeholder="Customer Name (Optional)"
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                  />
-                  <input
-                    type="tel"
-                    placeholder="Phone Number (Optional)"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                  />
-                </div>
-              </div>
-
-              {/* EXPANDED CART LIST WITH AUTO-SCROLL REF */}
-              <div className="cart-items-list">
-                {cart.map((item) => (
-                  <div key={item.id} className="cart-item">
-                    <div className="cart-item-info">
-                      <strong className="cart-item-name">{item.name}</strong>
-                      <div className="unit-price">
-                        ₦{(item.activePrice || 0).toLocaleString()} / {item.unitType || item.unit_type}
-                      </div>
-                    </div>
-                    <div className="qty-controls">
-                      <button onClick={() => updateQuantity(item.id, -1)}>-</button>
-                      <span>{item.quantity}</span>
-                      <button onClick={() => updateQuantity(item.id, 1)}>+</button>
+              {cart.length > 0 ? (
+                <>
+                  <div className="customer-info-section">
+                    <div className="customer-input-row">
+                      <input
+                        type="text"
+                        placeholder="Customer Name (Optional)"
+                        value={customerName}
+                        onChange={(e) => setCustomerName(e.target.value)}
+                      />
+                      <input
+                        type="tel"
+                        placeholder="Phone Number (Optional)"
+                        value={customerPhone}
+                        onChange={(e) => setCustomerPhone(e.target.value)}
+                      />
                     </div>
                   </div>
-                ))}
-                {/* Scroll Target Anchor */}
-                <div ref={cartEndRef} />
-              </div>
 
-              <div className="cart-summary">
-                <div>Total: <strong>₦{cartTotal.toLocaleString()}</strong></div>
-                <button className="checkout-btn" onClick={handleCheckout}>Complete Sale</button>
-              </div>
+                  <div className="cart-items-list">
+                    {cart.map((item) => (
+                      <div key={item.id} className="cart-item">
+                        <div className="cart-item-info">
+                          <strong className="cart-item-name">{item.name}</strong>
+                          <div className="unit-price">
+                            ₦{(item.activePrice || 0).toLocaleString()} / {item.unitType || item.unit_type}
+                          </div>
+                        </div>
+                        <div className="qty-controls">
+                          <button onClick={() => updateQuantity(item.id, -1)}>-</button>
+                          <span>{item.quantity}</span>
+                          <button onClick={() => updateQuantity(item.id, 1)}>+</button>
+                        </div>
+                      </div>
+                    ))}
+                    <div ref={cartEndRef} />
+                  </div>
+
+                  <div className="cart-summary">
+                    <div className="total-display">
+                      <span>Total Due:</span>
+                      <strong>₦{cartTotal.toLocaleString()}</strong>
+                    </div>
+                    <button className="checkout-btn" onClick={handleCheckout}>Complete Sale</button>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-cart-message">
+                  🛒 Cart is empty. Click on any drug on the left to add items.
+                </div>
+              )}
             </div>
-          )}
+          </div>
         </div>
       )}
 
