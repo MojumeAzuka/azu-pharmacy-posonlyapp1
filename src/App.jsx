@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, supabase, syncDrugsFromCloud, syncPendingSalesToCloud, pruneSalesOlderThanOneYear } from './db';
 import './App.css';
@@ -28,6 +28,9 @@ export default function App() {
   
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
+  // Cart Auto-Scroll Ref
+  const cartEndRef = useRef(null);
+
   // Manager CRUD Modal
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingDrug, setEditingDrug] = useState(null);
@@ -45,6 +48,13 @@ export default function App() {
   const [historySearchTerm, setHistorySearchTerm] = useState('');
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
   const [cloudSales, setCloudSales] = useState([]);
+
+  // Auto-scroll to bottom of cart when items change
+  useEffect(() => {
+    if (cart.length > 0 && cartEndRef.current) {
+      cartEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [cart]);
 
   // Handle Supabase Auth Session
   useEffect(() => {
@@ -95,7 +105,7 @@ export default function App() {
     setSession(null);
   };
 
-  // Fetch Central Sales History directly from Supabase for cross-device visibility
+  // Fetch Central Sales History directly from Supabase
   const fetchCloudSales = async () => {
     if (!navigator.onLine || !session) return;
     try {
@@ -159,14 +169,13 @@ export default function App() {
     };
   }, [session, userRole]);
 
-  // Refetch cloud sales when entering History tab
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
     }
   }, [activeTab, isOnline]);
 
-  // Live Query for Drugs Inventory with Barcode & Safe Name Matching
+  // Live Query for Drugs Inventory
   const drugs = useLiveQuery(async () => {
     if (!searchTerm.trim()) {
       return db.drugs.toArray();
@@ -198,27 +207,19 @@ export default function App() {
     return records;
   }, [session, userRole]);
 
-  // Merge Local (Offline/Pending) & Cloud Sales into unified history
+  // Merge Local & Cloud Sales
   const salesHistory = React.useMemo(() => {
     const combinedMap = new Map();
-
-    // Add Cloud sales first
     cloudSales.forEach((s) => combinedMap.set(String(s.id), s));
-
-    // Overlay Local sales (overwrites cloud if pending/matching)
     (localSales || []).forEach((s) => combinedMap.set(String(s.id), s));
 
     let records = Array.from(combinedMap.values());
-
-    // Sort newest first
     records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-    // Manager Cashier Filter
     if (userRole === 'manager' && historyCashierFilter !== 'all') {
       records = records.filter((s) => s.cashierEmail === historyCashierFilter);
     }
 
-    // Search filter: Customer Name, Phone, or Receipt ID
     if (historySearchTerm.trim()) {
       const term = historySearchTerm.toLowerCase();
       records = records.filter(
@@ -281,7 +282,7 @@ export default function App() {
 
   const cartTotal = cart.reduce((sum, item) => sum + (item.activePrice || 0) * item.quantity, 0);
 
-  // Complete Sale Logic inside atomic Dexie transaction with Direct Cloud Sync + Local Fallback
+  // Complete Sale Logic
   const handleCheckout = async () => {
     if (cart.length === 0) return;
 
@@ -300,7 +301,6 @@ export default function App() {
         synced: 0
       };
 
-      // Execute Dexie Local Storage Updates within an Atomic Read-Write Transaction
       await db.transaction('rw', db.drugs, db.sales, async () => {
         for (const item of cart) {
           if (item.id) {
@@ -316,7 +316,6 @@ export default function App() {
         await db.sales.add(saleData);
       });
 
-      // Sync stock deductions and sale record to Supabase if online
       if (isOnline) {
         for (const item of cart) {
           if (item.id) {
@@ -357,11 +356,8 @@ export default function App() {
         }
       }
 
-      // Launch printable receipt on screen
       setSaleSuccessData(saleData);
       setShowReceiptModal(true);
-
-      // Reset cart and inputs
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
@@ -371,7 +367,7 @@ export default function App() {
     }
   };
 
-  // Manager CRUD Handlers (Updates Dexie + Supabase)
+  // Manager CRUD Handlers
   const handleOpenAddModal = () => {
     setEditingDrug(null);
     setFormData({
@@ -406,7 +402,7 @@ export default function App() {
     if (window.confirm('Are you sure you want to delete this drug from inventory?')) {
       const drugKey = String(id);
       await db.drugs.delete(drugKey);
-      await db.drugs.delete(Number(id)); // Safe fallback if stored as number
+      await db.drugs.delete(Number(id));
       if (isOnline) {
         await supabase.from('drugs').delete().eq('id', drugKey);
       }
@@ -506,9 +502,8 @@ export default function App() {
   // ------------------- MAIN POS APP SCREEN -------------------
   return (
     <div className="app-container">
-      {/* REFACTORED COMPACT HEADER */}
+      {/* HEADER */}
       <header className="header no-print">
-        {/* Top Row: User Account Info & Logout */}
         <div className="user-profile-header">
           <div className="user-info-group">
             <span className="user-email">{session?.user?.email}</span>
@@ -517,7 +512,6 @@ export default function App() {
           <button className="logout-btn" onClick={handleLogout}>Sign Out</button>
         </div>
 
-        {/* Middle Row: App Title & Status */}
         <div className="header-title-row">
           <h1>AZU PHARMACY POS</h1>
           <span className={`status-badge ${isOnline ? 'online' : 'offline'}`}>
@@ -525,7 +519,6 @@ export default function App() {
           </span>
         </div>
 
-        {/* Bottom Row: Compact Nav + Price Mode Toggle */}
         <div className="controls-bar">
           <div className="nav-tabs">
             <button 
@@ -637,7 +630,6 @@ export default function App() {
 
               {/* Customer Details Form */}
               <div className="customer-info-section">
-                <h4>Customer Information</h4>
                 <div className="customer-input-row">
                   <input
                     type="text"
@@ -654,13 +646,14 @@ export default function App() {
                 </div>
               </div>
 
+              {/* EXPANDED CART LIST WITH AUTO-SCROLL REF */}
               <div className="cart-items-list">
                 {cart.map((item) => (
                   <div key={item.id} className="cart-item">
-                    <div>
-                      <strong>{item.name}</strong>
+                    <div className="cart-item-info">
+                      <strong className="cart-item-name">{item.name}</strong>
                       <div className="unit-price">
-                        ₦{(item.activePrice || 0).toLocaleString()} per {item.unitType || item.unit_type}
+                        ₦{(item.activePrice || 0).toLocaleString()} / {item.unitType || item.unit_type}
                       </div>
                     </div>
                     <div className="qty-controls">
@@ -670,6 +663,8 @@ export default function App() {
                     </div>
                   </div>
                 ))}
+                {/* Scroll Target Anchor */}
+                <div ref={cartEndRef} />
               </div>
 
               <div className="cart-summary">
@@ -760,7 +755,7 @@ export default function App() {
         </div>
       )}
 
-      {/* PRINTABLE RECEIPT & SALE COMPLETION MODAL */}
+      {/* PRINTABLE RECEIPT MODAL */}
       {showReceiptModal && saleSuccessData && (
         <div className="receipt-container">
           <div className="receipt-card">
