@@ -28,8 +28,8 @@ export default function App() {
   
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
-  // Cart Auto-Scroll Ref
-  const cartEndRef = useRef(null);
+  // Cart list ref (scrolls the list itself, not the whole page)
+  const cartListRef = useRef(null);
 
   // Manager CRUD Modal
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -49,10 +49,13 @@ export default function App() {
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
   const [cloudSales, setCloudSales] = useState([]);
 
-  // Auto-scroll to bottom of cart when items change
+  // Auto-scroll to bottom of the cart list when items change
   useEffect(() => {
-    if (cart.length > 0 && cartEndRef.current) {
-      cartEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (cart.length > 0 && cartListRef.current) {
+      cartListRef.current.scrollTo({
+        top: cartListRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
     }
   }, [cart]);
 
@@ -556,7 +559,7 @@ export default function App() {
 
       {/* POS TERMINAL TAB */}
       {activeTab === 'pos' && (
-        <div className="pos-screen no-print">
+        <div className={`pos-screen no-print ${cart.length > 0 ? 'cart-active' : 'cart-empty'}`}>
           {/* Main Inventory & Catalog Column */}
           <div className="pos-catalog-section">
             <div className="search-row">
@@ -655,7 +658,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="cart-items-list">
+                  <div className="cart-items-list" ref={cartListRef}>
                     {cart.map((item) => (
                       <div key={item.id} className="cart-item">
                         <div className="cart-item-info">
@@ -671,7 +674,6 @@ export default function App() {
                         </div>
                       </div>
                     ))}
-                    <div ref={cartEndRef} />
                   </div>
 
                   <div className="cart-summary">
@@ -684,7 +686,7 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-cart-message">
-                  🛒 Cart is empty. Click on any drug on the left to add items.
+                  🛒 Cart is empty. Tap any drug to add items.
                 </div>
               )}
             </div>
