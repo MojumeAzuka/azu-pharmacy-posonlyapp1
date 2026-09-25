@@ -14,6 +14,36 @@ db.version(4).stores({
   sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced'
 });
 
+// Schema Version 5: adds the audit log table used by the administrator
+// role. `drugs` records also now carry `deletedAt` / `deletedBy` fields
+// for soft-delete + recovery, but those are plain (non-indexed) fields,
+// so the `drugs` and `sales` index lists below don't need to change —
+// only the new `auditLog` table needed adding.
+db.version(5).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced',
+  auditLog: 'id, createdAt, synced'
+});
+
+// ============================================================
+// ROLE HIERARCHY
+// administrator > manager > salesperson. A higher role can do
+// everything a lower role can, plus its own extra features.
+// ============================================================
+export const ROLE_RANK = {
+  salesperson: 0,
+  manager: 1,
+  administrator: 2
+};
+
+export function hasRole(role, minimumRole) {
+  return (ROLE_RANK[role] ?? 0) >= (ROLE_RANK[minimumRole] ?? 0);
+}
+
+function generateId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+}
+
 export async function ensureSeedData() {
   const count = await db.drugs.count();
   if (count === 0) {
@@ -44,7 +74,9 @@ export async function syncDrugsFromCloud() {
         retailPrice: Number(drug.retail_price ?? drug.retailPrice ?? 0),
         wholesalePrice: Number(drug.wholesale_price ?? drug.wholesalePrice ?? 0),
         stock: Number(drug.stock ?? 0),
-        barcode: drug.barcode || ''
+        barcode: drug.barcode || '',
+        deletedAt: drug.deleted_at || drug.deletedAt || null,
+        deletedBy: drug.deleted_by || drug.deletedBy || null
       }));
 
       await db.drugs.bulkPut(mappedDrugs);
@@ -98,5 +130,231 @@ export async function pruneSalesOlderThanOneYear() {
     }
   } catch (err) {
     console.warn('Error pruning old sales:', err.message);
+  }
+}
+
+// ============================================================
+// AUDIT LOG
+// Every sensitive manager/administrator action writes one entry
+// here. Written locally first (so it's never lost offline), then
+// pushed to Supabase when possible.
+// ============================================================
+export async function logAuditEvent({ actorEmail, actorRole, action, targetType, targetId, details }) {
+  const entry = {
+    id: generateId('LOG'),
+    actorEmail: actorEmail || 'unknown',
+    actorRole: actorRole || 'unknown',
+    action,
+    targetType: targetType || '',
+    targetId: targetId ? String(targetId) : '',
+    details: details ? JSON.stringify(details) : '',
+    createdAt: new Date().toISOString(),
+    synced: 0
+  };
+
+  try {
+    await db.auditLog.add(entry);
+  } catch (err) {
+    console.warn('Unable to write audit log entry locally:', err.message);
+  }
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('audit_log').insert([
+        {
+          id: entry.id,
+          actor_email: entry.actorEmail,
+          actor_role: entry.actorRole,
+          action: entry.action,
+          target_type: entry.targetType,
+          target_id: entry.targetId,
+          details: entry.details ? JSON.parse(entry.details) : null,
+          created_at: entry.createdAt
+        }
+      ]);
+      if (!error) {
+        await db.auditLog.update(entry.id, { synced: 1 });
+      }
+    } catch (err) {
+      console.warn('Audit log cloud sync deferred:', err.message);
+    }
+  }
+
+  return entry;
+}
+
+export async function syncAuditLogToCloud() {
+  try {
+    const pending = await db.auditLog.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const entry of pending) {
+      const { error } = await supabase.from('audit_log').insert([
+        {
+          id: entry.id,
+          actor_email: entry.actorEmail,
+          actor_role: entry.actorRole,
+          action: entry.action,
+          target_type: entry.targetType,
+          target_id: entry.targetId,
+          details: entry.details ? JSON.parse(entry.details) : null,
+          created_at: entry.createdAt
+        }
+      ]);
+      if (!error) {
+        await db.auditLog.update(entry.id, { synced: 1 });
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync audit log:', err.message);
+  }
+}
+
+// ============================================================
+// DRUG SOFT-DELETE / RECOVERY (administrator feature)
+// A manager's "delete" only sets deletedAt/deletedBy — the row
+// stays in place so an administrator can restore it, or remove
+// it for good with permanentlyDeleteDrug.
+// ============================================================
+export async function softDeleteDrug(id, actor) {
+  try {
+    const drugKey = String(id);
+    const existing = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(id)));
+    if (!existing) return;
+
+    const deletedAt = new Date().toISOString();
+    const deletedBy = actor?.email || 'unknown';
+
+    await db.drugs.update(existing.id, { deletedAt, deletedBy });
+
+    if (navigator.onLine) {
+      try {
+        await supabase
+          .from('drugs')
+          .update({ deleted_at: deletedAt, deleted_by: deletedBy })
+          .eq('id', drugKey);
+      } catch (err) {
+        console.warn('Cloud soft-delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_deleted',
+      targetType: 'drug',
+      targetId: drugKey,
+      details: { name: existing.name }
+    });
+  } catch (err) {
+    console.warn('Unable to soft-delete drug:', err.message);
+  }
+}
+
+export async function restoreDrug(id, actor) {
+  try {
+    const drugKey = String(id);
+    const existing = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(id)));
+    if (!existing) return;
+
+    await db.drugs.update(existing.id, { deletedAt: null, deletedBy: null });
+
+    if (navigator.onLine) {
+      try {
+        await supabase
+          .from('drugs')
+          .update({ deleted_at: null, deleted_by: null })
+          .eq('id', drugKey);
+      } catch (err) {
+        console.warn('Cloud restore postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_restored',
+      targetType: 'drug',
+      targetId: drugKey,
+      details: { name: existing.name }
+    });
+  } catch (err) {
+    console.warn('Unable to restore drug:', err.message);
+  }
+}
+
+export async function permanentlyDeleteDrug(id, actor) {
+  try {
+    const drugKey = String(id);
+    const existing = (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(id)));
+
+    await db.drugs.delete(drugKey);
+    await db.drugs.delete(Number(id));
+
+    if (navigator.onLine) {
+      try {
+        await supabase.from('drugs').delete().eq('id', drugKey);
+      } catch (err) {
+        console.warn('Cloud permanent delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_permanently_deleted',
+      targetType: 'drug',
+      targetId: drugKey,
+      details: { name: existing?.name || 'unknown' }
+    });
+  } catch (err) {
+    console.warn('Unable to permanently delete drug:', err.message);
+  }
+}
+
+// ============================================================
+// BULK SALES-HISTORY DELETION (administrator feature)
+// This is a hard delete — sales records are not soft-deletable.
+// Double-check this is actually what you want before wiring up
+// the confirm dialog, since it's irreversible.
+// ============================================================
+export async function bulkDeleteSalesByDateRange(startISO, endISO, actor) {
+  try {
+    const toDelete = await db.sales
+      .where('createdAt')
+      .between(startISO, endISO, true, true)
+      .toArray();
+
+    const ids = toDelete.map((s) => s.id);
+
+    if (ids.length > 0) {
+      await db.sales.bulkDelete(ids);
+    }
+
+    if (navigator.onLine) {
+      try {
+        await supabase
+          .from('sales')
+          .delete()
+          .gte('created_at', startISO)
+          .lte('created_at', endISO);
+      } catch (err) {
+        console.warn('Cloud bulk sales delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'sales_bulk_deleted',
+      targetType: 'sales_range',
+      targetId: `${startISO}_to_${endISO}`,
+      details: { count: ids.length, startISO, endISO }
+    });
+
+    return ids.length;
+  } catch (err) {
+    console.warn('Unable to bulk-delete sales:', err.message);
+    return 0;
   }
 }

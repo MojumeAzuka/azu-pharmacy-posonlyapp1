@@ -3,11 +3,20 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import {
   db,
   supabase,
+  hasRole,
   syncDrugsFromCloud,
   syncPendingSalesToCloud,
-  pruneSalesOlderThanOneYear
+  syncAuditLogToCloud,
+  pruneSalesOlderThanOneYear,
+  softDeleteDrug,
+  restoreDrug,
+  permanentlyDeleteDrug,
+  bulkDeleteSalesByDateRange,
+  logAuditEvent
 } from './db';
 import './App.css';
+
+const LAST_SEEN_AUDIT_KEY = 'azu_last_seen_manager_changes';
 
 export default function App() {
   // ============================================================
@@ -23,7 +32,7 @@ export default function App() {
   // ============================================================
   // NAVIGATION
   // ============================================================
-  const [activeTab, setActiveTab] = useState('pos');
+  const [activeTab, setActiveTab] = useState('pos'); // 'pos' | 'history' | 'admin'
 
   // ============================================================
   // POS STATE
@@ -74,12 +83,21 @@ export default function App() {
   const [cloudSales, setCloudSales] = useState([]);
 
   // ============================================================
+  // ADMINISTRATOR STATE
+  // ============================================================
+  const [bulkDeleteStart, setBulkDeleteStart] = useState('');
+  const [bulkDeleteEnd, setBulkDeleteEnd] = useState('');
+  const [lastSeenAuditAt, setLastSeenAuditAt] = useState(
+    () => localStorage.getItem(LAST_SEEN_AUDIT_KEY) || null
+  );
+
+  // ============================================================
   // AUTO-SCROLL CART
   // ============================================================
   useEffect(() => {
     if (cart.length > 0 && cartListRef.current) {
       requestAnimationFrame(() => {
-        cartListRef.current.scrollTo({
+        cartListRef.current?.scrollTo({
           top: cartListRef.current.scrollHeight,
           behavior: 'smooth'
         });
@@ -171,7 +189,7 @@ export default function App() {
         .gte('created_at', oneYearAgo.toISOString())
         .order('created_at', { ascending: false });
 
-      if (userRole !== 'manager') {
+      if (!hasRole(userRole, 'manager')) {
         query = query.eq('cashier_id', session.user.id);
       }
 
@@ -217,6 +235,8 @@ export default function App() {
         fetchCloudSales();
       });
 
+      syncAuditLogToCloud();
+
       pruneSalesOlderThanOneYear();
     };
 
@@ -234,6 +254,8 @@ export default function App() {
         fetchCloudSales();
       });
 
+      syncAuditLogToCloud();
+
       pruneSalesOlderThanOneYear();
     }
 
@@ -250,24 +272,57 @@ export default function App() {
   }, [activeTab, isOnline]);
 
   // ============================================================
-  // DRUG INVENTORY
+  // DRUG INVENTORY (soft-deleted drugs are hidden from the catalog)
   // ============================================================
   const drugs = useLiveQuery(async () => {
-    if (!searchTerm.trim()) {
-      return db.drugs.toArray();
-    }
+    const all = !searchTerm.trim()
+      ? await db.drugs.toArray()
+      : await db.drugs
+          .filter((drug) => {
+            const term = searchTerm.toLowerCase().trim();
+            const nameMatch = drug.name?.toLowerCase().includes(term);
+            const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
+            return Boolean(nameMatch || barcodeMatch);
+          })
+          .toArray();
 
-    const term = searchTerm.toLowerCase().trim();
-
-    return db.drugs
-      .filter((drug) => {
-        const nameMatch = drug.name?.toLowerCase().includes(term);
-        const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
-
-        return Boolean(nameMatch || barcodeMatch);
-      })
-      .toArray();
+    return all.filter((drug) => !drug.deletedAt);
   }, [searchTerm]);
+
+  // ============================================================
+  // RECENTLY DELETED DRUGS (administrator only)
+  // ============================================================
+  const deletedDrugs = useLiveQuery(async () => {
+    if (!hasRole(userRole, 'administrator')) return [];
+    const all = await db.drugs.toArray();
+    return all
+      .filter((drug) => drug.deletedAt)
+      .sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
+  }, [userRole]);
+
+  // ============================================================
+  // AUDIT LOG (administrator only)
+  // ============================================================
+  const auditLog = useLiveQuery(async () => {
+    if (!hasRole(userRole, 'administrator')) return [];
+    return db.auditLog.orderBy('createdAt').reverse().toArray();
+  }, [userRole]);
+
+  const unseenManagerChanges = React.useMemo(() => {
+    if (!auditLog) return 0;
+    const managerEntries = auditLog.filter((entry) => entry.actorRole === 'manager');
+    if (!lastSeenAuditAt) return managerEntries.length;
+    return managerEntries.filter(
+      (entry) => new Date(entry.createdAt) > new Date(lastSeenAuditAt)
+    ).length;
+  }, [auditLog, lastSeenAuditAt]);
+
+  const handleOpenAdminTab = () => {
+    setActiveTab('admin');
+    const now = new Date().toISOString();
+    localStorage.setItem(LAST_SEEN_AUDIT_KEY, now);
+    setLastSeenAuditAt(now);
+  };
 
   // ============================================================
   // LOCAL SALES
@@ -284,7 +339,7 @@ export default function App() {
       (s) => new Date(s.createdAt) >= oneYearAgo
     );
 
-    if (userRole !== 'manager') {
+    if (!hasRole(userRole, 'manager')) {
       records = records.filter(
         (s) =>
           s.cashierId === session.user.id ||
@@ -317,7 +372,7 @@ export default function App() {
     );
 
     if (
-      userRole === 'manager' &&
+      hasRole(userRole, 'manager') &&
       historyCashierFilter !== 'all'
     ) {
       records = records.filter(
@@ -450,6 +505,9 @@ export default function App() {
 
   // ============================================================
   // CHECKOUT
+  // The receipt now shows as soon as the LOCAL write succeeds.
+  // Everything that talks to Supabase runs afterwards, in the
+  // background, via syncSaleToCloud — it no longer blocks the UI.
   // ============================================================
   const handleCheckout = async () => {
     if (cart.length === 0) return;
@@ -512,86 +570,20 @@ export default function App() {
         }
       );
 
-      if (isOnline) {
-        for (const item of cart) {
-          if (item.id) {
-            const drugKey = String(item.id);
-
-            const updatedDrug =
-              (await db.drugs.get(drugKey)) ||
-              (await db.drugs.get(
-                Number(item.id)
-              ));
-
-            if (updatedDrug) {
-              try {
-                await supabase
-                  .from('drugs')
-                  .update({
-                    stock: updatedDrug.stock
-                  })
-                  .eq(
-                    'id',
-                    updatedDrug.id
-                  );
-              } catch (cloudErr) {
-                console.warn(
-                  `Stock update postponed for ${item.name}:`,
-                  cloudErr.message
-                );
-              }
-            }
-          }
-        }
-
-        const supabasePayload = {
-          id: saleData.id,
-          total: saleData.total,
-          sale_type: saleData.saleType,
-          cashier_id: saleData.cashierId,
-          cashier_email: saleData.cashierEmail,
-          customer_name:
-            saleData.customerName,
-          customer_phone:
-            saleData.customerPhone,
-          created_at: saleData.createdAt,
-          items: JSON.stringify(
-            saleData.items
-          )
-        };
-
-        const { error } =
-          await supabase
-            .from('sales')
-            .insert([
-              supabasePayload
-            ]);
-
-        if (!error) {
-          await db.sales.update(
-            saleId,
-            {
-              synced: 1
-            }
-          );
-
-          saleData.synced = 1;
-
-          fetchCloudSales();
-        } else {
-          console.warn(
-            'Cloud insert pending, queued locally:',
-            error.message
-          );
-        }
-      }
-
+      // The sale is now safely on the device — show the receipt
+      // immediately instead of waiting on any network call.
       setSaleSuccessData(saleData);
       setShowReceiptModal(true);
 
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
+
+      if (isOnline) {
+        syncSaleToCloud(saleData).catch((err) => {
+          console.warn('Background sale sync failed:', err.message);
+        });
+      }
     } catch (err) {
       console.error(
         'Checkout error:',
@@ -603,6 +595,64 @@ export default function App() {
           err.message ||
           'Error processing database transaction'
         }`
+      );
+    }
+  };
+
+  // Runs in the background after the receipt is already on screen.
+  // Per-item stock updates go out in parallel (Promise.all) instead
+  // of one at a time, and the new sale is folded straight into
+  // cloudSales instead of re-fetching the entire sales history.
+  const syncSaleToCloud = async (saleData) => {
+    const stockUpdates = saleData.items
+      .filter((item) => item.id)
+      .map(async (item) => {
+        const drugKey = String(item.id);
+
+        const updatedDrug =
+          (await db.drugs.get(drugKey)) ||
+          (await db.drugs.get(Number(item.id)));
+
+        if (!updatedDrug) return;
+
+        try {
+          await supabase
+            .from('drugs')
+            .update({ stock: updatedDrug.stock })
+            .eq('id', updatedDrug.id);
+        } catch (cloudErr) {
+          console.warn(
+            `Stock update postponed for ${item.name}:`,
+            cloudErr.message
+          );
+        }
+      });
+
+    await Promise.all(stockUpdates);
+
+    const supabasePayload = {
+      id: saleData.id,
+      total: saleData.total,
+      sale_type: saleData.saleType,
+      cashier_id: saleData.cashierId,
+      cashier_email: saleData.cashierEmail,
+      customer_name: saleData.customerName,
+      customer_phone: saleData.customerPhone,
+      created_at: saleData.createdAt,
+      items: JSON.stringify(saleData.items)
+    };
+
+    const { error } = await supabase
+      .from('sales')
+      .insert([supabasePayload]);
+
+    if (!error) {
+      await db.sales.update(saleData.id, { synced: 1 });
+      setCloudSales((prev) => [{ ...saleData, synced: 1 }, ...prev]);
+    } else {
+      console.warn(
+        'Cloud insert pending, queued locally:',
+        error.message
       );
     }
   };
@@ -656,25 +706,21 @@ export default function App() {
     setIsModalOpen(true);
   };
 
+  // A manager's delete is now a SOFT delete — the drug moves to the
+  // administrator's "Recently Deleted" list instead of disappearing
+  // for good. Only an administrator can remove it permanently.
   const handleDeleteDrug = async (id, e) => {
     e.stopPropagation();
 
     if (
       window.confirm(
-        'Are you sure you want to delete this drug from inventory?'
+        'Move this drug to Recently Deleted? An administrator can restore it or remove it permanently later.'
       )
     ) {
-      const drugKey = String(id);
-
-      await db.drugs.delete(drugKey);
-      await db.drugs.delete(Number(id));
-
-      if (isOnline) {
-        await supabase
-          .from('drugs')
-          .delete()
-          .eq('id', drugKey);
-      }
+      await softDeleteDrug(id, {
+        email: session?.user?.email,
+        role: userRole
+      });
     }
   };
 
@@ -738,7 +784,65 @@ export default function App() {
         ]);
     }
 
+    await logAuditEvent({
+      actorEmail: session?.user?.email,
+      actorRole: userRole,
+      action: editingDrug ? 'drug_updated' : 'drug_added',
+      targetType: 'drug',
+      targetId: drugId,
+      details: { name: formData.name }
+    });
+
     setIsModalOpen(false);
+  };
+
+  // ============================================================
+  // ADMINISTRATOR ACTIONS
+  // ============================================================
+  const handleRestoreDrug = async (id) => {
+    await restoreDrug(id, {
+      email: session?.user?.email,
+      role: userRole
+    });
+  };
+
+  const handlePermanentDelete = async (id, name) => {
+    if (
+      window.confirm(
+        `Permanently delete "${name}"? This cannot be undone.`
+      )
+    ) {
+      await permanentlyDeleteDrug(id, {
+        email: session?.user?.email,
+        role: userRole
+      });
+    }
+  };
+
+  const handleBulkDeleteSales = async () => {
+    if (!bulkDeleteStart || !bulkDeleteEnd) {
+      alert('Choose a start and end date first.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Permanently delete ALL sales between ${bulkDeleteStart} and ${bulkDeleteEnd}? This cannot be undone.`
+    );
+
+    if (!confirmed) return;
+
+    const count = await bulkDeleteSalesByDateRange(
+      `${bulkDeleteStart}T00:00:00.000Z`,
+      `${bulkDeleteEnd}T23:59:59.999Z`,
+      { email: session?.user?.email, role: userRole }
+    );
+
+    alert(`Deleted ${count} sale record(s) from ${bulkDeleteStart} to ${bulkDeleteEnd}.`);
+
+    setBulkDeleteStart('');
+    setBulkDeleteEnd('');
+
+    fetchCloudSales();
   };
 
   // ============================================================
@@ -903,6 +1007,24 @@ export default function App() {
             >
               📋 History
             </button>
+
+            {hasRole(userRole, 'administrator') && (
+              <button
+                className={
+                  activeTab === 'admin'
+                    ? 'active-tab'
+                    : ''
+                }
+                onClick={handleOpenAdminTab}
+              >
+                🛡️ Admin
+                {unseenManagerChanges > 0 && (
+                  <span className="nav-badge">
+                    {unseenManagerChanges > 9 ? '9+' : unseenManagerChanges}
+                  </span>
+                )}
+              </button>
+            )}
           </div>
 
           {activeTab === 'pos' && (
@@ -940,7 +1062,7 @@ export default function App() {
           )}
 
           {activeTab === 'pos' &&
-            userRole === 'manager' && (
+            hasRole(userRole, 'manager') && (
               <button
                 className="add-drug-btn"
                 onClick={
@@ -1047,8 +1169,7 @@ export default function App() {
 
                       <div className="price-stack">
 
-                        {userRole ===
-                          'manager' && (
+                        {hasRole(userRole, 'manager') && (
                           <div className="price-item cost-price">
                             <small>
                               Cost:
@@ -1088,8 +1209,7 @@ export default function App() {
                           {wholesale.toLocaleString()}
                         </div>
 
-                        {userRole ===
-                          'manager' && (
+                        {hasRole(userRole, 'manager') && (
                           <div className="manager-actions">
 
                             <button
@@ -1111,6 +1231,7 @@ export default function App() {
                                 )
                               }
                               className="del-btn"
+                              title="Move to Recently Deleted"
                             >
                               🗑️
                             </button>
@@ -1314,7 +1435,7 @@ export default function App() {
           <div className="history-header-row">
 
             <h2>
-              {userRole === 'manager'
+              {hasRole(userRole, 'manager')
                 ? 'All Customer Sales History (1 Year)'
                 : 'My Sales History (1 Year)'}
             </h2>
@@ -1335,8 +1456,7 @@ export default function App() {
                 className="history-search-input"
               />
 
-              {userRole ===
-                'manager' && (
+              {hasRole(userRole, 'manager') && (
                 <select
                   value={
                     historyCashierFilter
@@ -1511,6 +1631,137 @@ export default function App() {
       )}
 
       {/* ========================================================
+          ADMINISTRATOR SCREEN
+      ======================================================== */}
+      {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
+        <div className="admin-screen no-print">
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Recently Deleted Drugs</h3>
+              <span className="admin-section-sub">
+                Restore or permanently remove items managers have deleted
+              </span>
+            </div>
+
+            {deletedDrugs && deletedDrugs.length > 0 ? (
+              <div className="deleted-drug-list">
+                {deletedDrugs.map((drug) => (
+                  <div key={drug.id} className="deleted-drug-card">
+                    <div className="deleted-drug-info">
+                      <strong>{drug.name}</strong>
+                      <span className="deleted-drug-meta">
+                        Deleted by {drug.deletedBy || 'unknown'} on{' '}
+                        {new Date(drug.deletedAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleRestoreDrug(drug.id)}
+                      >
+                        ♻️ Restore
+                      </button>
+
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() =>
+                          handlePermanentDelete(drug.id, drug.name)
+                        }
+                      >
+                        🗑️ Delete Permanently
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No deleted drugs to recover.</div>
+            )}
+          </section>
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Bulk Delete Sales History</h3>
+              <span className="admin-section-sub">
+                Permanently remove sales records within a date range
+              </span>
+            </div>
+
+            <div className="bulk-delete-panel">
+              <div className="bulk-delete-row">
+                <div>
+                  <label>From:</label>
+                  <input
+                    type="date"
+                    value={bulkDeleteStart}
+                    onChange={(e) => setBulkDeleteStart(e.target.value)}
+                  />
+                </div>
+
+                <div>
+                  <label>To:</label>
+                  <input
+                    type="date"
+                    value={bulkDeleteEnd}
+                    onChange={(e) => setBulkDeleteEnd(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <button className="bulk-delete-btn" onClick={handleBulkDeleteSales}>
+                Permanently Delete Sales in Range
+              </button>
+            </div>
+          </section>
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Audit Log</h3>
+              <span className="admin-section-sub">
+                Every sensitive action taken by managers and administrators
+              </span>
+            </div>
+
+            {auditLog && auditLog.length > 0 ? (
+              <div className="audit-log-list">
+                {auditLog.map((entry) => (
+                  <div key={entry.id} className="audit-log-entry">
+                    <div className="audit-log-main">
+                      <strong>{entry.action.replace(/_/g, ' ')}</strong>
+                      <span className="audit-log-meta">
+                        {entry.actorEmail} ({entry.actorRole}) ·{' '}
+                        {new Date(entry.createdAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    {entry.details && (
+                      <div className="audit-log-details">
+                        {(() => {
+                          try {
+                            const parsed = JSON.parse(entry.details);
+                            return Object.entries(parsed)
+                              .map(([k, v]) => `${k}: ${v}`)
+                              .join(' · ');
+                          } catch {
+                            return entry.details;
+                          }
+                        })()}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No audit log entries yet.</div>
+            )}
+          </section>
+
+        </div>
+      )}
+
+      {/* ========================================================
           RECEIPT MODAL
       ======================================================== */}
       {showReceiptModal &&
@@ -1665,7 +1916,7 @@ export default function App() {
           ADD / EDIT DRUG MODAL
       ======================================================== */}
       {isModalOpen &&
-        userRole === 'manager' && (
+        hasRole(userRole, 'manager') && (
           <div className="modal-overlay">
 
             <div className="modal-card">
