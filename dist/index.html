@@ -1,1 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 
+    <!-- PWA manifest — enables "Install app" on desktop Chrome/Edge and
+         Android Chrome. Icons and colors are defined inside manifest.json. -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#0284c7" />
+
+    <!-- Standard browser tab icon -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16.png" />
+
+    <!-- iOS Safari reads these directly rather than the manifest —
+         apple-mobile-web-app-capable/status-bar-style were already
+         present; apple-touch-icon and apple-mobile-web-app-title are
+         the two pieces that were missing for a proper iOS install. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Azu POS" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <title>AZU PHARMACY POS</title>
+    <script type="module" crossorigin src="/assets/index-CV7__7rh.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-doLf4dXd.css">
+  <script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
