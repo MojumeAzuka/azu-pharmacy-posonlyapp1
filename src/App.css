@@ -397,6 +397,8 @@ select {
 
 .nav-tabs button,
 .price-mode-toggle button {
+  position: relative;
+
   flex: 1 1 0;
 
   min-width: 0;
@@ -432,6 +434,33 @@ select {
 
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Small unread-count badge, used on the Admin tab to flag unseen
+   manager changes. */
+.nav-badge {
+  position: absolute;
+  top: -4px;
+  right: -2px;
+
+  min-width: 14px;
+  height: 14px;
+
+  padding: 0 3px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: #dc2626;
+  color: #ffffff;
+
+  border-radius: 999px;
+
+  font-size: 0.55rem;
+  font-weight: 700;
+
+  line-height: 1;
 }
 
 /* ============================================================
@@ -1284,6 +1313,19 @@ select {
     padding-bottom: 42vh;
     padding-bottom: 42dvh;
   }
+
+  /* Admin screen tightens up the same way the history screen does */
+  .admin-screen {
+    padding: 6px;
+  }
+
+  .admin-section {
+    padding: 8px;
+  }
+
+  .bulk-delete-row {
+    flex-direction: column;
+  }
 }
 
 /* ============================================================
@@ -1476,6 +1518,10 @@ select {
     padding-top: 5px;
 
     border-top: 1px dashed #f1f5f9;
+  }
+
+  .bulk-delete-row {
+    max-width: 420px;
   }
 }
 
@@ -2068,6 +2114,275 @@ select {
         minmax(0, 1fr)
       );
   }
+}
+
+/* ============================================================
+   ADMINISTRATOR SCREEN
+   ------------------------------------------------------------
+   Recently Deleted Drugs, Bulk Sales Deletion, and the Audit Log.
+   Visible only to the administrator role — deliberately styled
+   to feel like the higher-stakes area of the app (amber/red
+   accents instead of the app's usual blue/green).
+============================================================ */
+
+.admin-screen {
+  width: 100%;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 10px;
+
+  min-width: 0;
+}
+
+.admin-section {
+  width: 100%;
+
+  background: #ffffff;
+
+  padding: 10px;
+
+  border-radius: 10px;
+
+  border: 1px solid #e2e8f0;
+
+  min-width: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 8px;
+}
+
+.admin-section-header {
+  display: flex;
+  flex-direction: column;
+
+  gap: 2px;
+
+  padding-bottom: 6px;
+
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.admin-section-header h3 {
+  margin: 0;
+
+  font-size: 0.85rem;
+
+  color: #1e293b;
+}
+
+.admin-section-sub {
+  font-size: 0.68rem;
+  color: #64748b;
+}
+
+/* ---- Recently deleted drugs ---- */
+
+.deleted-drug-list {
+  display: flex;
+  flex-direction: column;
+
+  gap: 6px;
+}
+
+.deleted-drug-card {
+  display: flex;
+
+  align-items: center;
+  justify-content: space-between;
+
+  gap: 8px;
+
+  flex-wrap: wrap;
+
+  padding: 7px 9px;
+
+  background: #fffbeb;
+
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+
+  min-width: 0;
+}
+
+.deleted-drug-info {
+  min-width: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 2px;
+
+  font-size: 0.78rem;
+}
+
+.deleted-drug-meta {
+  font-size: 0.65rem;
+  color: #92400e;
+}
+
+.deleted-drug-actions {
+  flex: 0 0 auto;
+
+  display: flex;
+
+  gap: 5px;
+}
+
+.restore-btn {
+  background: #dcfce7;
+  color: #15803d;
+
+  border: 1px solid #86efac;
+  border-radius: 5px;
+
+  padding: 4px 8px;
+
+  font-size: 0.66rem;
+  font-weight: 700;
+
+  cursor: pointer;
+
+  white-space: nowrap;
+}
+
+.permanent-delete-btn {
+  background: #fee2e2;
+  color: #991b1b;
+
+  border: 1px solid #fca5a5;
+  border-radius: 5px;
+
+  padding: 4px 8px;
+
+  font-size: 0.66rem;
+  font-weight: 700;
+
+  cursor: pointer;
+
+  white-space: nowrap;
+}
+
+/* ---- Bulk delete sales ---- */
+
+.bulk-delete-panel {
+  display: flex;
+  flex-direction: column;
+
+  gap: 8px;
+}
+
+.bulk-delete-row {
+  display: flex;
+
+  gap: 8px;
+
+  min-width: 0;
+}
+
+.bulk-delete-row > div {
+  flex: 1;
+
+  min-width: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 3px;
+}
+
+.bulk-delete-row label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.bulk-delete-row input[type='date'] {
+  width: 100%;
+
+  padding: 6px 7px;
+
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+
+  font-size: 0.75rem;
+}
+
+.bulk-delete-btn {
+  align-self: flex-start;
+
+  background: #dc2626;
+  color: #ffffff;
+
+  border: none;
+  border-radius: 6px;
+
+  padding: 7px 12px;
+
+  font-size: 0.72rem;
+  font-weight: 700;
+
+  cursor: pointer;
+}
+
+.bulk-delete-btn:hover {
+  background: #b91c1c;
+}
+
+/* ---- Audit log ---- */
+
+.audit-log-list {
+  display: flex;
+  flex-direction: column;
+
+  gap: 5px;
+
+  max-height: 360px;
+
+  overflow-y: auto;
+
+  padding-right: 3px;
+}
+
+.audit-log-entry {
+  padding: 6px 8px;
+
+  background: #f8fafc;
+
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+
+  min-width: 0;
+}
+
+.audit-log-main {
+  display: flex;
+  flex-direction: column;
+
+  gap: 1px;
+
+  font-size: 0.74rem;
+}
+
+.audit-log-main strong {
+  text-transform: capitalize;
+}
+
+.audit-log-meta {
+  font-size: 0.63rem;
+  color: #64748b;
+}
+
+.audit-log-details {
+  margin-top: 3px;
+
+  font-size: 0.66rem;
+  color: #475569;
+
+  word-break: break-word;
 }
 
 /* ============================================================
