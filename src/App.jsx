@@ -176,6 +176,16 @@ export default function App() {
   // ============================================================
   // CLOUD SALES
   // ============================================================
+  // Supabase/PostgREST caps every request at 1000 rows by default. At
+  // 200-250 sales a day that's only about 4 days' worth of sales — a
+  // plain .select('*') would silently drop everything older than that
+  // from what a manager sees in Sales History. This pages through with
+  // .range() until a page comes back short, with SALES_FETCH_MAX_PAGES
+  // as a hard ceiling so one very old, very busy project can't trigger
+  // an unbounded fetch.
+  const SALES_FETCH_PAGE_SIZE = 1000;
+  const SALES_FETCH_MAX_PAGES = 100; // up to 100,000 rows — comfortably more than a year of sales at this volume
+
   const fetchCloudSales = async () => {
     if (!navigator.onLine || !session) return;
 
@@ -183,22 +193,36 @@ export default function App() {
       const oneYearAgo = new Date();
       oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
-      let query = supabase
-        .from('sales')
-        .select('*')
-        .gte('created_at', oneYearAgo.toISOString())
-        .order('created_at', { ascending: false });
+      let allSales = [];
+      let from = 0;
+      let page = 0;
 
-      if (!hasRole(userRole, 'manager')) {
-        query = query.eq('cashier_id', session.user.id);
+      while (page < SALES_FETCH_MAX_PAGES) {
+        let query = supabase
+          .from('sales')
+          .select('*')
+          .gte('created_at', oneYearAgo.toISOString())
+          .order('created_at', { ascending: false })
+          .range(from, from + SALES_FETCH_PAGE_SIZE - 1);
+
+        if (!hasRole(userRole, 'manager')) {
+          query = query.eq('cashier_id', session.user.id);
+        }
+
+        const { data: pageData, error } = await query;
+
+        if (error) throw error;
+        if (!pageData || pageData.length === 0) break;
+
+        allSales = allSales.concat(pageData);
+
+        if (pageData.length < SALES_FETCH_PAGE_SIZE) break;
+        from += SALES_FETCH_PAGE_SIZE;
+        page += 1;
       }
 
-      const { data, error } = await query;
-
-      if (error) throw error;
-
-      if (data) {
-        const formatted = data.map((s) => ({
+      if (allSales.length > 0) {
+        const formatted = allSales.map((s) => ({
           id: s.id,
           total: Number(s.total || s.total_amount || 0),
           saleType: s.sale_type || s.saleType || 'retail',
@@ -503,6 +527,23 @@ export default function App() {
     0
   );
 
+  // A cart line currently carries the ENTIRE drug record (cost price,
+  // stock, barcode, etc — everything addToCart spread in). None of that
+  // belongs in a saved sale: the receipt, Sales History and the Admin
+  // audit log only ever read name/unitType/quantity/activePrice, and
+  // storing the rest roughly doubles every sale row's size for no
+  // benefit — while also leaking cost prices into records a
+  // salesperson's own sales end up sitting next to. This keeps only
+  // what's actually displayed anywhere downstream.
+  const slimCartItems = (items) =>
+    items.map((item) => ({
+      id: item.id,
+      name: item.name,
+      unitType: item.unitType || item.unit_type || 'Sachet',
+      quantity: item.quantity,
+      activePrice: item.activePrice || 0
+    }));
+
   // ============================================================
   // CHECKOUT
   // The receipt now shows as soon as the LOCAL write succeeds.
@@ -530,7 +571,7 @@ export default function App() {
         customerPhone:
           customerPhone.trim() || 'N/A',
         createdAt: new Date().toISOString(),
-        items: [...cart],
+        items: slimCartItems(cart),
         synced: 0
       };
 
