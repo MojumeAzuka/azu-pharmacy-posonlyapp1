@@ -64,13 +64,35 @@ export async function ensureSeedData() {
 // empty local database.
 // ensureSeedData();
 
+// Supabase/PostgREST caps every request at 1000 rows by default, silently
+// — a plain .select('*') on a catalog bigger than that would only ever
+// pull the first 1000 drugs, with no error to warn you. This pages
+// through the table with .range() until a page comes back short of
+// PAGE_SIZE, so the full catalog syncs down regardless of size.
+const DRUGS_SYNC_PAGE_SIZE = 1000;
+
 export async function syncDrugsFromCloud() {
   try {
-    const { data: cloudDrugs, error } = await supabase.from('drugs').select('*');
-    if (error) throw error;
+    let allCloudDrugs = [];
+    let from = 0;
 
-    if (cloudDrugs && cloudDrugs.length > 0) {
-      const mappedDrugs = cloudDrugs.map((drug) => ({
+    while (true) {
+      const { data: page, error } = await supabase
+        .from('drugs')
+        .select('*')
+        .range(from, from + DRUGS_SYNC_PAGE_SIZE - 1);
+
+      if (error) throw error;
+      if (!page || page.length === 0) break;
+
+      allCloudDrugs = allCloudDrugs.concat(page);
+
+      if (page.length < DRUGS_SYNC_PAGE_SIZE) break;
+      from += DRUGS_SYNC_PAGE_SIZE;
+    }
+
+    if (allCloudDrugs.length > 0) {
+      const mappedDrugs = allCloudDrugs.map((drug) => ({
         id: String(drug.id),
         name: drug.name,
         unitType: drug.unit_type || drug.unitType || 'Sachet',
