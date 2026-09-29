@@ -65,6 +65,15 @@ export default function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingDrug, setEditingDrug] = useState(null);
 
+  // isSavingDrug drives the button's disabled/"Saving…" state. The ref
+  // alongside it is the part that actually stops a double-click:
+  // React state updates aren't guaranteed to have re-rendered yet by
+  // the time a second, near-instant click fires handleSaveDrug again,
+  // but a ref updates synchronously, so the guard at the top of
+  // handleSaveDrug can't be raced the way the old code could.
+  const [isSavingDrug, setIsSavingDrug] = useState(false);
+  const isSavingDrugRef = useRef(false);
+
   const [formData, setFormData] = useState({
     name: '',
     unitType: 'Sachet',
@@ -765,83 +774,135 @@ export default function App() {
     }
   };
 
-  const handleSaveDrug = async (e) => {
-    e.preventDefault();
-
-    const drugId = editingDrug
-      ? String(editingDrug.id)
-      : Date.now().toString();
-
-    const drugPayload = {
+  // Pushes a saved drug to Supabase in the background, after the modal
+  // has already closed. If the cloud rejects it — most likely the
+  // drugs_name_key unique constraint firing because another device
+  // just saved the same name, or because a soft-deleted drug still
+  // holds that name — the local copy this device just created is
+  // rolled back, so it can't keep sitting there as a phantom the cloud
+  // never accepted. This is the piece that was missing before: a
+  // failed cloud upsert used to leave the local row untouched forever.
+  const syncDrugToCloud = async (drugId, drugPayload, wasEditing) => {
+    const cloudPayload = {
       id: drugId,
-      name: formData.name,
-      unitType: formData.unitType,
-      costPrice: Number(
-        formData.costPrice
-      ),
-      retailPrice: Number(
-        formData.retailPrice
-      ),
-      wholesalePrice: Number(
-        formData.wholesalePrice
-      ),
-      stock: Number(formData.stock),
-      barcode: formData.barcode
+      name: drugPayload.name,
+      unit_type: drugPayload.unitType,
+      cost_price: drugPayload.costPrice,
+      retail_price: drugPayload.retailPrice,
+      wholesale_price: drugPayload.wholesalePrice,
+      stock: drugPayload.stock,
+      barcode: drugPayload.barcode
     };
 
-    if (editingDrug) {
-      await db.drugs.update(
-        editingDrug.id,
-        drugPayload
-      );
-    } else {
-      await db.drugs.add(
-        drugPayload
-      );
-    }
+    const { error: upsertError } = await supabase
+      .from('drugs')
+      .upsert([cloudPayload]);
 
-    if (isOnline) {
-      const cloudPayload = {
-        id: drugId,
-        name: formData.name,
-        unit_type: formData.unitType,
-        cost_price: Number(
-          formData.costPrice
-        ),
-        retail_price: Number(
-          formData.retailPrice
-        ),
-        wholesale_price: Number(
-          formData.wholesalePrice
-        ),
-        stock: Number(formData.stock),
-        barcode: formData.barcode
-      };
+    if (upsertError) {
+      console.error('Cloud save failed:', upsertError.message);
 
-      const { error: upsertError } = await supabase
-        .from('drugs')
-        .upsert([
-          cloudPayload
-        ]);
+      const isDuplicateName =
+        upsertError.code === '23505' ||
+        /duplicate key/i.test(upsertError.message || '');
 
-      if (upsertError) {
-        console.error('Cloud save failed:', upsertError.message);
+      if (isDuplicateName && !wasEditing) {
+        await db.drugs.delete(drugId);
+        alert(
+          `"${drugPayload.name}" already exists in the shared catalog (it may have just been added from another device, or a deleted drug still holds that name). The local copy on this device has been removed — refresh to see the current catalog.`
+        );
+      } else {
         alert(
           `Warning: saved on this device, but the cloud update failed (${upsertError.message}). This device's copy may get overwritten on next sync.`
         );
       }
     }
+  };
 
-    await logAuditEvent({
-      actorEmail: session?.user?.email,
-      actorRole: userRole,
-      action: editingDrug ? 'drug_updated' : 'drug_added',
-      targetType: 'drug',
-      targetId: drugId,
-      details: { name: formData.name }
-    });
+  const handleSaveDrug = async (e) => {
+    e.preventDefault();
 
-    setIsModalOpen(false);
+    // Synchronous guard: if a save is already in flight, a second,
+    // near-instant click (or a double-click) is ignored outright,
+    // before it can create a second local row with a different id.
+    if (isSavingDrugRef.current) return;
+    isSavingDrugRef.current = true;
+    setIsSavingDrug(true);
+
+    try {
+      const trimmedName = formData.name.trim();
+
+      // Enforce "no two drugs share a name" locally, before writing
+      // anything — this is what actually stops duplicates from being
+      // created, rather than only finding out after the fact when
+      // Supabase's unique constraint rejects the cloud write.
+      const nameMatches = await db.drugs
+        .where('name')
+        .equalsIgnoreCase(trimmedName)
+        .toArray();
+
+      const conflict = nameMatches.find(
+        (d) => !editingDrug || String(d.id) !== String(editingDrug.id)
+      );
+
+      if (conflict) {
+        if (conflict.deletedAt) {
+          alert(
+            `A drug named "${trimmedName}" already exists but was deleted. Ask an administrator to restore it from Admin → Recently Deleted instead of creating a new one with the same name.`
+          );
+        } else {
+          alert(`A drug named "${trimmedName}" already exists.`);
+        }
+        return; // modal stays open so the name can be corrected
+      }
+
+      const drugId = editingDrug
+        ? String(editingDrug.id)
+        : Date.now().toString();
+
+      const drugPayload = {
+        id: drugId,
+        name: trimmedName,
+        unitType: formData.unitType,
+        costPrice: Number(formData.costPrice),
+        retailPrice: Number(formData.retailPrice),
+        wholesalePrice: Number(formData.wholesalePrice),
+        stock: Number(formData.stock),
+        barcode: formData.barcode
+      };
+
+      if (editingDrug) {
+        await db.drugs.update(editingDrug.id, drugPayload);
+      } else {
+        await db.drugs.add(drugPayload);
+      }
+
+      // The local write is done — close the form immediately instead
+      // of making the user wait on the network. This also removes the
+      // Save button from the screen, so there's nothing left to
+      // double-click even if someone tries.
+      const wasEditing = Boolean(editingDrug);
+      setIsModalOpen(false);
+
+      if (isOnline) {
+        syncDrugToCloud(drugId, drugPayload, wasEditing).catch((err) => {
+          console.warn('Background drug sync failed:', err.message);
+        });
+      }
+
+      logAuditEvent({
+        actorEmail: session?.user?.email,
+        actorRole: userRole,
+        action: wasEditing ? 'drug_updated' : 'drug_added',
+        targetType: 'drug',
+        targetId: drugId,
+        details: { name: trimmedName }
+      }).catch((err) => {
+        console.warn('Audit log failed:', err.message);
+      });
+    } finally {
+      isSavingDrugRef.current = false;
+      setIsSavingDrug(false);
+    }
   };
 
   // ============================================================
@@ -2144,8 +2205,9 @@ export default function App() {
                   <button
                     type="submit"
                     className="save-btn"
+                    disabled={isSavingDrug}
                   >
-                    Save Changes
+                    {isSavingDrug ? 'Saving…' : 'Save Changes'}
                   </button>
 
                   <button
