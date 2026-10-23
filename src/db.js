@@ -25,6 +25,20 @@ db.version(5).stores({
   auditLog: 'id, createdAt, synced'
 });
 
+// Schema Version 6: adds `synced` to drugs. Sales and the audit log have
+// always had a retry mechanism — a failed cloud write leaves `synced: 0`
+// locally, and the next reconnect automatically pushes it up. Drugs never
+// had this. A drug added while the cloud upsert fails (weak mobile
+// signal, a dropped connection, a PWA/service-worker quirk — "Load
+// failed" is WebKit's generic network-failure message, not a Supabase
+// error) was simply stuck unsynced forever, with no automatic recovery.
+// This closes that gap using the exact same pattern sales already use.
+db.version(6).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced',
+  auditLog: 'id, createdAt, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > salesperson. A higher role can do
@@ -92,23 +106,80 @@ export async function syncDrugsFromCloud() {
     }
 
     if (allCloudDrugs.length > 0) {
-      const mappedDrugs = allCloudDrugs.map((drug) => ({
-        id: String(drug.id),
-        name: drug.name,
-        unitType: drug.unit_type || drug.unitType || 'Sachet',
-        costPrice: Number(drug.cost_price ?? drug.costPrice ?? 0),
-        retailPrice: Number(drug.retail_price ?? drug.retailPrice ?? 0),
-        wholesalePrice: Number(drug.wholesale_price ?? drug.wholesalePrice ?? 0),
-        stock: Number(drug.stock ?? 0),
-        barcode: drug.barcode || '',
-        deletedAt: drug.deleted_at || drug.deletedAt || null,
-        deletedBy: drug.deleted_by || drug.deletedBy || null
-      }));
+      // Don't let a pull-from-cloud stomp a drug this device just created
+      // or edited and hasn't successfully pushed up yet (synced: 0) — a
+      // bulkPut here would overwrite it with stale/missing cloud data
+      // before syncPendingDrugsToCloud() gets a chance to retry the push.
+      const pendingIds = new Set(
+        (await db.drugs.where('synced').equals(0).toArray()).map((d) =>
+          String(d.id)
+        )
+      );
 
-      await db.drugs.bulkPut(mappedDrugs);
+      const mappedDrugs = allCloudDrugs
+        .filter((drug) => !pendingIds.has(String(drug.id)))
+        .map((drug) => ({
+          id: String(drug.id),
+          name: drug.name,
+          unitType: drug.unit_type || drug.unitType || 'Sachet',
+          costPrice: Number(drug.cost_price ?? drug.costPrice ?? 0),
+          retailPrice: Number(drug.retail_price ?? drug.retailPrice ?? 0),
+          wholesalePrice: Number(drug.wholesale_price ?? drug.wholesalePrice ?? 0),
+          stock: Number(drug.stock ?? 0),
+          barcode: drug.barcode || '',
+          halfPackQty:
+            drug.half_pack_qty ?? drug.halfPackQty ?? null,
+          halfPackPrice:
+            drug.half_pack_price ?? drug.halfPackPrice ?? null,
+          packQty: drug.pack_qty ?? drug.packQty ?? null,
+          packPrice: drug.pack_price ?? drug.packPrice ?? null,
+          deletedAt: drug.deleted_at || drug.deletedAt || null,
+          deletedBy: drug.deleted_by || drug.deletedBy || null,
+          synced: 1
+        }));
+
+      if (mappedDrugs.length > 0) {
+        await db.drugs.bulkPut(mappedDrugs);
+      }
     }
   } catch (err) {
     console.warn('Unable to sync drugs from cloud:', err.message);
+  }
+}
+
+// Mirrors syncPendingSalesToCloud(): retries the cloud upsert for any
+// drug that was saved locally (synced: 0) but whose push to Supabase
+// failed at the time — weak signal, a dropped connection, etc. Runs on
+// every reconnect/app-load alongside the sales and audit-log retries.
+export async function syncPendingDrugsToCloud() {
+  try {
+    const unsyncedDrugs = await db.drugs.where('synced').equals(0).toArray();
+    if (unsyncedDrugs.length === 0) return;
+
+    for (const drug of unsyncedDrugs) {
+      const { error } = await supabase.from('drugs').upsert([
+        {
+          id: drug.id,
+          name: drug.name,
+          unit_type: drug.unitType,
+          cost_price: drug.costPrice,
+          retail_price: drug.retailPrice,
+          wholesale_price: drug.wholesalePrice,
+          stock: drug.stock,
+          barcode: drug.barcode,
+          half_pack_qty: drug.halfPackQty ?? null,
+          half_pack_price: drug.halfPackPrice ?? null,
+          pack_qty: drug.packQty ?? null,
+          pack_price: drug.packPrice ?? null
+        }
+      ]);
+
+      if (!error) {
+        await db.drugs.update(drug.id, { synced: 1 });
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending drugs:', err.message);
   }
 }
 
@@ -382,5 +453,150 @@ export async function bulkDeleteSalesByDateRange(startISO, endISO, actor) {
   } catch (err) {
     console.warn('Unable to bulk-delete sales:', err.message);
     return 0;
+  }
+}
+
+// ============================================================
+// PARTIAL SALE REVERSAL (manager feature)
+// Reverses one or more LINE ITEMS from a sale — not the whole sale.
+// `reversals` is [{ id: <item id>, quantity: <how many units to
+// reverse> }]. Each matching item gets a running `reversedQty` so a
+// line can be reversed more than once (e.g. 2 of 5 today, 1 more
+// later) without ever reversing more than it originally sold. Stock
+// for the affected drugs is restored, the sale's stored total is
+// reduced by the refunded amount, and the sale record keeps a
+// `reversalLog` of who reversed what and when, for the audit trail.
+// ============================================================
+export async function reverseSaleItems(sale, reversals, actor) {
+  try {
+    const saleId = String(sale.id);
+    const reversalMap = new Map(
+      reversals.map((r) => [String(r.id), Number(r.quantity) || 0])
+    );
+
+    let refundTotal = 0;
+    const reversedDetails = [];
+
+    const updatedItems = (sale.items || []).map((item) => {
+      const reverseQty = reversalMap.get(String(item.id));
+      if (!reverseQty || reverseQty <= 0) return item;
+
+      const alreadyReversed = Number(item.reversedQty) || 0;
+      const remaining = item.quantity - alreadyReversed;
+      const qtyToReverse = Math.min(reverseQty, remaining);
+      if (qtyToReverse <= 0) return item;
+
+      // Refund at this item's average per-unit price (its stored
+      // lineTotal already reflects any pack discount), so a reversed
+      // unit is credited back at what it was actually sold for.
+      const perUnitPrice =
+        item.quantity > 0
+          ? (item.lineTotal ?? item.activePrice * item.quantity) /
+            item.quantity
+          : item.activePrice || 0;
+
+      const refund = perUnitPrice * qtyToReverse;
+      refundTotal += refund;
+
+      reversedDetails.push({
+        itemId: item.id,
+        name: item.name,
+        quantity: qtyToReverse,
+        refund,
+        reversedBy: actor?.email || 'unknown',
+        reversedAt: new Date().toISOString()
+      });
+
+      return {
+        ...item,
+        reversedQty: alreadyReversed + qtyToReverse
+      };
+    });
+
+    if (reversedDetails.length === 0) {
+      return { success: false, reason: 'Nothing to reverse.' };
+    }
+
+    const newTotal = Math.max(0, (sale.total || 0) - refundTotal);
+    const existingLog = Array.isArray(sale.reversalLog)
+      ? sale.reversalLog
+      : [];
+    const newReversalLog = [...existingLog, ...reversedDetails];
+
+    // Restore stock for each reversed item, locally first.
+    for (const detail of reversedDetails) {
+      const drugKey = String(detail.itemId);
+      const existingDrug =
+        (await db.drugs.get(drugKey)) ||
+        (await db.drugs.get(Number(detail.itemId)));
+
+      if (existingDrug) {
+        const restoredStock =
+          (existingDrug.stock || 0) + detail.quantity;
+
+        await db.drugs.update(existingDrug.id, {
+          stock: restoredStock,
+          synced: 0
+        });
+
+        if (navigator.onLine) {
+          try {
+            await supabase
+              .from('drugs')
+              .update({ stock: restoredStock })
+              .eq('id', drugKey);
+            await db.drugs.update(existingDrug.id, { synced: 1 });
+          } catch (err) {
+            console.warn('Cloud stock restore postponed:', err.message);
+          }
+        }
+      }
+    }
+
+    // Update the sale record locally if this device has a copy.
+    const localSale = await db.sales.get(saleId);
+    if (localSale) {
+      await db.sales.update(saleId, {
+        items: updatedItems,
+        total: newTotal,
+        reversalLog: newReversalLog
+      });
+    }
+
+    // Always push the update to Supabase too — the sale may only
+    // exist in the cloud (made on a different device).
+    if (navigator.onLine) {
+      try {
+        await supabase
+          .from('sales')
+          .update({
+            items: updatedItems,
+            total: newTotal,
+            reversal_log: newReversalLog
+          })
+          .eq('id', saleId);
+      } catch (err) {
+        console.warn('Cloud sale reversal postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'sale_items_reversed',
+      targetType: 'sale',
+      targetId: saleId,
+      details: { items: reversedDetails, refundTotal }
+    });
+
+    return {
+      success: true,
+      updatedItems,
+      newTotal,
+      reversalLog: newReversalLog
+    };
+  } catch (err) {
+    console.warn('Unable to reverse sale items:', err.message);
+    return { success: false, reason: err.message };
   }
 }

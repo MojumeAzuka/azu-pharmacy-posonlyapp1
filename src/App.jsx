@@ -5,6 +5,7 @@ import {
   supabase,
   hasRole,
   syncDrugsFromCloud,
+  syncPendingDrugsToCloud,
   syncPendingSalesToCloud,
   syncAuditLogToCloud,
   pruneSalesOlderThanOneYear,
@@ -12,6 +13,7 @@ import {
   restoreDrug,
   permanentlyDeleteDrug,
   bulkDeleteSalesByDateRange,
+  reverseSaleItems,
   logAuditEvent
 } from './db';
 import './App.css';
@@ -74,14 +76,23 @@ export default function App() {
   const [isSavingDrug, setIsSavingDrug] = useState(false);
   const isSavingDrugRef = useRef(false);
 
+  // halfPackQty/halfPackPrice and packQty/packPrice are all optional —
+  // most drugs are sold one unit at a time and leave these blank. When
+  // a drug does have a pack size filled in, hitting that quantity in the
+  // cart switches that portion of the line to the discounted pack price
+  // instead of unit price × quantity (see computePackPricing below).
   const [formData, setFormData] = useState({
     name: '',
-    unitType: 'Sachet',
+    unitType: 'Unit',
     costPrice: '',
     retailPrice: '',
     wholesalePrice: '',
     stock: '',
-    barcode: ''
+    barcode: '',
+    halfPackQty: '',
+    halfPackPrice: '',
+    packQty: '',
+    packPrice: ''
   });
 
   // ============================================================
@@ -91,6 +102,12 @@ export default function App() {
   const [historyCashierFilter, setHistoryCashierFilter] = useState('all');
   const [cloudSales, setCloudSales] = useState([]);
 
+  // Manager partial-sale-reversal modal: which sale is open, and how
+  // many units of each line item the manager has chosen to reverse.
+  const [reversingSale, setReversingSale] = useState(null);
+  const [reversalQtys, setReversalQtys] = useState({});
+  const [isReversing, setIsReversing] = useState(false);
+
   // ============================================================
   // ADMINISTRATOR STATE
   // ============================================================
@@ -99,6 +116,10 @@ export default function App() {
   const [lastSeenAuditAt, setLastSeenAuditAt] = useState(
     () => localStorage.getItem(LAST_SEEN_AUDIT_KEY) || null
   );
+
+  // Drug-sale accountability search: "who sold this and when" for a
+  // named drug, independent of the Sales History tab's own filters.
+  const [drugSearchTerm, setDrugSearchTerm] = useState('');
 
   // ============================================================
   // AUTO-SCROLL CART
@@ -262,7 +283,9 @@ export default function App() {
     const handleOnline = () => {
       setIsOnline(true);
 
-      syncDrugsFromCloud();
+      syncPendingDrugsToCloud().then(() => {
+        syncDrugsFromCloud();
+      });
 
       syncPendingSalesToCloud().then(() => {
         fetchCloudSales();
@@ -281,7 +304,9 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
 
     if (navigator.onLine) {
-      syncDrugsFromCloud();
+      syncPendingDrugsToCloud().then(() => {
+        syncDrugsFromCloud();
+      });
 
       syncPendingSalesToCloud().then(() => {
         fetchCloudSales();
@@ -436,6 +461,107 @@ export default function App() {
     historySearchTerm
   ]);
 
+  // All sales (local + cloud, deduped, 1-year window), unaffected by
+  // whatever filters are currently set on the Sales History tab — this
+  // is what the Admin drug-accountability search runs against.
+  const allSalesForSearch = React.useMemo(() => {
+    const combinedMap = new Map();
+
+    cloudSales.forEach((s) => combinedMap.set(String(s.id), s));
+    (localSales || []).forEach((s) => combinedMap.set(String(s.id), s));
+
+    return Array.from(combinedMap.values()).sort(
+      (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+    );
+  }, [localSales, cloudSales]);
+
+  // ============================================================
+  // ADMIN: DRUG SALE ACCOUNTABILITY SEARCH
+  // Finds every line item across every sale matching the searched drug
+  // name, with which salesperson/manager account sold it and when — for
+  // tracing expensive drugs back to who sold them.
+  // ============================================================
+  const drugSaleMatches = React.useMemo(() => {
+    const term = drugSearchTerm.trim().toLowerCase();
+    if (!term) return [];
+
+    const matches = [];
+
+    allSalesForSearch.forEach((sale) => {
+      (sale.items || []).forEach((item) => {
+        if (item.name && item.name.toLowerCase().includes(term)) {
+          matches.push({
+            saleId: sale.id,
+            drugName: item.name,
+            unitType: item.unitType || item.unit_type || '',
+            quantity: item.quantity,
+            reversedQty: Number(item.reversedQty) || 0,
+            lineTotal:
+              item.lineTotal ?? (item.activePrice || 0) * item.quantity,
+            cashierEmail: sale.cashierEmail,
+            customerName: sale.customerName,
+            createdAt: sale.createdAt
+          });
+        }
+      });
+    });
+
+    return matches;
+  }, [drugSearchTerm, allSalesForSearch]);
+
+  // ============================================================
+  // PARTIAL SALE REVERSAL (manager feature)
+  // reversalQtys is keyed by item id → how many units of that line the
+  // manager wants to reverse right now (never more than quantity minus
+  // whatever was already reversed earlier).
+  // ============================================================
+  const handleConfirmReversal = async () => {
+    if (!reversingSale) return;
+
+    const reversals = Object.entries(reversalQtys)
+      .map(([id, qty]) => ({ id, quantity: Number(qty) || 0 }))
+      .filter((r) => r.quantity > 0);
+
+    if (reversals.length === 0) {
+      alert('Enter a quantity to reverse for at least one item.');
+      return;
+    }
+
+    setIsReversing(true);
+
+    try {
+      const result = await reverseSaleItems(reversingSale, reversals, {
+        email: session?.user?.email,
+        role: userRole
+      });
+
+      if (result.success) {
+        // Keep cloudSales in sync too, in case this sale only exists
+        // in the cloud (made on a different device) — localSales
+        // already updates itself via useLiveQuery.
+        setCloudSales((prev) =>
+          prev.map((s) =>
+            String(s.id) === String(reversingSale.id)
+              ? {
+                  ...s,
+                  items: result.updatedItems,
+                  total: result.newTotal,
+                  reversalLog: result.reversalLog
+                }
+              : s
+          )
+        );
+
+        setReversingSale(null);
+        setReversalQtys({});
+      } else {
+        alert(result.reason || 'Unable to reverse those items.');
+      }
+    } finally {
+      setIsReversing(false);
+    }
+  };
+
   // ============================================================
   // CART OPERATIONS
   // ============================================================
@@ -528,11 +654,51 @@ export default function App() {
     );
   };
 
+  // Half-pack/pack pricing is optional per drug (packQty/packPrice and
+  // halfPackQty/halfPackPrice are blank unless a manager filled them
+  // in). When they ARE set, this greedily breaks a line's quantity into
+  // as many full packs as fit, then as many half packs as fit the
+  // remainder, pricing the rest at the normal per-unit price — so a
+  // cart of 14 units with pack=12@2000 and half=6@1000 prices as one
+  // pack (2000) + 2 units at the per-unit rate, not 14 × per-unit.
+  const computePackPricing = (item) => {
+    const unitPrice = item.activePrice || 0;
+    const packQty = Number(item.packQty) || 0;
+    const packPrice = Number(item.packPrice) || 0;
+    const halfQty = Number(item.halfPackQty) || 0;
+    const halfPrice = Number(item.halfPackPrice) || 0;
+
+    let remaining = item.quantity;
+    let total = 0;
+    let packsUsed = 0;
+    let halvesUsed = 0;
+
+    if (packQty > 0 && packPrice > 0) {
+      packsUsed = Math.floor(remaining / packQty);
+      total += packsUsed * packPrice;
+      remaining -= packsUsed * packQty;
+    }
+
+    if (halfQty > 0 && halfPrice > 0) {
+      halvesUsed = Math.floor(remaining / halfQty);
+      total += halvesUsed * halfPrice;
+      remaining -= halvesUsed * halfQty;
+    }
+
+    total += remaining * unitPrice;
+
+    return {
+      total,
+      packsUsed,
+      halvesUsed,
+      remainingUnits: remaining,
+      hasDiscount: packsUsed > 0 || halvesUsed > 0
+    };
+  };
+
   const cartTotal = cart.reduce(
     (sum, item) =>
-      sum +
-      (item.activePrice || 0) *
-        item.quantity,
+      sum + computePackPricing(item).total,
     0
   );
 
@@ -550,7 +716,11 @@ export default function App() {
       name: item.name,
       unitType: item.unitType || item.unit_type || 'Sachet',
       quantity: item.quantity,
-      activePrice: item.activePrice || 0
+      activePrice: item.activePrice || 0,
+      // Snapshot the pack-discounted total at sale time, so a receipt or
+      // history record still shows what was actually charged even if
+      // the drug's pack pricing is edited later.
+      lineTotal: computePackPricing(item).total
     }));
 
   // ============================================================
@@ -715,12 +885,16 @@ export default function App() {
 
     setFormData({
       name: '',
-      unitType: 'Sachet',
+      unitType: 'Unit',
       costPrice: '',
       retailPrice: '',
       wholesalePrice: '',
       stock: '',
-      barcode: ''
+      barcode: '',
+      halfPackQty: '',
+      halfPackPrice: '',
+      packQty: '',
+      packPrice: ''
     });
 
     setIsModalOpen(true);
@@ -750,7 +924,23 @@ export default function App() {
         drug.wholesale_price ??
         '',
       stock: drug.stock ?? '',
-      barcode: drug.barcode || ''
+      barcode: drug.barcode || '',
+      halfPackQty:
+        drug.halfPackQty ??
+        drug.half_pack_qty ??
+        '',
+      halfPackPrice:
+        drug.halfPackPrice ??
+        drug.half_pack_price ??
+        '',
+      packQty:
+        drug.packQty ??
+        drug.pack_qty ??
+        '',
+      packPrice:
+        drug.packPrice ??
+        drug.pack_price ??
+        ''
     });
 
     setIsModalOpen(true);
@@ -791,7 +981,11 @@ export default function App() {
       retail_price: drugPayload.retailPrice,
       wholesale_price: drugPayload.wholesalePrice,
       stock: drugPayload.stock,
-      barcode: drugPayload.barcode
+      barcode: drugPayload.barcode,
+      half_pack_qty: drugPayload.halfPackQty,
+      half_pack_price: drugPayload.halfPackPrice,
+      pack_qty: drugPayload.packQty,
+      pack_price: drugPayload.packPrice
     };
 
     const { error: upsertError } = await supabase
@@ -812,9 +1006,11 @@ export default function App() {
         );
       } else {
         alert(
-          `Warning: saved on this device, but the cloud update failed (${upsertError.message}). This device's copy may get overwritten on next sync.`
+          `Warning: saved on this device, but the cloud update failed (${upsertError.message}). This will keep retrying automatically — on this device or any other that's online — until it syncs.`
         );
       }
+    } else {
+      await db.drugs.update(drugId, { synced: 1 });
     }
   };
 
@@ -859,6 +1055,14 @@ export default function App() {
         ? String(editingDrug.id)
         : Date.now().toString();
 
+      // Pack/half-pack fields are optional — a blank slot means "this
+      // drug has no discounted pack pricing", stored as null rather
+      // than 0 so it's never mistaken for a free/zero-priced pack.
+      const optionalNumber = (value) =>
+        value === '' || value === null || value === undefined
+          ? null
+          : Number(value);
+
       const drugPayload = {
         id: drugId,
         name: trimmedName,
@@ -867,7 +1071,12 @@ export default function App() {
         retailPrice: Number(formData.retailPrice),
         wholesalePrice: Number(formData.wholesalePrice),
         stock: Number(formData.stock),
-        barcode: formData.barcode
+        barcode: formData.barcode,
+        halfPackQty: optionalNumber(formData.halfPackQty),
+        halfPackPrice: optionalNumber(formData.halfPackPrice),
+        packQty: optionalNumber(formData.packQty),
+        packPrice: optionalNumber(formData.packPrice),
+        synced: 0
       };
 
       if (editingDrug) {
@@ -1460,6 +1669,29 @@ export default function App() {
                               item.unit_type}
                           </div>
 
+                          {(() => {
+                            const pricing = computePackPricing(item);
+                            return pricing.hasDiscount ? (
+                              <div className="pack-discount-note">
+                                🏷️{' '}
+                                {pricing.packsUsed > 0 &&
+                                  `${pricing.packsUsed} pack${
+                                    pricing.packsUsed > 1 ? 's' : ''
+                                  }`}
+                                {pricing.packsUsed > 0 &&
+                                  pricing.halvesUsed > 0 &&
+                                  ' + '}
+                                {pricing.halvesUsed > 0 &&
+                                  `${pricing.halvesUsed} half-pack${
+                                    pricing.halvesUsed > 1 ? 's' : ''
+                                  }`}
+                                {pricing.remainingUnits > 0 &&
+                                  ` + ${pricing.remainingUnits} @ unit price`}{' '}
+                                — ₦{pricing.total.toLocaleString()}
+                              </div>
+                            ) : null;
+                          })()}
+
                         </div>
 
                         <div className="qty-controls">
@@ -1684,14 +1916,20 @@ export default function App() {
                               {
                                 item.quantity
                               }
+                              {item.reversedQty > 0 && (
+                                <span className="reversed-tag">
+                                  {' '}
+                                  — {item.reversedQty} reversed
+                                </span>
+                              )}
                             </span>
 
                             <span>
                               ₦
                               {(
-                                (item.activePrice ||
-                                  0) *
-                                item.quantity
+                                item.lineTotal ??
+                                (item.activePrice || 0) *
+                                  item.quantity
                               ).toLocaleString()}
                             </span>
                           </div>
@@ -1710,20 +1948,34 @@ export default function App() {
                       </strong>
                     </div>
 
-                    <button
-                      className="receipt-btn"
-                      onClick={() => {
-                        setSaleSuccessData(
-                          sale
-                        );
+                    <div className="sale-card-actions">
+                      {hasRole(userRole, 'manager') && (
+                        <button
+                          className="reverse-btn"
+                          onClick={() => {
+                            setReversingSale(sale);
+                            setReversalQtys({});
+                          }}
+                        >
+                          ↩️ Reverse Items
+                        </button>
+                      )}
 
-                        setShowReceiptModal(
-                          true
-                        );
-                      }}
-                    >
-                      🖨️ Receipt
-                    </button>
+                      <button
+                        className="receipt-btn"
+                        onClick={() => {
+                          setSaleSuccessData(
+                            sale
+                          );
+
+                          setShowReceiptModal(
+                            true
+                          );
+                        }}
+                      >
+                        🖨️ Receipt
+                      </button>
+                    </div>
 
                   </div>
 
@@ -1744,6 +1996,64 @@ export default function App() {
       ======================================================== */}
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
         <div className="admin-screen no-print">
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Drug Sale Search</h3>
+              <span className="admin-section-sub">
+                Find every sale of a drug, and which account sold it — for
+                tracing expensive or sensitive drugs (1-year window)
+              </span>
+            </div>
+
+            <input
+              type="text"
+              placeholder="Search by drug name (e.g. Tramadol)..."
+              value={drugSearchTerm}
+              onChange={(e) => setDrugSearchTerm(e.target.value)}
+              className="history-search-input"
+            />
+
+            {drugSearchTerm.trim() && (
+              drugSaleMatches.length > 0 ? (
+                <div className="drug-search-results">
+                  {drugSaleMatches.map((match, idx) => (
+                    <div
+                      key={`${match.saleId}-${idx}`}
+                      className="drug-search-row"
+                    >
+                      <div className="drug-search-main">
+                        <strong>{match.drugName}</strong>
+                        <span className="deleted-drug-meta">
+                          {match.quantity} {match.unitType}
+                          {match.reversedQty > 0 &&
+                            ` (${match.reversedQty} reversed)`}{' '}
+                          · ₦{match.lineTotal.toLocaleString()} · Sale{' '}
+                          {match.saleId}
+                        </span>
+                      </div>
+
+                      <div className="drug-search-accountability">
+                        <span>
+                          👤 Sold by: <strong>{match.cashierEmail}</strong>
+                        </span>
+                        <span>
+                          🕒 {new Date(match.createdAt).toLocaleString()}
+                        </span>
+                        <span>
+                          Customer: {match.customerName || 'Walk-in Customer'}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state">
+                  No sales of "{drugSearchTerm}" found in the last year.
+                </div>
+              )
+            )}
+          </section>
 
           <section className="admin-section">
             <div className="admin-section-header">
@@ -1958,9 +2268,9 @@ export default function App() {
                       <span>
                         ₦
                         {(
-                          (item.activePrice ||
-                            0) *
-                          item.quantity
+                          item.lineTotal ??
+                          (item.activePrice || 0) *
+                            item.quantity
                         ).toLocaleString()}
                       </span>
                     </div>
@@ -2022,6 +2332,94 @@ export default function App() {
         )}
 
       {/* ========================================================
+          PARTIAL SALE REVERSAL MODAL (manager)
+      ======================================================== */}
+      {reversingSale && (
+        <div className="modal-overlay">
+
+          <div className="modal-card">
+
+            <h3>Reverse Items — {reversingSale.id}</h3>
+
+            <p className="form-section-hint">
+              Enter how many units of each item to reverse. Stock is
+              restored and the sale total is reduced by the refunded
+              amount. Leave an item at 0 to leave it untouched.
+            </p>
+
+            <div className="reversal-items-list">
+              {(reversingSale.items || []).map((item) => {
+                const alreadyReversed = Number(item.reversedQty) || 0;
+                const maxReversible = item.quantity - alreadyReversed;
+
+                return (
+                  <div
+                    key={item.id}
+                    className="reversal-item-row"
+                  >
+                    <div>
+                      <strong>{item.name}</strong>
+                      <div className="reversal-item-meta">
+                        Sold: {item.quantity} {item.unitType}
+                        {alreadyReversed > 0 &&
+                          ` · Already reversed: ${alreadyReversed}`}
+                        {maxReversible <= 0 && ' · Fully reversed'}
+                      </div>
+                    </div>
+
+                    <input
+                      type="number"
+                      min="0"
+                      max={maxReversible}
+                      disabled={maxReversible <= 0}
+                      placeholder="0"
+                      value={reversalQtys[item.id] || ''}
+                      onChange={(e) => {
+                        const val = Math.max(
+                          0,
+                          Math.min(
+                            maxReversible,
+                            Number(e.target.value) || 0
+                          )
+                        );
+                        setReversalQtys({
+                          ...reversalQtys,
+                          [item.id]: val
+                        });
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isReversing}
+                onClick={handleConfirmReversal}
+              >
+                {isReversing ? 'Reversing…' : 'Confirm Reversal'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => {
+                  setReversingSale(null);
+                  setReversalQtys({});
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
           ADD / EDIT DRUG MODAL
       ======================================================== */}
       {isModalOpen &&
@@ -2081,12 +2479,32 @@ export default function App() {
                     Sachet
                   </option>
 
-                  <option value="Pack">
-                    Pack
-                  </option>
-
                   <option value="Bottle">
                     Bottle
+                  </option>
+
+                  <option value="Tube">
+                    Tube
+                  </option>
+
+                  <option value="Ampoule">
+                    Ampoule
+                  </option>
+
+                  <option value="Drop">
+                    Drop
+                  </option>
+
+                  <option value="Vial">
+                    Vial
+                  </option>
+
+                  <option value="Strip">
+                    Strip
+                  </option>
+
+                  <option value="Unit">
+                    Unit
                   </option>
                 </select>
 
@@ -2199,6 +2617,106 @@ export default function App() {
                     })
                   }
                 />
+
+                <p className="form-section-hint">
+                  Pack Discounts (Optional) — leave blank for drugs that are only sold one {formData.unitType.toLowerCase()} at a time.
+                </p>
+
+                <div className="form-row">
+
+                  <div>
+                    <label>
+                      Half Pack Qty:
+                    </label>
+
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 6"
+                      value={
+                        formData.halfPackQty
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          halfPackQty:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>
+                      Half Pack Price (₦):
+                    </label>
+
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 1000"
+                      value={
+                        formData.halfPackPrice
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          halfPackPrice:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                </div>
+
+                <div className="form-row">
+
+                  <div>
+                    <label>
+                      Full Pack Qty:
+                    </label>
+
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 12"
+                      value={
+                        formData.packQty
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          packQty:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>
+                      Full Pack Price (₦):
+                    </label>
+
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 2000"
+                      value={
+                        formData.packPrice
+                      }
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          packPrice:
+                            e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                </div>
 
                 <div className="modal-actions">
 
