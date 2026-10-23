@@ -39,15 +39,39 @@ db.version(6).stores({
   auditLog: 'id, createdAt, synced'
 });
 
+// Schema Version 7:
+//  - `sales` gains `reversalPending` (indexed) — a partial reversal is
+//    now written locally first and retried against the cloud, the same
+//    write-then-sync pattern everything else already uses, instead of
+//    silently failing if the cloud update was rejected (e.g. by RLS)
+//    or the device was offline.
+//  - Two new tables for the attendant/cashier ticket workflow:
+//    `tickets` (a cart an attendant built for a customer, pending
+//    payment approval by a cashier) and `bankOptions` (the admin-
+//    managed list of banks a cashier can record a transfer against).
+db.version(7).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
-// administrator > manager > salesperson. A higher role can do
-// everything a lower role can, plus its own extra features.
+// administrator > manager > cashier > salesperson. A higher role can
+// do everything a lower role can, plus its own extra features. Cashier
+// sits between salesperson and manager: a cashier does everything a
+// salesperson (attendant) can, PLUS approve/complete pending tickets —
+// but doesn't automatically get manager-level inventory/admin rights.
+// Managers and administrators, being higher ranked, can also act as a
+// cashier (approve tickets) when needed.
 // ============================================================
 export const ROLE_RANK = {
   salesperson: 0,
-  manager: 1,
-  administrator: 2
+  cashier: 1,
+  manager: 2,
+  administrator: 3
 };
 
 export function hasRole(role, minimumRole) {
@@ -553,21 +577,27 @@ export async function reverseSaleItems(sale, reversals, actor) {
       }
     }
 
-    // Update the sale record locally if this device has a copy.
-    const localSale = await db.sales.get(saleId);
-    if (localSale) {
-      await db.sales.update(saleId, {
-        items: updatedItems,
-        total: newTotal,
-        reversalLog: newReversalLog
-      });
-    }
+    // Persist the reversed sale locally FIRST, unconditionally — not
+    // only when this device already had a local copy. Sales History
+    // mostly renders from cloudSales (fetched from Supabase), and the
+    // merge logic prefers the local copy over the cloud one, so writing
+    // locally with `put` (which both creates and updates) is what makes
+    // the reversal survive a reload on this device even if the cloud
+    // push below fails or is still offline. `reversalPending: 1` marks
+    // it for the retry function below.
+    await db.sales.put({
+      ...sale,
+      items: updatedItems,
+      total: newTotal,
+      reversalLog: newReversalLog,
+      reversalPending: 1
+    });
 
-    // Always push the update to Supabase too — the sale may only
-    // exist in the cloud (made on a different device).
+    let cloudSynced = false;
+
     if (navigator.onLine) {
       try {
-        await supabase
+        const { error: cloudError } = await supabase
           .from('sales')
           .update({
             items: updatedItems,
@@ -575,6 +605,11 @@ export async function reverseSaleItems(sale, reversals, actor) {
             reversal_log: newReversalLog
           })
           .eq('id', saleId);
+
+        if (cloudError) throw cloudError;
+
+        cloudSynced = true;
+        await db.sales.update(saleId, { reversalPending: 0 });
       } catch (err) {
         console.warn('Cloud sale reversal postponed:', err.message);
       }
@@ -593,10 +628,42 @@ export async function reverseSaleItems(sale, reversals, actor) {
       success: true,
       updatedItems,
       newTotal,
-      reversalLog: newReversalLog
+      reversalLog: newReversalLog,
+      cloudSynced
     };
   } catch (err) {
     console.warn('Unable to reverse sale items:', err.message);
     return { success: false, reason: err.message };
+  }
+}
+
+// Mirrors syncPendingDrugsToCloud()/syncPendingSalesToCloud(): retries
+// pushing a reversal's updated items/total up to Supabase for any sale
+// where the cloud push failed or was offline at the time (reversalPending).
+export async function syncPendingReversalsToCloud() {
+  try {
+    const pending = await db.sales
+      .where('reversalPending')
+      .equals(1)
+      .toArray();
+
+    if (pending.length === 0) return;
+
+    for (const sale of pending) {
+      const { error } = await supabase
+        .from('sales')
+        .update({
+          items: sale.items,
+          total: sale.total,
+          reversal_log: sale.reversalLog
+        })
+        .eq('id', sale.id);
+
+      if (!error) {
+        await db.sales.update(sale.id, { reversalPending: 0 });
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending reversals:', err.message);
   }
 }

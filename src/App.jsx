@@ -770,11 +770,13 @@ export default function App() {
                 ));
 
               if (existingDrug) {
-                const newStock = Math.max(
-                  0,
+                // Allowed to go negative on purpose — a sale can be
+                // recorded before a delivery is logged, or stock counts
+                // can run behind reality; clamping to 0 used to hide
+                // that discrepancy instead of surfacing it.
+                const newStock =
                   (existingDrug.stock || 0) -
-                    item.quantity
-                );
+                  item.quantity;
 
                 await db.drugs.update(
                   existingDrug.id,
@@ -2192,7 +2194,7 @@ export default function App() {
               <div className="receipt-header">
 
                 <h2>
-                  AZU PHARMACY
+                  Alimosho Pharmacy
                 </h2>
 
                 <p>
