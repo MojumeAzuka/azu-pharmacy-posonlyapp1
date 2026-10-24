@@ -372,6 +372,16 @@ export default function App() {
     };
   }, [session, userRole]);
 
+  // A pure cashier account has no POS tab (see the nav above) — if their
+  // role loads in after the default 'pos' tab is already selected (or
+  // they were switched to cashier while the app was open), bounce them
+  // straight to their Queue instead of showing an empty/inaccessible tab.
+  useEffect(() => {
+    if (userRole === 'cashier' && activeTab === 'pos') {
+      setActiveTab('tickets');
+    }
+  }, [userRole, activeTab]);
+
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
@@ -379,8 +389,10 @@ export default function App() {
 
     // Tickets need to feel close to real-time — a customer is standing
     // at the till waiting — so re-pull from the cloud every 10s while
-    // the Tickets tab is open, on top of the reconnect/tab-switch fetch.
-    if (activeTab === 'tickets' && isOnline) {
+    // either the attendant's POS screen (ticket drafts + "my tickets")
+    // or the cashier's Queue screen is open, on top of the
+    // reconnect/tab-switch fetch.
+    if ((activeTab === 'pos' || activeTab === 'tickets') && isOnline) {
       fetchCloudTickets();
       expireStaleTickets();
 
@@ -474,6 +486,65 @@ export default function App() {
       .filter((t) => t.status === 'PENDING_PAYMENT')
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   }, [allTickets]);
+
+  // ============================================================
+  // CASHIER CHIME — a short two-note tone whenever a NEW ticket lands
+  // in the Queue, so a cashier doesn't have to keep staring at the
+  // screen to notice a customer is ready to pay. Built with the Web
+  // Audio API (no audio file to fetch/cache), so it works offline too.
+  // Only wired up for cashier-rank accounts, and never fires on the
+  // very first load of an already-full queue — only on an increase
+  // after that.
+  // ============================================================
+  const prevPendingCountRef = useRef(null);
+
+  const playQueueChime = () => {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+
+      const playTone = (freq, startTime, duration) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, startTime);
+        gain.gain.exponentialRampToValueAtTime(0.3, startTime + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(startTime);
+        osc.stop(startTime + duration + 0.05);
+      };
+
+      playTone(880, now, 0.15);
+      playTone(1175, now + 0.15, 0.22);
+    } catch (err) {
+      console.warn('Unable to play queue chime:', err.message);
+    }
+  };
+
+  useEffect(() => {
+    if (!hasRole(userRole, 'cashier')) return;
+
+    const count = pendingTickets.length;
+
+    if (prevPendingCountRef.current === null) {
+      // First measurement after login/reload — don't chime for tickets
+      // that were already sitting in the queue before this device
+      // opened it.
+      prevPendingCountRef.current = count;
+      return;
+    }
+
+    if (count > prevPendingCountRef.current) {
+      playQueueChime();
+    }
+
+    prevPendingCountRef.current = count;
+  }, [pendingTickets, userRole]);
 
   // What the ATTENDANT sees: their own submitted tickets (any status),
   // so they can see a ticket go PAID or follow up on one that's
@@ -1662,18 +1733,24 @@ export default function App() {
         <div className="controls-bar">
 
           <div className="nav-tabs">
-            <button
-              className={
-                activeTab === 'pos'
-                  ? 'active-tab'
-                  : ''
-              }
-              onClick={() =>
-                setActiveTab('pos')
-              }
-            >
-              🛒 POS
-            </button>
+            {/* A pure cashier's whole job is the approval queue — they
+                never see the drug catalog or build tickets themselves,
+                so the POS tab doesn't exist for that role. Managers and
+                administrators outrank cashier, so they still get it. */}
+            {userRole !== 'cashier' && (
+              <button
+                className={
+                  activeTab === 'pos'
+                    ? 'active-tab'
+                    : ''
+                }
+                onClick={() =>
+                  setActiveTab('pos')
+                }
+              >
+                🛒 POS
+              </button>
+            )}
 
             <button
               className={
@@ -1690,21 +1767,26 @@ export default function App() {
               📋 History
             </button>
 
-            <button
-              className={
-                activeTab === 'tickets'
-                  ? 'active-tab'
-                  : ''
-              }
-              onClick={() => setActiveTab('tickets')}
-            >
-              🎫 Tickets
-              {hasRole(userRole, 'cashier') && pendingTickets.length > 0 && (
-                <span className="nav-badge">
-                  {pendingTickets.length > 9 ? '9+' : pendingTickets.length}
-                </span>
-              )}
-            </button>
+            {/* The approval Queue is only for cashier rank and above —
+                a plain salesperson/attendant builds tickets from the
+                POS tab instead and never approves payment. */}
+            {hasRole(userRole, 'cashier') && (
+              <button
+                className={
+                  activeTab === 'tickets'
+                    ? 'active-tab'
+                    : ''
+                }
+                onClick={() => setActiveTab('tickets')}
+              >
+                🧾 Queue
+                {pendingTickets.length > 0 && (
+                  <span className="nav-badge">
+                    {pendingTickets.length > 9 ? '9+' : pendingTickets.length}
+                  </span>
+                )}
+              </button>
+            )}
 
             {hasRole(userRole, 'administrator') && (
               <button
@@ -1794,355 +1876,263 @@ export default function App() {
           POS TERMINAL
       ======================================================== */}
       {activeTab === 'pos' && (
-        <div
-          className={`pos-screen ${
-            cart.length > 0
-              ? 'cart-active'
-              : 'cart-empty'
-          }`}
-        >
+        <div className="tickets-screen no-print">
 
-          {/* DRUG CATALOG */}
-          <div className="pos-catalog-section">
-            <div className="drug-list">
-
-              {drugs &&
-              drugs.length > 0 ? (
-                drugs.map((drug) => {
-                  const cost = Number(
-                    drug.costPrice ??
-                      drug.cost_price ??
-                      0
-                  );
-
-                  const retail = Number(
-                    drug.retailPrice ??
-                      drug.retail_price ??
-                      0
-                  );
-
-                  const wholesale =
-                    Number(
-                      drug.wholesalePrice ??
-                        drug.wholesale_price ??
-                        0
-                    );
-
-                  const unit =
-                    drug.unitType ||
-                    drug.unit_type ||
-                    'Sachet';
-
-                  return (
-                    <div
-                      key={drug.id}
-                      className="drug-card"
-                      onClick={() =>
-                        addToCart(drug)
-                      }
-                    >
-
-                      <div className="drug-info">
-                        <div className="drug-name">
-                          {drug.name}
-                        </div>
-
-                        <div className="tags-row">
-                          <span className="unit-tag">
-                            {unit}
-                          </span>
-
-                          <span
-                            className={`stock-tag ${
-                              drug.stock < 10
-                                ? 'low-stock'
-                                : ''
-                            }`}
-                          >
-                            Stock:{' '}
-                            {drug.stock}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="price-stack">
-
-                        {hasRole(userRole, 'manager') && (
-                          <div className="price-item cost-price">
-                            <small>
-                              Cost:
-                            </small>{' '}
-                            ₦
-                            {cost.toLocaleString()}
-                          </div>
-                        )}
-
-                        <div
-                          className={`price-item ${
-                            saleType ===
-                            'retail'
-                              ? 'highlight'
-                              : ''
-                          }`}
-                        >
-                          <small>
-                            Retail:
-                          </small>{' '}
-                          ₦
-                          {retail.toLocaleString()}
-                        </div>
-
-                        <div
-                          className={`price-item ${
-                            saleType ===
-                            'wholesale'
-                              ? 'highlight'
-                              : ''
-                          }`}
-                        >
-                          <small>
-                            Wholesale:
-                          </small>{' '}
-                          ₦
-                          {wholesale.toLocaleString()}
-                        </div>
-
-                        {hasRole(userRole, 'manager') && (
-                          <div className="manager-actions">
-
-                            <button
-                              onClick={(e) =>
-                                handleOpenEditModal(
-                                  drug,
-                                  e
-                                )
-                              }
-                            >
-                              ✏️ Edit
-                            </button>
-
-                            <button
-                              onClick={(e) =>
-                                handleDeleteDrug(
-                                  drug.id,
-                                  e
-                                )
-                              }
-                              className="del-btn"
-                              title="Move to Recently Deleted"
-                            >
-                              🗑️
-                            </button>
-
-                          </div>
-                        )}
-
-                      </div>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="empty-state">
-                  No drugs found.
-                </div>
-              )}
-
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Build Tickets</h3>
+              <span className="admin-section-sub">
+                Build a cart for each customer, submit it, and hand them the
+                printed ticket to carry to the cashier. You can keep several
+                customers' tickets open at once.
+              </span>
             </div>
-          </div>
 
-          {/* ====================================================
-              CART
-          ==================================================== */}
-          <div className="cart-sidebar-wrapper">
-
-            <div
-              className={`cart-drawer ${
-                cart.length === 0
-                  ? 'empty-cart-drawer'
-                  : ''
-              }`}
-            >
-
-              <div className="cart-header">
-
-                <h3>
-                  Cart
-                  <span className="cart-mode-label">
-                    {' '}
-                    ·{' '}
-                    {saleType.toUpperCase()}
+            <div className="ticket-draft-tabs">
+              {ticketDrafts.map((d) => (
+                <button
+                  key={d.id}
+                  type="button"
+                  className={`ticket-draft-tab ${
+                    activeDraftId === d.id ? 'active' : ''
+                  }`}
+                  onClick={() => setActiveDraftId(d.id)}
+                >
+                  {d.customerName || 'New Customer'} ({d.items.length})
+                  <span
+                    className="ticket-draft-close"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeDraft(d.id);
+                    }}
+                  >
+                    ✕
                   </span>
-                </h3>
+                </button>
+              ))}
 
-                {cart.length > 0 && (
-                  <button
-                    className="clear-cart-btn"
-                    onClick={() =>
-                      setCart([])
+              <button
+                type="button"
+                className="ticket-draft-tab new-draft-btn"
+                onClick={createNewDraft}
+              >
+                + New Ticket
+              </button>
+            </div>
+
+            {activeDraft ? (
+              <div className="ticket-draft-builder">
+                <div className="customer-input-row">
+                  <input
+                    type="text"
+                    placeholder="Customer Name"
+                    value={activeDraft.customerName}
+                    onChange={(e) =>
+                      setDraftField(activeDraft.id, 'customerName', e.target.value)
                     }
+                  />
+                  <input
+                    type="text"
+                    placeholder="Customer Phone"
+                    value={activeDraft.customerPhone}
+                    onChange={(e) =>
+                      setDraftField(activeDraft.id, 'customerPhone', e.target.value)
+                    }
+                  />
+                </div>
+
+                <div className="price-mode-toggle">
+                  <button
+                    type="button"
+                    className={activeDraft.saleType === 'retail' ? 'active' : ''}
+                    onClick={() => setDraftSaleType(activeDraft.id, 'retail')}
                   >
-                    Clear
+                    Retail
                   </button>
-                )}
-
-              </div>
-
-              {cart.length > 0 ? (
-                <>
-
-                  <div className="customer-info-section">
-                    <div className="customer-input-row">
-
-                      <input
-                        type="text"
-                        placeholder="Customer name"
-                        value={
-                          customerName
-                        }
-                        onChange={(e) =>
-                          setCustomerName(
-                            e.target.value
-                          )
-                        }
-                      />
-
-                      <input
-                        type="tel"
-                        placeholder="Phone"
-                        value={
-                          customerPhone
-                        }
-                        onChange={(e) =>
-                          setCustomerPhone(
-                            e.target.value
-                          )
-                        }
-                      />
-
-                    </div>
-                  </div>
-
-                  <div
-                    className="cart-items-list"
-                    ref={cartListRef}
+                  <button
+                    type="button"
+                    className={activeDraft.saleType === 'wholesale' ? 'active' : ''}
+                    onClick={() => setDraftSaleType(activeDraft.id, 'wholesale')}
                   >
-                    {cart.map((item) => (
-                      <div
-                        key={item.id}
-                        className="cart-item"
-                      >
+                    Wholesale
+                  </button>
+                </div>
 
-                        <div className="cart-item-info">
+                <div className="drug-list ticket-drug-list">
+                  {drugs && drugs.length > 0 ? (
+                    drugs.map((drug) => {
+                      const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
+                      const price =
+                        activeDraft.saleType === 'wholesale'
+                          ? Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0)
+                          : Number(drug.retailPrice ?? drug.retail_price ?? 0);
 
-                          <strong className="cart-item-name">
-                            {item.name}
-                          </strong>
-
-                          <div className="unit-price">
-                            ₦
-                            {(
-                              item.activePrice ||
-                              0
-                            ).toLocaleString()}{' '}
-                            /{' '}
-                            {item.unitType ||
-                              item.unit_type}
+                      return (
+                        <div
+                          key={drug.id}
+                          className="drug-card"
+                          onClick={() => addToDraft(activeDraft.id, drug)}
+                        >
+                          <div className="drug-info">
+                            <div className="drug-name">{drug.name}</div>
+                            <div className="tags-row">
+                              <span className="unit-tag">
+                                {drug.unitType || drug.unit_type}
+                              </span>
+                              <span
+                                className={`stock-tag ${
+                                  drug.stock < 10 ? 'low-stock' : ''
+                                }`}
+                              >
+                                Stock: {drug.stock}
+                              </span>
+                            </div>
                           </div>
 
-                          {(() => {
-                            const pricing = computePackPricing(item);
-                            return pricing.hasDiscount ? (
-                              <div className="pack-discount-note">
-                                🏷️{' '}
-                                {pricing.packsUsed > 0 &&
-                                  `${pricing.packsUsed} pack${
-                                    pricing.packsUsed > 1 ? 's' : ''
-                                  }`}
-                                {pricing.packsUsed > 0 &&
-                                  pricing.halvesUsed > 0 &&
-                                  ' + '}
-                                {pricing.halvesUsed > 0 &&
-                                  `${pricing.halvesUsed} half-pack${
-                                    pricing.halvesUsed > 1 ? 's' : ''
-                                  }`}
-                                {pricing.remainingUnits > 0 &&
-                                  ` + ${pricing.remainingUnits} @ unit price`}{' '}
-                                — ₦{pricing.total.toLocaleString()}
+                          <div className="price-stack">
+                            {hasRole(userRole, 'manager') && (
+                              <div className="price-item cost-price">
+                                <small>Cost:</small> ₦{cost.toLocaleString()}
                               </div>
-                            ) : null;
-                          })()}
+                            )}
 
+                            <div className="price-item highlight">
+                              <small>
+                                {activeDraft.saleType === 'wholesale'
+                                  ? 'Wholesale:'
+                                  : 'Retail:'}
+                              </small>{' '}
+                              ₦{price.toLocaleString()}
+                            </div>
+
+                            {hasRole(userRole, 'manager') && (
+                              <div className="manager-actions">
+                                <button
+                                  onClick={(e) => handleOpenEditModal(drug, e)}
+                                >
+                                  ✏️ Edit
+                                </button>
+
+                                <button
+                                  onClick={(e) => handleDeleteDrug(drug.id, e)}
+                                  className="del-btn"
+                                  title="Move to Recently Deleted"
+                                >
+                                  🗑️
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </div>
-
-                        <div className="qty-controls">
-
-                          <button
-                            onClick={() =>
-                              updateQuantity(
-                                item.id,
-                                -1
-                              )
-                            }
-                            aria-label="Decrease quantity"
-                          >
-                            -
-                          </button>
-
-                          <span>
-                            {item.quantity}
-                          </span>
-
-                          <button
-                            onClick={() =>
-                              updateQuantity(
-                                item.id,
-                                1
-                              )
-                            }
-                            aria-label="Increase quantity"
-                          >
-                            +
-                          </button>
-
-                        </div>
-
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="cart-summary">
-
-                    <div className="total-display">
-                      <span>
-                        Total Due
-                      </span>
-
-                      <strong>
-                        ₦
-                        {cartTotal.toLocaleString()}
-                      </strong>
-                    </div>
-
-                    <button
-                      className="checkout-btn"
-                      onClick={
-                        handleCheckout
-                      }
-                    >
-                      Complete Sale
-                    </button>
-
-                  </div>
-
-                </>
-              ) : (
-                <div className="empty-cart-message">
-                  🛒 Tap a drug to add it
+                      );
+                    })
+                  ) : (
+                    <div className="empty-state">No drugs found.</div>
+                  )}
                 </div>
-              )}
 
+                <div className="cart-items-list ticket-items-list">
+                  {activeDraft.items.length > 0 ? (
+                    activeDraft.items.map((item) => {
+                      const pricing = computePackPricing(item);
+                      return (
+                        <div key={item.id} className="cart-item">
+                          <div className="cart-item-info">
+                            <strong className="cart-item-name">{item.name}</strong>
+                            <div className="unit-price">
+                              ₦{(item.activePrice || 0).toLocaleString()} /{' '}
+                              {item.unitType || item.unit_type}
+                            </div>
+                            {pricing.hasDiscount && (
+                              <div className="pack-discount-note">
+                                Pack discount applied
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="qty-controls">
+                            <button
+                              onClick={() =>
+                                updateDraftQuantity(activeDraft.id, item.id, -1)
+                              }
+                              aria-label="Decrease quantity"
+                            >
+                              -
+                            </button>
+                            <span>{item.quantity}</span>
+                            <button
+                              onClick={() =>
+                                updateDraftQuantity(activeDraft.id, item.id, 1)
+                              }
+                              aria-label="Increase quantity"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="empty-cart-message">
+                      🛒 Tap a drug above to add it to this ticket
+                    </div>
+                  )}
+                </div>
+
+                <div className="cart-summary">
+                  <div className="total-display">
+                    <span>Ticket Total</span>
+                    <strong>₦{draftTotal(activeDraft).toLocaleString()}</strong>
+                  </div>
+
+                  <button
+                    className="checkout-btn"
+                    disabled={activeDraft.items.length === 0 || isSubmittingTicket}
+                    onClick={() => handleSubmitTicket(activeDraft.id)}
+                  >
+                    {isSubmittingTicket
+                      ? 'Submitting…'
+                      : '🖨️ Print Ticket & Send to Cashier'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state">
+                No ticket open — tap "+ New Ticket" above to start one.
+              </div>
+            )}
+          </section>
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>My Recent Tickets</h3>
+              <span className="admin-section-sub">
+                Submitted in the last 2 days
+              </span>
             </div>
-          </div>
+
+            {myRecentTickets.length > 0 ? (
+              <div className="ticket-list">
+                {myRecentTickets.map((t) => (
+                  <div key={t.id} className="ticket-row">
+                    <div>
+                      <strong>{t.customerName}</strong>
+                      <div className="deleted-drug-meta">
+                        {t.items.length} item(s) · ₦{t.total.toLocaleString()}
+                      </div>
+                    </div>
+                    <span
+                      className={`ticket-status-pill status-${t.status.toLowerCase()}`}
+                    >
+                      {t.status.replace('_', ' ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No tickets yet.</div>
+            )}
+          </section>
 
         </div>
       )}
@@ -2379,286 +2369,47 @@ export default function App() {
 
           <section className="admin-section">
             <div className="admin-section-header">
-              <h3>Build Tickets</h3>
+              <h3>Payment Queue</h3>
               <span className="admin-section-sub">
-                Build a cart for each customer, submit it, and hand them the
-                printed ticket to carry to the cashier. You can keep several
-                customers' tickets open at once.
+                Tickets waiting for payment, oldest first — approve one once
+                the customer has paid, or switch to another customer if this
+                one is still sorting out payment.
               </span>
             </div>
 
-            <div className="ticket-draft-tabs">
-              {ticketDrafts.map((d) => (
-                <button
-                  key={d.id}
-                  type="button"
-                  className={`ticket-draft-tab ${
-                    activeDraftId === d.id ? 'active' : ''
-                  }`}
-                  onClick={() => setActiveDraftId(d.id)}
-                >
-                  {d.customerName || 'New Customer'} ({d.items.length})
-                  <span
-                    className="ticket-draft-close"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      closeDraft(d.id);
-                    }}
-                  >
-                    ✕
-                  </span>
-                </button>
-              ))}
-
-              <button
-                type="button"
-                className="ticket-draft-tab new-draft-btn"
-                onClick={createNewDraft}
-              >
-                + New Ticket
-              </button>
-            </div>
-
-            {activeDraft ? (
-              <div className="ticket-draft-builder">
-                <div className="customer-input-row">
-                  <input
-                    type="text"
-                    placeholder="Customer Name"
-                    value={activeDraft.customerName}
-                    onChange={(e) =>
-                      setDraftField(activeDraft.id, 'customerName', e.target.value)
-                    }
-                  />
-                  <input
-                    type="text"
-                    placeholder="Customer Phone"
-                    value={activeDraft.customerPhone}
-                    onChange={(e) =>
-                      setDraftField(activeDraft.id, 'customerPhone', e.target.value)
-                    }
-                  />
-                </div>
-
-                <div className="price-mode-toggle">
-                  <button
-                    type="button"
-                    className={activeDraft.saleType === 'retail' ? 'active' : ''}
-                    onClick={() => setDraftSaleType(activeDraft.id, 'retail')}
-                  >
-                    Retail
-                  </button>
-                  <button
-                    type="button"
-                    className={activeDraft.saleType === 'wholesale' ? 'active' : ''}
-                    onClick={() => setDraftSaleType(activeDraft.id, 'wholesale')}
-                  >
-                    Wholesale
-                  </button>
-                </div>
-
-                <input
-                  type="text"
-                  placeholder="Search drugs or scan barcode..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className="search-input"
-                />
-
-                <div className="drug-list ticket-drug-list">
-                  {drugs && drugs.length > 0 ? (
-                    drugs.map((drug) => {
-                      const price =
-                        activeDraft.saleType === 'wholesale'
-                          ? Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0)
-                          : Number(drug.retailPrice ?? drug.retail_price ?? 0);
-
-                      return (
-                        <div
-                          key={drug.id}
-                          className="drug-card"
-                          onClick={() => addToDraft(activeDraft.id, drug)}
-                        >
-                          <div className="drug-info">
-                            <div className="drug-name">{drug.name}</div>
-                            <div className="tags-row">
-                              <span className="unit-tag">
-                                {drug.unitType || drug.unit_type}
-                              </span>
-                              <span
-                                className={`stock-tag ${
-                                  drug.stock < 10 ? 'low-stock' : ''
-                                }`}
-                              >
-                                Stock: {drug.stock}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="price-stack">
-                            <div className="price-item highlight">
-                              <small>
-                                {activeDraft.saleType === 'wholesale'
-                                  ? 'Wholesale:'
-                                  : 'Retail:'}
-                              </small>{' '}
-                              ₦{price.toLocaleString()}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="empty-state">No drugs found.</div>
-                  )}
-                </div>
-
-                <div className="cart-items-list ticket-items-list">
-                  {activeDraft.items.length > 0 ? (
-                    activeDraft.items.map((item) => {
-                      const pricing = computePackPricing(item);
-                      return (
-                        <div key={item.id} className="cart-item">
-                          <div className="cart-item-info">
-                            <strong className="cart-item-name">{item.name}</strong>
-                            <div className="unit-price">
-                              ₦{(item.activePrice || 0).toLocaleString()} /{' '}
-                              {item.unitType || item.unit_type}
-                            </div>
-                            {pricing.hasDiscount && (
-                              <div className="pack-discount-note">
-                                Pack discount applied
-                              </div>
-                            )}
-                          </div>
-
-                          <div className="qty-controls">
-                            <button
-                              onClick={() =>
-                                updateDraftQuantity(activeDraft.id, item.id, -1)
-                              }
-                              aria-label="Decrease quantity"
-                            >
-                              -
-                            </button>
-                            <span>{item.quantity}</span>
-                            <button
-                              onClick={() =>
-                                updateDraftQuantity(activeDraft.id, item.id, 1)
-                              }
-                              aria-label="Increase quantity"
-                            >
-                              +
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="empty-cart-message">
-                      🛒 Tap a drug above to add it to this ticket
-                    </div>
-                  )}
-                </div>
-
-                <div className="cart-summary">
-                  <div className="total-display">
-                    <span>Ticket Total</span>
-                    <strong>₦{draftTotal(activeDraft).toLocaleString()}</strong>
-                  </div>
-
-                  <button
-                    className="checkout-btn"
-                    disabled={activeDraft.items.length === 0 || isSubmittingTicket}
-                    onClick={() => handleSubmitTicket(activeDraft.id)}
-                  >
-                    {isSubmittingTicket
-                      ? 'Submitting…'
-                      : '🖨️ Print Ticket & Send to Cashier'}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="empty-state">
-                No ticket open — tap "+ New Ticket" above to start one.
-              </div>
-            )}
-          </section>
-
-          <section className="admin-section">
-            <div className="admin-section-header">
-              <h3>My Recent Tickets</h3>
-              <span className="admin-section-sub">
-                Submitted in the last 2 days
-              </span>
-            </div>
-
-            {myRecentTickets.length > 0 ? (
+            {pendingTickets.length > 0 ? (
               <div className="ticket-list">
-                {myRecentTickets.map((t) => (
+                {pendingTickets.map((t) => (
                   <div key={t.id} className="ticket-row">
                     <div>
                       <strong>{t.customerName}</strong>
                       <div className="deleted-drug-meta">
-                        {t.items.length} item(s) · ₦{t.total.toLocaleString()}
+                        {t.items.map((i) => `${i.name} x${i.quantity}`).join(', ')}
+                        {' · '}₦{t.total.toLocaleString()} · by {t.attendantEmail}
                       </div>
                     </div>
-                    <span
-                      className={`ticket-status-pill status-${t.status.toLowerCase()}`}
-                    >
-                      {t.status.replace('_', ' ')}
-                    </span>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleOpenApproveModal(t)}
+                      >
+                        💳 Approve Payment
+                      </button>
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() => handleCancelTicketClick(t)}
+                      >
+                        ✕ Cancel
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="empty-state">No tickets yet.</div>
+              <div className="empty-state">No pending tickets.</div>
             )}
           </section>
-
-          {hasRole(userRole, 'cashier') && (
-            <section className="admin-section">
-              <div className="admin-section-header">
-                <h3>Cashier Queue</h3>
-                <span className="admin-section-sub">
-                  Tickets waiting for payment, oldest first
-                </span>
-              </div>
-
-              {pendingTickets.length > 0 ? (
-                <div className="ticket-list">
-                  {pendingTickets.map((t) => (
-                    <div key={t.id} className="ticket-row">
-                      <div>
-                        <strong>{t.customerName}</strong>
-                        <div className="deleted-drug-meta">
-                          {t.items.map((i) => `${i.name} x${i.quantity}`).join(', ')}
-                          {' · '}₦{t.total.toLocaleString()} · by {t.attendantEmail}
-                        </div>
-                      </div>
-
-                      <div className="deleted-drug-actions">
-                        <button
-                          className="restore-btn"
-                          onClick={() => handleOpenApproveModal(t)}
-                        >
-                          💳 Approve Payment
-                        </button>
-                        <button
-                          className="permanent-delete-btn"
-                          onClick={() => handleCancelTicketClick(t)}
-                        >
-                          ✕ Cancel
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-state">No pending tickets.</div>
-              )}
-            </section>
-          )}
 
         </div>
       )}
