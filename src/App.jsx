@@ -8,12 +8,24 @@ import {
   syncPendingDrugsToCloud,
   syncPendingSalesToCloud,
   syncAuditLogToCloud,
+  fetchCloudAuditLog,
   pruneSalesOlderThanOneYear,
   softDeleteDrug,
   restoreDrug,
   permanentlyDeleteDrug,
   bulkDeleteSalesByDateRange,
   reverseSaleItems,
+  syncPendingReversalsToCloud,
+  createTicket,
+  fetchCloudTickets,
+  syncPendingTicketsToCloud,
+  expireStaleTickets,
+  cancelTicket,
+  approveTicket,
+  fetchBankOptions,
+  addBankOption,
+  removeBankOption,
+  syncPendingBankOptionsToCloud,
   logAuditEvent
 } from './db';
 import './App.css';
@@ -120,6 +132,37 @@ export default function App() {
   // Drug-sale accountability search: "who sold this and when" for a
   // named drug, independent of the Sales History tab's own filters.
   const [drugSearchTerm, setDrugSearchTerm] = useState('');
+
+  // ============================================================
+  // ATTENDANT / CASHIER TICKET WORKFLOW
+  // ------------------------------------------------------------
+  // ticketDrafts: carts an attendant is still building, one per
+  // customer, NEVER written to Dexie/Supabase until submitted (this is
+  // the DRAFT status — purely local, in-memory). Several can be open
+  // at once so one attendant can juggle multiple customers.
+  // activeDraftId: which draft the catalog's "tap a drug" adds to.
+  // ============================================================
+  const [ticketDrafts, setTicketDrafts] = useState([]);
+  const [activeDraftId, setActiveDraftId] = useState(null);
+  const [isSubmittingTicket, setIsSubmittingTicket] = useState(false);
+
+  // Cashier-side: which PENDING_PAYMENT ticket is open in the
+  // approve/payment-split modal, and the cash/bank/card amounts and
+  // chosen bank being entered for it.
+  const [approvingTicket, setApprovingTicket] = useState(null);
+  const [paymentCash, setPaymentCash] = useState('');
+  const [paymentBank, setPaymentBank] = useState('');
+  const [paymentCard, setPaymentCard] = useState('');
+  const [paymentBankOption, setPaymentBankOption] = useState('');
+  const [isApprovingTicket, setIsApprovingTicket] = useState(false);
+
+  // Admin: new bank-option name being typed into the add box.
+  const [newBankOptionName, setNewBankOptionName] = useState('');
+
+  // The just-submitted ticket shown in the printable "take this to the
+  // cashier" slip modal (separate from the receipt modal, which is only
+  // for a completed/PAID sale).
+  const [printingTicket, setPrintingTicket] = useState(null);
 
   // ============================================================
   // AUTO-SCROLL CART
@@ -280,9 +323,7 @@ export default function App() {
   // ONLINE / OFFLINE SYNC
   // ============================================================
   useEffect(() => {
-    const handleOnline = () => {
-      setIsOnline(true);
-
+    const runAllSync = () => {
       syncPendingDrugsToCloud().then(() => {
         syncDrugsFromCloud();
       });
@@ -291,9 +332,27 @@ export default function App() {
         fetchCloudSales();
       });
 
+      syncPendingReversalsToCloud();
+
       syncAuditLogToCloud();
+      fetchCloudAuditLog();
+
+      syncPendingTicketsToCloud().then(() => {
+        fetchCloudTickets();
+      });
+
+      syncPendingBankOptionsToCloud().then(() => {
+        fetchBankOptions();
+      });
+
+      expireStaleTickets();
 
       pruneSalesOlderThanOneYear();
+    };
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      runAllSync();
     };
 
     const handleOffline = () => {
@@ -304,17 +363,7 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
 
     if (navigator.onLine) {
-      syncPendingDrugsToCloud().then(() => {
-        syncDrugsFromCloud();
-      });
-
-      syncPendingSalesToCloud().then(() => {
-        fetchCloudSales();
-      });
-
-      syncAuditLogToCloud();
-
-      pruneSalesOlderThanOneYear();
+      runAllSync();
     }
 
     return () => {
@@ -326,6 +375,21 @@ export default function App() {
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
+    }
+
+    // Tickets need to feel close to real-time — a customer is standing
+    // at the till waiting — so re-pull from the cloud every 10s while
+    // the Tickets tab is open, on top of the reconnect/tab-switch fetch.
+    if (activeTab === 'tickets' && isOnline) {
+      fetchCloudTickets();
+      expireStaleTickets();
+
+      const interval = setInterval(() => {
+        fetchCloudTickets();
+        expireStaleTickets();
+      }, 10000);
+
+      return () => clearInterval(interval);
     }
   }, [activeTab, isOnline]);
 
@@ -380,7 +444,53 @@ export default function App() {
     const now = new Date().toISOString();
     localStorage.setItem(LAST_SEEN_AUDIT_KEY, now);
     setLastSeenAuditAt(now);
+
+    // Pull in any audit entries other admins/managers made on other
+    // devices right away, instead of waiting for the next reconnect —
+    // same freshness-on-open pattern as Sales History.
+    if (navigator.onLine) {
+      fetchCloudAuditLog();
+    }
   };
+
+  // ============================================================
+  // TICKETS (fetchCloudTickets merges cloud data straight into local
+  // Dexie, so this one query already reflects every device's tickets)
+  // ============================================================
+  const allTickets = useLiveQuery(async () => {
+    const all = await db.tickets.orderBy('createdAt').reverse().toArray();
+
+    const twoDaysAgo = new Date();
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+
+    return all.filter((t) => new Date(t.createdAt) >= twoDaysAgo);
+  }, []);
+
+  // What the CASHIER queue shows: every attendant's submitted tickets
+  // still awaiting payment, oldest first so nobody waits out of turn.
+  const pendingTickets = React.useMemo(() => {
+    if (!allTickets) return [];
+    return allTickets
+      .filter((t) => t.status === 'PENDING_PAYMENT')
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  }, [allTickets]);
+
+  // What the ATTENDANT sees: their own submitted tickets (any status),
+  // so they can see a ticket go PAID or follow up on one that's
+  // lingered in PENDING_PAYMENT too long.
+  const myRecentTickets = React.useMemo(() => {
+    if (!allTickets || !session) return [];
+    return allTickets.filter(
+      (t) =>
+        t.attendantId === session.user.id ||
+        t.attendantEmail === session.user.email
+    );
+  }, [allTickets, session]);
+
+  const bankOptions = useLiveQuery(async () => {
+    const all = await db.bankOptions.toArray();
+    return all.filter((b) => b.active !== false);
+  }, []);
 
   // ============================================================
   // LOCAL SALES
@@ -722,6 +832,258 @@ export default function App() {
       // the drug's pack pricing is edited later.
       lineTotal: computePackPricing(item).total
     }));
+
+  // ============================================================
+  // TICKET DRAFTS (attendant building carts for the cashier workflow)
+  // Each draft is an isolated cart — its own items/customer/saleType —
+  // so several customers can be worked on at once. Nothing here is
+  // persisted until handleSubmitTicket runs.
+  // ============================================================
+  const createNewDraft = () => {
+    const draftId = `draft-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    setTicketDrafts((prev) => [
+      ...prev,
+      {
+        id: draftId,
+        items: [],
+        customerName: '',
+        customerPhone: '',
+        saleType
+      }
+    ]);
+
+    setActiveDraftId(draftId);
+  };
+
+  const closeDraft = (draftId) => {
+    setTicketDrafts((prev) => {
+      const remaining = prev.filter((d) => d.id !== draftId);
+
+      if (activeDraftId === draftId) {
+        setActiveDraftId(remaining.length > 0 ? remaining[0].id : null);
+      }
+
+      return remaining;
+    });
+  };
+
+  const addToDraft = (draftId, drug) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) => {
+        if (d.id !== draftId) return d;
+
+        const retail = Number(drug.retailPrice ?? drug.retail_price ?? 0);
+        const wholesale = Number(
+          drug.wholesalePrice ?? drug.wholesale_price ?? 0
+        );
+        const activePrice = d.saleType === 'wholesale' ? wholesale : retail;
+
+        const idx = d.items.findIndex(
+          (item) => String(item.id) === String(drug.id)
+        );
+
+        if (idx > -1) {
+          const items = [...d.items];
+          items[idx] = {
+            ...items[idx],
+            quantity: items[idx].quantity + 1
+          };
+          return { ...d, items };
+        }
+
+        return {
+          ...d,
+          items: [...d.items, { ...drug, activePrice, quantity: 1 }]
+        };
+      })
+    );
+  };
+
+  const updateDraftQuantity = (draftId, itemId, delta) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) => {
+        if (d.id !== draftId) return d;
+
+        const items = d.items
+          .map((item) => {
+            if (String(item.id) !== String(itemId)) return item;
+            const newQty = item.quantity + delta;
+            return newQty > 0 ? { ...item, quantity: newQty } : null;
+          })
+          .filter(Boolean);
+
+        return { ...d, items };
+      })
+    );
+  };
+
+  const setDraftField = (draftId, field, value) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) => (d.id === draftId ? { ...d, [field]: value } : d))
+    );
+  };
+
+  const setDraftSaleType = (draftId, type) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) => {
+        if (d.id !== draftId) return d;
+
+        const items = d.items.map((item) => {
+          const retail = Number(item.retailPrice ?? item.retail_price ?? 0);
+          const wholesale = Number(
+            item.wholesalePrice ?? item.wholesale_price ?? 0
+          );
+          return {
+            ...item,
+            activePrice: type === 'wholesale' ? wholesale : retail
+          };
+        });
+
+        return { ...d, saleType: type, items };
+      })
+    );
+  };
+
+  const draftTotal = (draft) =>
+    draft.items.reduce((sum, item) => sum + computePackPricing(item).total, 0);
+
+  const activeDraft = ticketDrafts.find((d) => d.id === activeDraftId) || null;
+
+  const handleSubmitTicket = async (draftId) => {
+    const draft = ticketDrafts.find((d) => d.id === draftId);
+    if (!draft || draft.items.length === 0) return;
+
+    setIsSubmittingTicket(true);
+
+    try {
+      const ticketPayload = {
+        items: slimCartItems(draft.items),
+        total: draftTotal(draft),
+        saleType: draft.saleType,
+        customerName: draft.customerName.trim() || 'Walk-in Customer',
+        customerPhone: draft.customerPhone.trim() || 'N/A',
+        attendantId: session?.user?.id,
+        attendantEmail: session?.user?.email
+      };
+
+      const result = await createTicket(ticketPayload, {
+        email: session?.user?.email,
+        role: userRole
+      });
+
+      if (result.success) {
+        closeDraft(draftId);
+        setPrintingTicket(result.ticket);
+      } else {
+        alert(result.reason || 'Unable to submit this ticket.');
+      }
+    } finally {
+      setIsSubmittingTicket(false);
+    }
+  };
+
+  // ============================================================
+  // CASHIER: APPROVE / CANCEL TICKETS
+  // ============================================================
+  const handleOpenApproveModal = (ticket) => {
+    setApprovingTicket(ticket);
+    setPaymentCash('');
+    setPaymentBank('');
+    setPaymentCard('');
+    setPaymentBankOption(bankOptions?.[0]?.name || '');
+  };
+
+  const handleConfirmApproval = async () => {
+    if (!approvingTicket) return;
+
+    const cash = Number(paymentCash) || 0;
+    const bank = Number(paymentBank) || 0;
+    const card = Number(paymentCard) || 0;
+    const sum = cash + bank + card;
+
+    // Allow a 1-naira tolerance for rounding, not more — a payment
+    // short or over the ticket total is exactly the kind of mistake
+    // this split-role workflow exists to catch before it leaves the
+    // till.
+    if (Math.abs(sum - approvingTicket.total) > 1) {
+      alert(
+        `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the cash/bank/card amounts so they add up exactly.`
+      );
+      return;
+    }
+
+    if (bank > 0 && !paymentBankOption) {
+      alert('Select which bank the transfer was made to.');
+      return;
+    }
+
+    setIsApprovingTicket(true);
+
+    try {
+      const paymentBreakdown = {
+        cash,
+        bank,
+        bankOption: bank > 0 ? paymentBankOption : null,
+        card
+      };
+
+      const result = await approveTicket(approvingTicket, paymentBreakdown, {
+        id: session?.user?.id,
+        email: session?.user?.email,
+        role: userRole
+      });
+
+      if (result.success) {
+        setApprovingTicket(null);
+        setSaleSuccessData(result.sale);
+        setShowReceiptModal(true);
+      } else {
+        alert(result.reason || 'Unable to approve this ticket.');
+      }
+    } finally {
+      setIsApprovingTicket(false);
+    }
+  };
+
+  const handleCancelTicketClick = async (ticket) => {
+    if (
+      !window.confirm(
+        `Cancel this ₦${ticket.total.toLocaleString()} ticket for ${ticket.customerName}? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+
+    await cancelTicket(ticket, {
+      email: session?.user?.email,
+      role: userRole
+    });
+  };
+
+  // ============================================================
+  // ADMIN: BANK OPTIONS
+  // ============================================================
+  const handleAddBankOption = async () => {
+    const name = newBankOptionName.trim();
+    if (!name) return;
+
+    await addBankOption(name, {
+      email: session?.user?.email,
+      role: userRole
+    });
+
+    setNewBankOptionName('');
+  };
+
+  const handleRemoveBankOption = async (option) => {
+    if (!window.confirm(`Remove "${option.name}" from the bank list?`)) return;
+
+    await removeBankOption(option.id, {
+      email: session?.user?.email,
+      role: userRole
+    });
+  };
 
   // ============================================================
   // CHECKOUT
@@ -1326,6 +1688,22 @@ export default function App() {
               }
             >
               📋 History
+            </button>
+
+            <button
+              className={
+                activeTab === 'tickets'
+                  ? 'active-tab'
+                  : ''
+              }
+              onClick={() => setActiveTab('tickets')}
+            >
+              🎫 Tickets
+              {hasRole(userRole, 'cashier') && pendingTickets.length > 0 && (
+                <span className="nav-badge">
+                  {pendingTickets.length > 9 ? '9+' : pendingTickets.length}
+                </span>
+              )}
             </button>
 
             {hasRole(userRole, 'administrator') && (
@@ -1994,6 +2372,298 @@ export default function App() {
       )}
 
       {/* ========================================================
+          TICKETS: attendant ticket-building + cashier approval queue
+      ======================================================== */}
+      {activeTab === 'tickets' && (
+        <div className="tickets-screen no-print">
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Build Tickets</h3>
+              <span className="admin-section-sub">
+                Build a cart for each customer, submit it, and hand them the
+                printed ticket to carry to the cashier. You can keep several
+                customers' tickets open at once.
+              </span>
+            </div>
+
+            <div className="ticket-draft-tabs">
+              {ticketDrafts.map((d) => (
+                <button
+                  key={d.id}
+                  type="button"
+                  className={`ticket-draft-tab ${
+                    activeDraftId === d.id ? 'active' : ''
+                  }`}
+                  onClick={() => setActiveDraftId(d.id)}
+                >
+                  {d.customerName || 'New Customer'} ({d.items.length})
+                  <span
+                    className="ticket-draft-close"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeDraft(d.id);
+                    }}
+                  >
+                    ✕
+                  </span>
+                </button>
+              ))}
+
+              <button
+                type="button"
+                className="ticket-draft-tab new-draft-btn"
+                onClick={createNewDraft}
+              >
+                + New Ticket
+              </button>
+            </div>
+
+            {activeDraft ? (
+              <div className="ticket-draft-builder">
+                <div className="customer-input-row">
+                  <input
+                    type="text"
+                    placeholder="Customer Name"
+                    value={activeDraft.customerName}
+                    onChange={(e) =>
+                      setDraftField(activeDraft.id, 'customerName', e.target.value)
+                    }
+                  />
+                  <input
+                    type="text"
+                    placeholder="Customer Phone"
+                    value={activeDraft.customerPhone}
+                    onChange={(e) =>
+                      setDraftField(activeDraft.id, 'customerPhone', e.target.value)
+                    }
+                  />
+                </div>
+
+                <div className="price-mode-toggle">
+                  <button
+                    type="button"
+                    className={activeDraft.saleType === 'retail' ? 'active' : ''}
+                    onClick={() => setDraftSaleType(activeDraft.id, 'retail')}
+                  >
+                    Retail
+                  </button>
+                  <button
+                    type="button"
+                    className={activeDraft.saleType === 'wholesale' ? 'active' : ''}
+                    onClick={() => setDraftSaleType(activeDraft.id, 'wholesale')}
+                  >
+                    Wholesale
+                  </button>
+                </div>
+
+                <input
+                  type="text"
+                  placeholder="Search drugs or scan barcode..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="search-input"
+                />
+
+                <div className="drug-list ticket-drug-list">
+                  {drugs && drugs.length > 0 ? (
+                    drugs.map((drug) => {
+                      const price =
+                        activeDraft.saleType === 'wholesale'
+                          ? Number(drug.wholesalePrice ?? drug.wholesale_price ?? 0)
+                          : Number(drug.retailPrice ?? drug.retail_price ?? 0);
+
+                      return (
+                        <div
+                          key={drug.id}
+                          className="drug-card"
+                          onClick={() => addToDraft(activeDraft.id, drug)}
+                        >
+                          <div className="drug-info">
+                            <div className="drug-name">{drug.name}</div>
+                            <div className="tags-row">
+                              <span className="unit-tag">
+                                {drug.unitType || drug.unit_type}
+                              </span>
+                              <span
+                                className={`stock-tag ${
+                                  drug.stock < 10 ? 'low-stock' : ''
+                                }`}
+                              >
+                                Stock: {drug.stock}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="price-stack">
+                            <div className="price-item highlight">
+                              <small>
+                                {activeDraft.saleType === 'wholesale'
+                                  ? 'Wholesale:'
+                                  : 'Retail:'}
+                              </small>{' '}
+                              ₦{price.toLocaleString()}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="empty-state">No drugs found.</div>
+                  )}
+                </div>
+
+                <div className="cart-items-list ticket-items-list">
+                  {activeDraft.items.length > 0 ? (
+                    activeDraft.items.map((item) => {
+                      const pricing = computePackPricing(item);
+                      return (
+                        <div key={item.id} className="cart-item">
+                          <div className="cart-item-info">
+                            <strong className="cart-item-name">{item.name}</strong>
+                            <div className="unit-price">
+                              ₦{(item.activePrice || 0).toLocaleString()} /{' '}
+                              {item.unitType || item.unit_type}
+                            </div>
+                            {pricing.hasDiscount && (
+                              <div className="pack-discount-note">
+                                Pack discount applied
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="qty-controls">
+                            <button
+                              onClick={() =>
+                                updateDraftQuantity(activeDraft.id, item.id, -1)
+                              }
+                              aria-label="Decrease quantity"
+                            >
+                              -
+                            </button>
+                            <span>{item.quantity}</span>
+                            <button
+                              onClick={() =>
+                                updateDraftQuantity(activeDraft.id, item.id, 1)
+                              }
+                              aria-label="Increase quantity"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="empty-cart-message">
+                      🛒 Tap a drug above to add it to this ticket
+                    </div>
+                  )}
+                </div>
+
+                <div className="cart-summary">
+                  <div className="total-display">
+                    <span>Ticket Total</span>
+                    <strong>₦{draftTotal(activeDraft).toLocaleString()}</strong>
+                  </div>
+
+                  <button
+                    className="checkout-btn"
+                    disabled={activeDraft.items.length === 0 || isSubmittingTicket}
+                    onClick={() => handleSubmitTicket(activeDraft.id)}
+                  >
+                    {isSubmittingTicket
+                      ? 'Submitting…'
+                      : '🖨️ Print Ticket & Send to Cashier'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state">
+                No ticket open — tap "+ New Ticket" above to start one.
+              </div>
+            )}
+          </section>
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>My Recent Tickets</h3>
+              <span className="admin-section-sub">
+                Submitted in the last 2 days
+              </span>
+            </div>
+
+            {myRecentTickets.length > 0 ? (
+              <div className="ticket-list">
+                {myRecentTickets.map((t) => (
+                  <div key={t.id} className="ticket-row">
+                    <div>
+                      <strong>{t.customerName}</strong>
+                      <div className="deleted-drug-meta">
+                        {t.items.length} item(s) · ₦{t.total.toLocaleString()}
+                      </div>
+                    </div>
+                    <span
+                      className={`ticket-status-pill status-${t.status.toLowerCase()}`}
+                    >
+                      {t.status.replace('_', ' ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No tickets yet.</div>
+            )}
+          </section>
+
+          {hasRole(userRole, 'cashier') && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Cashier Queue</h3>
+                <span className="admin-section-sub">
+                  Tickets waiting for payment, oldest first
+                </span>
+              </div>
+
+              {pendingTickets.length > 0 ? (
+                <div className="ticket-list">
+                  {pendingTickets.map((t) => (
+                    <div key={t.id} className="ticket-row">
+                      <div>
+                        <strong>{t.customerName}</strong>
+                        <div className="deleted-drug-meta">
+                          {t.items.map((i) => `${i.name} x${i.quantity}`).join(', ')}
+                          {' · '}₦{t.total.toLocaleString()} · by {t.attendantEmail}
+                        </div>
+                      </div>
+
+                      <div className="deleted-drug-actions">
+                        <button
+                          className="restore-btn"
+                          onClick={() => handleOpenApproveModal(t)}
+                        >
+                          💳 Approve Payment
+                        </button>
+                        <button
+                          className="permanent-delete-btn"
+                          onClick={() => handleCancelTicketClick(t)}
+                        >
+                          ✕ Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state">No pending tickets.</div>
+              )}
+            </section>
+          )}
+
+        </div>
+      )}
+
+      {/* ========================================================
           ADMINISTRATOR SCREEN
       ======================================================== */}
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
@@ -2135,6 +2805,52 @@ export default function App() {
                 Permanently Delete Sales in Range
               </button>
             </div>
+          </section>
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Bank Options</h3>
+              <span className="admin-section-sub">
+                The banks a cashier can pick from when recording a transfer
+                payment on a ticket
+              </span>
+            </div>
+
+            <div className="customer-input-row">
+              <input
+                type="text"
+                placeholder="Bank name (e.g. GTBank)"
+                value={newBankOptionName}
+                onChange={(e) => setNewBankOptionName(e.target.value)}
+              />
+              <button className="save-btn" onClick={handleAddBankOption}>
+                + Add Bank
+              </button>
+            </div>
+
+            {bankOptions && bankOptions.length > 0 ? (
+              <div className="deleted-drug-list">
+                {bankOptions.map((option) => (
+                  <div key={option.id} className="deleted-drug-card">
+                    <div className="deleted-drug-info">
+                      <strong>{option.name}</strong>
+                    </div>
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() => handleRemoveBankOption(option)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                No bank options yet — add one above.
+              </div>
+            )}
           </section>
 
           <section className="admin-section">
@@ -2332,6 +3048,152 @@ export default function App() {
             </div>
           </div>
         )}
+
+      {/* ========================================================
+          TICKET SLIP — what the customer carries to the cashier.
+          Separate from the receipt modal above, which only ever shows
+          a completed/PAID sale.
+      ======================================================== */}
+      {printingTicket && (
+        <div className="receipt-container">
+          <div className="receipt-card">
+
+            <div className="receipt-header">
+              <h2>Alimosho Pharmacy</h2>
+              <p>Please pay at the till — show this to the cashier</p>
+            </div>
+
+            <div>Ticket #: {printingTicket.id}</div>
+            <div>Customer: {printingTicket.customerName}</div>
+
+            <div className="receipt-items">
+              {printingTicket.items.map((item, idx) => (
+                <div key={idx} className="receipt-item-row">
+                  <span>
+                    {item.name} ({item.unitType}) x{item.quantity}
+                  </span>
+                  <span>
+                    ₦
+                    {(
+                      item.lineTotal ?? (item.activePrice || 0) * item.quantity
+                    ).toLocaleString()}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div className="receipt-total">
+              Total Due: ₦{printingTicket.total.toLocaleString()}
+            </div>
+
+            <p className="receipt-footer">
+              Not yet paid — take this to the cashier to complete your
+              purchase.
+            </p>
+
+            <div className="receipt-actions no-print">
+              <button className="print-btn" onClick={() => window.print()}>
+                🖨️ Print Ticket
+              </button>
+
+              <button
+                className="close-btn"
+                onClick={() => setPrintingTicket(null)}
+              >
+                Close
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          CASHIER: APPROVE PAYMENT MODAL
+      ======================================================== */}
+      {approvingTicket && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Approve Payment — {approvingTicket.customerName}</h3>
+
+            <p className="form-section-hint">
+              Total Due: ₦{approvingTicket.total.toLocaleString()}. Enter how
+              much was paid by each method — cash, bank and card amounts must
+              add up to the total exactly (splitting across methods is fine).
+            </p>
+
+            <div className="form-row">
+              <div>
+                <label>Cash (₦):</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={paymentCash}
+                  onChange={(e) => setPaymentCash(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label>Card (₦):</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={paymentCard}
+                  onChange={(e) => setPaymentCard(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div>
+                <label>Bank Transfer (₦):</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={paymentBank}
+                  onChange={(e) => setPaymentBank(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label>Bank:</label>
+                <select
+                  value={paymentBankOption}
+                  onChange={(e) => setPaymentBankOption(e.target.value)}
+                >
+                  <option value="">Select bank…</option>
+                  {(bankOptions || []).map((b) => (
+                    <option key={b.id} value={b.name}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isApprovingTicket}
+                onClick={handleConfirmApproval}
+              >
+                {isApprovingTicket ? 'Approving…' : 'Confirm Payment'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setApprovingTicket(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
 
       {/* ========================================================
           PARTIAL SALE REVERSAL MODAL (manager)

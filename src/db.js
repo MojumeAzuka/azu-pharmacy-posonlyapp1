@@ -667,3 +667,553 @@ export async function syncPendingReversalsToCloud() {
     console.warn('Unable to sync pending reversals:', err.message);
   }
 }
+
+// ============================================================
+// ATTENDANT / CASHIER TICKET WORKFLOW
+// ------------------------------------------------------------
+// DRAFT tickets (an attendant still building a customer's cart) live
+// only in React state in App.jsx — they're never written here, so
+// there's nothing to sync or clean up for them. A ticket only reaches
+// this file once an attendant submits it, at which point it's created
+// directly in PENDING_PAYMENT status: printed for the customer to carry
+// to the cashier, and visible to every cashier/manager/administrator
+// device via fetchCloudTickets(), not just the attendant's own device.
+// ============================================================
+
+export async function createTicket(ticketPayload, actor) {
+  const ticket = {
+    ...ticketPayload,
+    id: ticketPayload.id || generateId('TICKET'),
+    status: 'PENDING_PAYMENT',
+    createdAt: new Date().toISOString(),
+    synced: 0
+  };
+
+  try {
+    await db.tickets.add(ticket);
+  } catch (err) {
+    console.warn('Unable to write ticket locally:', err.message);
+    return { success: false, reason: err.message };
+  }
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('tickets').insert([
+        {
+          id: ticket.id,
+          status: ticket.status,
+          items: ticket.items,
+          total: ticket.total,
+          sale_type: ticket.saleType,
+          customer_name: ticket.customerName,
+          customer_phone: ticket.customerPhone,
+          attendant_id: ticket.attendantId,
+          attendant_email: ticket.attendantEmail,
+          created_at: ticket.createdAt
+        }
+      ]);
+      if (!error) {
+        await db.tickets.update(ticket.id, { synced: 1 });
+      }
+    } catch (err) {
+      console.warn('Cloud ticket creation postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'ticket_created',
+    targetType: 'ticket',
+    targetId: ticket.id,
+    details: { total: ticket.total, customerName: ticket.customerName }
+  });
+
+  return { success: true, ticket };
+}
+
+// Pulls every ticket from the last 2 days down from Supabase, so a
+// cashier's queue shows tickets created by ANY attendant on ANY device,
+// not just ones submitted from this device. The 2-day window (rather
+// than "pending only") also lets a just-approved/cancelled ticket still
+// show briefly in a shared "recent tickets" view for cross-checking.
+// Same pending-write guard as syncDrugsFromCloud: a ticket this device
+// has unsynced local changes for (synced: 0) is never overwritten by a
+// stale cloud copy.
+export async function fetchCloudTickets() {
+  try {
+    const twoDaysAgo = new Date();
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+
+    const { data, error } = await supabase
+      .from('tickets')
+      .select('*')
+      .gte('created_at', twoDaysAgo.toISOString())
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.tickets.where('synced').equals(0).toArray()).map((t) =>
+        String(t.id)
+      )
+    );
+
+    const mapped = data
+      .filter((t) => !pendingIds.has(String(t.id)))
+      .map((t) => ({
+        id: String(t.id),
+        status: t.status,
+        items: t.items || [],
+        total: Number(t.total || 0),
+        saleType: t.sale_type || 'retail',
+        customerName: t.customer_name || '',
+        customerPhone: t.customer_phone || '',
+        attendantId: t.attendant_id,
+        attendantEmail: t.attendant_email,
+        cashierId: t.cashier_id || null,
+        cashierEmail: t.cashier_email || null,
+        paymentMethod: t.payment_method || null,
+        saleId: t.sale_id || null,
+        createdAt: t.created_at,
+        paidAt: t.paid_at || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.tickets.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch tickets from cloud:', err.message);
+  }
+}
+
+export async function syncPendingTicketsToCloud() {
+  try {
+    const pending = await db.tickets.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const ticket of pending) {
+      const { error } = await supabase.from('tickets').upsert([
+        {
+          id: ticket.id,
+          status: ticket.status,
+          items: ticket.items,
+          total: ticket.total,
+          sale_type: ticket.saleType,
+          customer_name: ticket.customerName,
+          customer_phone: ticket.customerPhone,
+          attendant_id: ticket.attendantId,
+          attendant_email: ticket.attendantEmail,
+          cashier_id: ticket.cashierId || null,
+          cashier_email: ticket.cashierEmail || null,
+          payment_method: ticket.paymentMethod || null,
+          sale_id: ticket.saleId || null,
+          created_at: ticket.createdAt,
+          paid_at: ticket.paidAt || null
+        }
+      ]);
+
+      if (!error) {
+        await db.tickets.update(ticket.id, { synced: 1 });
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending tickets:', err.message);
+  }
+}
+
+// A PENDING_PAYMENT ticket older than this with no cashier action is
+// treated as abandoned (customer walked off, or never made it to the
+// till). This is only checked opportunistically — whenever a device
+// loads the Tickets tab — there's no server-side cron doing this, so a
+// ticket won't flip to EXPIRED until some device with the app open
+// happens to notice. Good enough for a single-location pharmacy; worth
+// revisiting if that ever stops being true.
+const TICKET_EXPIRY_MINUTES = 30;
+
+export async function expireStaleTickets() {
+  try {
+    const cutoff = new Date();
+    cutoff.setMinutes(cutoff.getMinutes() - TICKET_EXPIRY_MINUTES);
+
+    const pending = await db.tickets
+      .where('status')
+      .equals('PENDING_PAYMENT')
+      .toArray();
+
+    const stale = pending.filter((t) => new Date(t.createdAt) < cutoff);
+    if (stale.length === 0) return;
+
+    for (const ticket of stale) {
+      await db.tickets.update(ticket.id, {
+        status: 'EXPIRED',
+        synced: 0
+      });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('tickets')
+            .update({ status: 'EXPIRED' })
+            .eq('id', ticket.id);
+          if (!error) {
+            await db.tickets.update(ticket.id, { synced: 1 });
+          }
+        } catch (err) {
+          console.warn('Cloud ticket expiry postponed:', err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to expire stale tickets:', err.message);
+  }
+}
+
+export async function cancelTicket(ticket, actor) {
+  try {
+    await db.tickets.update(ticket.id, { status: 'CANCELLED', synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('tickets')
+          .update({ status: 'CANCELLED' })
+          .eq('id', ticket.id);
+        if (!error) {
+          await db.tickets.update(ticket.id, { synced: 1 });
+        }
+      } catch (err) {
+        console.warn('Cloud ticket cancel postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'ticket_cancelled',
+      targetType: 'ticket',
+      targetId: ticket.id,
+      details: { total: ticket.total }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to cancel ticket:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// The cashier-approval step: this is where a ticket actually becomes a
+// real sale. `paymentBreakdown` is { cash, bank, bankOption, card } —
+// whichever of cash/bank/card aren't used are 0. Stock is deducted the
+// same way handleCheckout does it for a direct sale, a `sales` row is
+// created (so Sales History, the audit log, and the drug-accountability
+// search all pick it up for free), and the ticket itself is marked PAID
+// with a link back to that sale.
+export async function approveTicket(ticket, paymentBreakdown, actor) {
+  try {
+    const saleId = generateId('SALE');
+    const paidAt = new Date().toISOString();
+
+    const saleData = {
+      id: saleId,
+      total: ticket.total,
+      saleType: ticket.saleType,
+      cashierId: actor?.id,
+      cashierEmail: actor?.email,
+      attendantId: ticket.attendantId,
+      attendantEmail: ticket.attendantEmail,
+      customerName: ticket.customerName,
+      customerPhone: ticket.customerPhone,
+      items: ticket.items,
+      paymentMethod: paymentBreakdown,
+      ticketId: ticket.id,
+      createdAt: paidAt,
+      synced: 0
+    };
+
+    await db.transaction('rw', db.drugs, db.sales, db.tickets, async () => {
+      for (const item of ticket.items) {
+        if (!item.id) continue;
+        const drugKey = String(item.id);
+        const existingDrug =
+          (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+
+        if (existingDrug) {
+          await db.drugs.update(existingDrug.id, {
+            stock: (existingDrug.stock || 0) - item.quantity,
+            synced: 0
+          });
+        }
+      }
+
+      await db.sales.add(saleData);
+
+      await db.tickets.update(ticket.id, {
+        status: 'PAID',
+        cashierId: actor?.id,
+        cashierEmail: actor?.email,
+        paymentMethod: paymentBreakdown,
+        saleId,
+        paidAt,
+        synced: 0
+      });
+    });
+
+    if (navigator.onLine) {
+      // Push the stock changes, the new sale, and the ticket update to
+      // the cloud. Each piece retries independently on the next
+      // reconnect (via syncPendingDrugsToCloud / syncPendingSalesToCloud
+      // / syncPendingTicketsToCloud) if any of these calls fail here.
+      for (const item of ticket.items) {
+        if (!item.id) continue;
+        const drugKey = String(item.id);
+        const existingDrug =
+          (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
+        if (existingDrug) {
+          try {
+            const { error } = await supabase
+              .from('drugs')
+              .update({ stock: existingDrug.stock })
+              .eq('id', drugKey);
+            if (!error) await db.drugs.update(existingDrug.id, { synced: 1 });
+          } catch (err) {
+            console.warn('Cloud stock update postponed:', err.message);
+          }
+        }
+      }
+
+      try {
+        const { error } = await supabase.from('sales').insert([
+          {
+            id: saleData.id,
+            total: saleData.total,
+            sale_type: saleData.saleType,
+            cashier_id: saleData.cashierId,
+            cashier_email: saleData.cashierEmail,
+            attendant_id: saleData.attendantId,
+            attendant_email: saleData.attendantEmail,
+            customer_name: saleData.customerName,
+            customer_phone: saleData.customerPhone,
+            items: saleData.items,
+            payment_method: saleData.paymentMethod,
+            ticket_id: saleData.ticketId,
+            created_at: saleData.createdAt
+          }
+        ]);
+        if (!error) await db.sales.update(saleId, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud sale insert postponed:', err.message);
+      }
+
+      try {
+        const { error } = await supabase
+          .from('tickets')
+          .update({
+            status: 'PAID',
+            cashier_id: actor?.id,
+            cashier_email: actor?.email,
+            payment_method: paymentBreakdown,
+            sale_id: saleId,
+            paid_at: paidAt
+          })
+          .eq('id', ticket.id);
+        if (!error) await db.tickets.update(ticket.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud ticket approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'ticket_approved',
+      targetType: 'ticket',
+      targetId: ticket.id,
+      details: { saleId, total: ticket.total, paymentBreakdown }
+    });
+
+    return { success: true, sale: saleData };
+  } catch (err) {
+    console.warn('Unable to approve ticket:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
+// ADMIN-MANAGED BANK OPTIONS
+// The list a cashier picks from when recording a bank transfer.
+// ============================================================
+export async function fetchBankOptions() {
+  try {
+    const { data, error } = await supabase.from('bank_options').select('*');
+    if (error) throw error;
+    if (!data) return;
+
+    const pendingIds = new Set(
+      (await db.bankOptions.where('synced').equals(0).toArray()).map((b) =>
+        String(b.id)
+      )
+    );
+
+    const mapped = data
+      .filter((b) => !pendingIds.has(String(b.id)))
+      .map((b) => ({
+        id: String(b.id),
+        name: b.name,
+        active: b.active !== false,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.bankOptions.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch bank options:', err.message);
+  }
+}
+
+export async function addBankOption(name, actor) {
+  const bankOption = {
+    id: generateId('BANK'),
+    name: name.trim(),
+    active: true,
+    synced: 0
+  };
+
+  await db.bankOptions.add(bankOption);
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('bank_options').insert([
+        { id: bankOption.id, name: bankOption.name, active: true }
+      ]);
+      if (!error) await db.bankOptions.update(bankOption.id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud bank option create postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'bank_option_added',
+    targetType: 'bank_option',
+    targetId: bankOption.id,
+    details: { name: bankOption.name }
+  });
+
+  return bankOption;
+}
+
+export async function removeBankOption(id, actor) {
+  // Soft-disable rather than delete, so past tickets/sales that
+  // recorded a transfer against this bank keep a readable name instead
+  // of a dangling reference.
+  await db.bankOptions.update(id, { active: false, synced: 0 });
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase
+        .from('bank_options')
+        .update({ active: false })
+        .eq('id', id);
+      if (!error) await db.bankOptions.update(id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud bank option removal postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'bank_option_removed',
+    targetType: 'bank_option',
+    targetId: id
+  });
+}
+
+export async function syncPendingBankOptionsToCloud() {
+  try {
+    const pending = await db.bankOptions.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const option of pending) {
+      const { error } = await supabase.from('bank_options').upsert([
+        { id: option.id, name: option.name, active: option.active }
+      ]);
+      if (!error) {
+        await db.bankOptions.update(option.id, { synced: 1 });
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending bank options:', err.message);
+  }
+}
+
+// ============================================================
+// AUDIT LOG: CROSS-DEVICE SYNC (administrator feature)
+// Previously the Admin Audit Log only ever showed entries created on
+// THIS device (useLiveQuery read straight from local Dexie, with
+// nothing pulling other devices' entries down). This pulls every audit
+// log entry from the last year down from Supabase, so any
+// administrator can see what every manager AND every other
+// administrator has done, regardless of which device they used.
+// ============================================================
+export async function fetchCloudAuditLog() {
+  try {
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+    let allEntries = [];
+    let from = 0;
+    const PAGE_SIZE = 1000;
+
+    while (true) {
+      const { data: page, error } = await supabase
+        .from('audit_log')
+        .select('*')
+        .gte('created_at', oneYearAgo.toISOString())
+        .order('created_at', { ascending: false })
+        .range(from, from + PAGE_SIZE - 1);
+
+      if (error) throw error;
+      if (!page || page.length === 0) break;
+
+      allEntries = allEntries.concat(page);
+
+      if (page.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+
+    if (allEntries.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.auditLog.where('synced').equals(0).toArray()).map((e) =>
+        String(e.id)
+      )
+    );
+
+    const mapped = allEntries
+      .filter((e) => !pendingIds.has(String(e.id)))
+      .map((e) => ({
+        id: String(e.id),
+        actorEmail: e.actor_email,
+        actorRole: e.actor_role,
+        action: e.action,
+        targetType: e.target_type || '',
+        targetId: e.target_id || '',
+        details: e.details ? JSON.stringify(e.details) : '',
+        createdAt: e.created_at,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.auditLog.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch audit log from cloud:', err.message);
+  }
+}
