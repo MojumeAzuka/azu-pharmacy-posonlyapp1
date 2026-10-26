@@ -1076,6 +1076,8 @@ export async function fetchCloudTickets() {
         customerName: t.customer_name || '',
         customerPhone: t.customer_phone || '',
         dailyNumber: t.daily_number ?? null,
+        adjustmentReason: t.adjustment_reason || null,
+        sentBackAt: t.sent_back_at || null,
         attendantId: t.attendant_id,
         attendantEmail: t.attendant_email,
         cashierId: t.cashier_id || null,
@@ -1111,6 +1113,8 @@ export async function syncPendingTicketsToCloud() {
           customer_name: ticket.customerName,
           customer_phone: ticket.customerPhone,
           daily_number: ticket.dailyNumber ?? null,
+          adjustment_reason: ticket.adjustmentReason ?? null,
+          sent_back_at: ticket.sentBackAt ?? null,
           attendant_id: ticket.attendantId,
           attendant_email: ticket.attendantEmail,
           cashier_id: ticket.cashierId || null,
@@ -1209,6 +1213,178 @@ export async function cancelTicket(ticket, actor) {
   } catch (err) {
     console.warn('Unable to cancel ticket:', err.message);
     return { success: false, reason: err.message };
+  }
+}
+
+// A cashier can't fix a customer's cart themselves — no touching drugs
+// or quantities on the cashier side — so instead of cancelling and
+// losing the sale, they send the ticket back to whoever built it with a
+// short reason ("customer can't afford item X", "forgot to add Y").
+// The attendant then reopens it as an editable draft and resubmits,
+// which turns it back into PENDING_PAYMENT via resubmitTicket below —
+// the ticket itself (its id, and its daily arrival number) is reused
+// rather than recreated, since it already had its place in line.
+export async function sendTicketBack(ticket, reason, actor) {
+  try {
+    const freshLocal = await db.tickets.get(ticket.id);
+    if (freshLocal && freshLocal.status !== 'PENDING_PAYMENT') {
+      return {
+        success: false,
+        reason: 'This ticket has already been handled.'
+      };
+    }
+
+    const trimmedReason = (reason || '').trim();
+    const sentBackAt = new Date().toISOString();
+
+    await db.tickets.update(ticket.id, {
+      status: 'SENT_BACK',
+      adjustmentReason: trimmedReason,
+      sentBackAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('tickets')
+          .update({
+            status: 'SENT_BACK',
+            adjustment_reason: trimmedReason,
+            sent_back_at: sentBackAt
+          })
+          .eq('id', ticket.id)
+          .eq('status', 'PENDING_PAYMENT');
+        if (!error) {
+          await db.tickets.update(ticket.id, { synced: 1 });
+        }
+      } catch (err) {
+        console.warn('Cloud ticket send-back postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'ticket_sent_back',
+      targetType: 'ticket',
+      targetId: ticket.id,
+      details: {
+        reason: trimmedReason,
+        customerName: ticket.customerName,
+        attendantEmail: ticket.attendantEmail
+      }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to send ticket back:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// The attendant's side of the above: reopening a SENT_BACK ticket as an
+// editable draft (done in App.jsx) and resubmitting it lands here. The
+// same ticket id and daily number are kept — this is still "that
+// customer's" place in the queue, just with corrected contents — and
+// the ticket flips back to PENDING_PAYMENT for the cashier to see again.
+export async function resubmitTicket(ticketId, updatedPayload, actor) {
+  try {
+    const freshLocal = await db.tickets.get(ticketId);
+    if (!freshLocal) {
+      return { success: false, reason: 'Original ticket could not be found.' };
+    }
+    if (freshLocal.status !== 'SENT_BACK') {
+      return {
+        success: false,
+        reason: 'This ticket is no longer waiting for adjustment.'
+      };
+    }
+
+    const update = {
+      items: updatedPayload.items,
+      total: updatedPayload.total,
+      saleType: updatedPayload.saleType,
+      customerName: updatedPayload.customerName,
+      customerPhone: updatedPayload.customerPhone,
+      status: 'PENDING_PAYMENT',
+      adjustmentReason: null,
+      sentBackAt: null,
+      synced: 0
+    };
+
+    await db.tickets.update(ticketId, update);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('tickets')
+          .update({
+            items: update.items,
+            total: update.total,
+            sale_type: update.saleType,
+            customer_name: update.customerName,
+            customer_phone: update.customerPhone,
+            status: 'PENDING_PAYMENT',
+            adjustment_reason: null,
+            sent_back_at: null
+          })
+          .eq('id', ticketId);
+        if (!error) {
+          await db.tickets.update(ticketId, { synced: 1 });
+        }
+      } catch (err) {
+        console.warn('Cloud ticket resubmit postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'ticket_resubmitted',
+      targetType: 'ticket',
+      targetId: ticketId,
+      details: { total: update.total, customerName: update.customerName }
+    });
+
+    const freshest = await db.tickets.get(ticketId);
+    return { success: true, ticket: freshest };
+  } catch (err) {
+    console.warn('Unable to resubmit ticket:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// Floors any drug already sitting at a negative stock count (from
+// before every write path clamped at 0) up to 0, locally and in the
+// cloud. Safe to call repeatedly — it's a no-op once nothing is
+// negative anymore.
+export async function clampNegativeStockToZero() {
+  try {
+    const negative = await db.drugs
+      .filter((d) => Number(d.stock || 0) < 0)
+      .toArray();
+    if (negative.length === 0) return;
+
+    for (const drug of negative) {
+      await db.drugs.update(drug.id, { stock: 0, synced: 0 });
+    }
+
+    if (navigator.onLine) {
+      for (const drug of negative) {
+        try {
+          const { error } = await supabase
+            .from('drugs')
+            .update({ stock: 0 })
+            .eq('id', drug.id);
+          if (!error) await db.drugs.update(drug.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud negative-stock clamp postponed:', err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to clamp negative stock:', err.message);
   }
 }
 
@@ -1313,8 +1489,11 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
           (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
 
         if (existingDrug) {
+          // Stock is never allowed to go negative — clamp at 0. A sale is
+          // still recorded in full even if the pharmacy was already
+          // short on physical stock; only the recorded count floors out.
           await db.drugs.update(existingDrug.id, {
-            stock: (existingDrug.stock || 0) - item.quantity,
+            stock: Math.max(0, (existingDrug.stock || 0) - item.quantity),
             synced: 0
           });
         }

@@ -27,6 +27,9 @@ import {
   expireStaleTickets,
   cancelTicket,
   approveTicket,
+  sendTicketBack,
+  resubmitTicket,
+  clampNegativeStockToZero,
   fetchBankOptions,
   addBankOption,
   removeBankOption,
@@ -178,6 +181,14 @@ export default function App() {
   const [paymentCard, setPaymentCard] = useState('');
   const [paymentBankOption, setPaymentBankOption] = useState('');
   const [isApprovingTicket, setIsApprovingTicket] = useState(false);
+
+  // Cashier-side: which PENDING_PAYMENT ticket is open in the "send
+  // back for adjustment" modal, and the reason being typed for it. A
+  // cashier never edits drugs/quantities themselves — this just flags
+  // the ticket back to whoever built it, with a note on what to fix.
+  const [sendingBackTicket, setSendingBackTicket] = useState(null);
+  const [sendBackReason, setSendBackReason] = useState('');
+  const [isSendingBackTicket, setIsSendingBackTicket] = useState(false);
 
   // Admin: new bank-option name being typed into the add box.
   const [newBankOptionName, setNewBankOptionName] = useState('');
@@ -403,6 +414,13 @@ export default function App() {
       expireStaleTickets();
 
       pruneSalesOlderThanOneYear();
+
+      // One-time-safe cleanup: anything already sitting at a negative
+      // stock count (from before the floor-at-0 clamp existed on every
+      // write path) gets floored to 0 and pushed to the cloud, so old
+      // data converges with the new rule instead of staying negative
+      // forever.
+      clampNegativeStockToZero();
     };
 
     const handleOnline = () => {
@@ -655,6 +673,13 @@ export default function App() {
         t.attendantEmail === session.user.email
     );
   }, [allTickets, session]);
+
+  // Tickets the cashier sent back to ME for adjustment, still waiting
+  // to be reopened and resubmitted.
+  const mySentBackTickets = React.useMemo(
+    () => myRecentTickets.filter((t) => t.status === 'SENT_BACK'),
+    [myRecentTickets]
+  );
 
   const bankOptions = useLiveQuery(async () => {
     const all = await db.bankOptions.toArray();
@@ -1251,10 +1276,18 @@ export default function App() {
         attendantEmail: session?.user?.email
       };
 
-      const result = await createTicket(ticketPayload, {
-        email: session?.user?.email,
-        role: userRole
-      });
+      // A reopened "sent back" draft resubmits onto the SAME ticket
+      // (same id, same daily number — it already had its place in
+      // line), rather than creating a brand-new one.
+      const result = draft.resubmitOf
+        ? await resubmitTicket(draft.resubmitOf, ticketPayload, {
+            email: session?.user?.email,
+            role: userRole
+          })
+        : await createTicket(ticketPayload, {
+            email: session?.user?.email,
+            role: userRole
+          });
 
       if (result.success) {
         closeDraft(draftId);
@@ -1346,6 +1379,66 @@ export default function App() {
   };
 
   // ============================================================
+  // CASHIER: SEND TICKET BACK FOR ADJUSTMENT
+  // (no drug/quantity editing happens on the cashier's side — this just
+  // flags the ticket back to the attendant who built it)
+  // ============================================================
+  const handleOpenSendBackModal = (ticket) => {
+    setSendingBackTicket(ticket);
+    setSendBackReason('');
+  };
+
+  const handleConfirmSendBack = async () => {
+    if (!sendingBackTicket) return;
+
+    if (!sendBackReason.trim()) {
+      alert('Enter a short reason so the attendant knows what to fix.');
+      return;
+    }
+
+    setIsSendingBackTicket(true);
+
+    try {
+      const result = await sendTicketBack(sendingBackTicket, sendBackReason, {
+        email: session?.user?.email,
+        role: userRole
+      });
+
+      if (result.success) {
+        setSendingBackTicket(null);
+        setSendBackReason('');
+      } else {
+        alert(result.reason || 'Unable to send this ticket back.');
+      }
+    } finally {
+      setIsSendingBackTicket(false);
+    }
+  };
+
+  // Attendant reopening a SENT_BACK ticket: turns it back into a live,
+  // editable draft (same drafts array single-cart-at-a-time builder used
+  // for a fresh ticket), tagged with `resubmitOf` so handleSubmitTicket
+  // below knows to call resubmitTicket (same ticket id/daily number)
+  // instead of createTicket (a brand-new one).
+  const handleReopenSentBackTicket = (ticket) => {
+    const draftId = `draft-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    setTicketDrafts((prev) => [
+      ...prev,
+      {
+        id: draftId,
+        items: (ticket.items || []).map((item) => ({ ...item })),
+        customerName: ticket.customerName || `Customer ${nextDraftLetter()}`,
+        customerPhone: ticket.customerPhone || '',
+        saleType: ticket.saleType || 'retail',
+        resubmitOf: ticket.id
+      }
+    ]);
+
+    setActiveDraftId(draftId);
+  };
+
+  // ============================================================
   // ADMIN: BANK OPTIONS
   // ============================================================
   const handleAddBankOption = async () => {
@@ -1416,13 +1509,11 @@ export default function App() {
                 ));
 
               if (existingDrug) {
-                // Allowed to go negative on purpose — a sale can be
-                // recorded before a delivery is logged, or stock counts
-                // can run behind reality; clamping to 0 used to hide
-                // that discrepancy instead of surfacing it.
-                const newStock =
-                  (existingDrug.stock || 0) -
-                  item.quantity;
+                // Stock is never allowed to go negative — clamp at 0.
+                const newStock = Math.max(
+                  0,
+                  (existingDrug.stock || 0) - item.quantity
+                );
 
                 await db.drugs.update(
                   existingDrug.id,
@@ -1718,7 +1809,7 @@ export default function App() {
         costPrice: Number(formData.costPrice),
         retailPrice: Number(formData.retailPrice),
         wholesalePrice: Number(formData.wholesalePrice),
-        stock: Number(formData.stock),
+        stock: Math.max(0, Number(formData.stock) || 0),
         barcode: formData.barcode,
         halfPackQty: optionalNumber(formData.halfPackQty),
         halfPackPrice: optionalNumber(formData.halfPackPrice),
@@ -2067,6 +2158,36 @@ export default function App() {
                 customers' tickets open at once.
               </span>
             </div>
+
+            {mySentBackTickets.length > 0 && (
+              <div className="sent-back-section">
+                <div className="sent-back-header">
+                  ↩️ Sent back for adjustment ({mySentBackTickets.length})
+                </div>
+                {mySentBackTickets.map((t) => (
+                  <div key={t.id} className="sent-back-row">
+                    <div>
+                      <strong>{t.customerName}</strong>
+                      <div className="deleted-drug-meta">
+                        {t.items.length} item(s) · ₦{t.total.toLocaleString()}
+                      </div>
+                      {t.adjustmentReason && (
+                        <div className="sent-back-reason">
+                          Cashier's note: "{t.adjustmentReason}"
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      className="restore-btn"
+                      onClick={() => handleReopenSentBackTicket(t)}
+                    >
+                      ✎ Reopen & Edit
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div className="ticket-draft-tabs">
               {ticketDrafts.map((d) => (
@@ -2682,6 +2803,12 @@ export default function App() {
                         onClick={() => handleOpenApproveModal(t)}
                       >
                         💳 Approve Payment
+                      </button>
+                      <button
+                        className="send-back-btn"
+                        onClick={() => handleOpenSendBackModal(t)}
+                      >
+                        ↩️ Send Back
                       </button>
                       <button
                         className="permanent-delete-btn"
@@ -3324,6 +3451,61 @@ export default function App() {
                 type="button"
                 className="cancel-btn"
                 onClick={() => setApprovingTicket(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          CASHIER: SEND TICKET BACK FOR ADJUSTMENT MODAL
+          No drug list here on purpose — the cashier isn't editing the
+          cart, just flagging it back with a reason.
+      ======================================================== */}
+      {sendingBackTicket && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Send Back — {sendingBackTicket.customerName}</h3>
+
+            <p className="form-section-hint">
+              This sends the ticket back to {sendingBackTicket.attendantEmail}{' '}
+              to adjust the cart (drop something the customer can't afford,
+              add something they forgot). It leaves the payment queue until
+              they resubmit it — their place in line (
+              {sendingBackTicket.dailyNumber
+                ? `Customer #${sendingBackTicket.dailyNumber}`
+                : 'their number'}
+              ) is kept.
+            </p>
+
+            <div>
+              <label>Reason for the attendant:</label>
+              <textarea
+                rows={3}
+                value={sendBackReason}
+                onChange={(e) => setSendBackReason(e.target.value)}
+                placeholder="e.g. Customer can't afford the Amoxicillin — remove it"
+              />
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isSendingBackTicket}
+                onClick={handleConfirmSendBack}
+              >
+                {isSendingBackTicket ? 'Sending…' : 'Send Back'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setSendingBackTicket(null)}
               >
                 Cancel
               </button>
