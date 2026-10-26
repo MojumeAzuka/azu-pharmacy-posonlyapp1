@@ -2638,7 +2638,44 @@ select {
   display: flex;
   flex-direction: column;
 
+  gap: 10px;
+
+  min-width: 0;
+}
+
+.ticket-builder-catalog,
+.ticket-builder-cart {
+  display: flex;
+  flex-direction: column;
+
   gap: 8px;
+
+  min-width: 0;
+}
+
+/* Below desktop width, catalog and cart just stack — catalog (search +
+   browse) first, then the cart for whichever customer is active. Each
+   half manages its own scroll height (see .ticket-drug-list /
+   .ticket-items-list below) so the page itself doesn't need one long
+   scroll to reach the submit button. */
+@media (min-width: 1024px) {
+  .ticket-draft-builder {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .ticket-builder-catalog {
+    flex: 1 1 58%;
+    min-width: 0;
+  }
+
+  .ticket-builder-cart {
+    flex: 1 1 42%;
+    min-width: 300px;
+
+    position: sticky;
+    top: 8px;
+  }
 }
 
 /* Deliberately separate from the old header .price-mode-toggle — that
@@ -2719,6 +2756,36 @@ select {
   }
 }
 
+@media (min-width: 1024px) {
+  /* Each column now has real width of its own instead of fighting the
+     other for shared vertical space, so both get taller before either
+     needs to scroll. */
+  .ticket-drug-list {
+    max-height: 60vh;
+  }
+
+  .ticket-items-list {
+    max-height: 38vh;
+  }
+}
+
+/* A drug just tapped into the cart gets a brief highlight so it's
+   obvious what was just added, on top of the list auto-scrolling to
+   it. Fades out on its own — no interaction needed to dismiss it. */
+@keyframes justAddedFlash {
+  0% {
+    background: #bae6fd;
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+.cart-item.just-added {
+  animation: justAddedFlash 0.9s ease-out;
+  border-radius: 6px;
+}
+
 .ticket-list {
   display: flex;
   flex-direction: column;
@@ -2746,6 +2813,102 @@ select {
   min-width: 0;
 
   font-size: 0.78rem;
+}
+
+/* Approval-queue-only detail: a real itemized list, totals, and a
+   retail/wholesale badge so a cashier can identify a customer and their
+   goods at a glance. Deliberately NOT reused on the ticket slip or the
+   final receipt — those stay a plain itemized list with no sale-type
+   indicator, per explicit instruction. */
+.ticket-row-detailed {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.ticket-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ticket-daily-number {
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: #0f172a;
+  background: #e2e8f0;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.ticket-saletype-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.ticket-saletype-badge.retail {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.ticket-saletype-badge.wholesale {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.ticket-row-items {
+  list-style: none;
+  margin: 2px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ticket-row-items li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.76rem;
+  color: #334155;
+}
+
+.ticket-row-item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.ticket-row-item-qty {
+  flex: 0 0 auto;
+  color: #64748b;
+}
+
+.ticket-row-item-amount {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+.approval-modal-header {
+  margin-bottom: 8px;
+}
+
+.approval-modal-items {
+  max-height: 200px;
+  overflow-y: auto;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.approval-modal-items li {
+  padding: 2px 0;
 }
 
 .ticket-status-pill {

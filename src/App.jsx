@@ -161,6 +161,14 @@ export default function App() {
   const [activeDraftId, setActiveDraftId] = useState(null);
   const [isSubmittingTicket, setIsSubmittingTicket] = useState(false);
 
+  // Briefly highlights whichever item was just tapped into the active
+  // draft's cart, and the list auto-scrolls to it — same "see what you
+  // just added" behavior the single-cart POS used to have, reapplied to
+  // the per-customer draft carts.
+  const [lastAddedItemId, setLastAddedItemId] = useState(null);
+  const lastAddedTimeoutRef = useRef(null);
+  const draftCartListRef = useRef(null);
+
   // Cashier-side: which PENDING_PAYMENT ticket is open in the
   // approve/payment-split modal, and the cash/bank/card amounts and
   // chosen bank being entered for it.
@@ -192,6 +200,23 @@ export default function App() {
       });
     }
   }, [cart]);
+
+  // Same auto-scroll, for the active ticket draft's cart — the item
+  // that was just tapped should always be the one in view, not scrolled
+  // out of sight above a long list.
+  const activeDraftItemCount =
+    ticketDrafts.find((d) => d.id === activeDraftId)?.items.length || 0;
+
+  useEffect(() => {
+    if (activeDraftItemCount > 0 && draftCartListRef.current) {
+      requestAnimationFrame(() => {
+        draftCartListRef.current?.scrollTo({
+          top: draftCartListRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      });
+    }
+  }, [activeDraftItemCount, activeDraftId]);
 
   // ============================================================
   // SUPABASE AUTH
@@ -1124,6 +1149,10 @@ export default function App() {
   };
 
   const addToDraft = (draftId, drug) => {
+    setLastAddedItemId(drug.id);
+    if (lastAddedTimeoutRef.current) clearTimeout(lastAddedTimeoutRef.current);
+    lastAddedTimeoutRef.current = setTimeout(() => setLastAddedItemId(null), 900);
+
     setTicketDrafts((prev) =>
       prev.map((d) => {
         if (d.id !== draftId) return d;
@@ -2073,45 +2102,19 @@ export default function App() {
 
             {activeDraft ? (
               <div className="ticket-draft-builder">
-                <div className="customer-input-row">
+
+                <div className="ticket-builder-catalog">
                   <input
                     type="text"
-                    placeholder="Customer Name"
-                    value={activeDraft.customerName}
-                    onChange={(e) =>
-                      setDraftField(activeDraft.id, 'customerName', e.target.value)
-                    }
+                    className="search-input"
+                    placeholder="Search drugs or scan barcode..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
                   />
-                  <input
-                    type="text"
-                    placeholder="Customer Phone"
-                    value={activeDraft.customerPhone}
-                    onChange={(e) =>
-                      setDraftField(activeDraft.id, 'customerPhone', e.target.value)
-                    }
-                  />
-                </div>
 
-                <div className="draft-price-toggle">
-                  <button
-                    type="button"
-                    className={activeDraft.saleType === 'retail' ? 'active' : ''}
-                    onClick={() => setDraftSaleType(activeDraft.id, 'retail')}
-                  >
-                    Retail
-                  </button>
-                  <button
-                    type="button"
-                    className={activeDraft.saleType === 'wholesale' ? 'active' : ''}
-                    onClick={() => setDraftSaleType(activeDraft.id, 'wholesale')}
-                  >
-                    Wholesale
-                  </button>
-                </div>
-
-                <div className="drug-list ticket-drug-list">
-                  {drugs && drugs.length > 0 ? (
-                    drugs.map((drug) => {
+                  <div className="drug-list ticket-drug-list">
+                    {drugs && drugs.length > 0 ? (
+                      drugs.map((drug) => {
                       const cost = Number(drug.costPrice ?? drug.cost_price ?? 0);
                       const price =
                         activeDraft.saleType === 'wholesale'
@@ -2180,72 +2183,120 @@ export default function App() {
                   ) : (
                     <div className="empty-state">No drugs found.</div>
                   )}
+                  </div>
                 </div>
 
-                <div className="cart-items-list ticket-items-list">
-                  {activeDraft.items.length > 0 ? (
-                    activeDraft.items.map((item) => {
-                      const pricing = computePackPricing(item);
-                      return (
-                        <div key={item.id} className="cart-item">
-                          <div className="cart-item-info">
-                            <strong className="cart-item-name">{item.name}</strong>
-                            <div className="unit-price">
-                              ₦{(item.activePrice || 0).toLocaleString()} /{' '}
-                              {item.unitType || item.unit_type}
-                            </div>
-                            {pricing.hasDiscount && (
-                              <div className="pack-discount-note">
-                                Pack discount applied
-                              </div>
-                            )}
-                          </div>
-
-                          <div className="qty-controls">
-                            <button
-                              onClick={() =>
-                                updateDraftQuantity(activeDraft.id, item.id, -1)
-                              }
-                              aria-label="Decrease quantity"
-                            >
-                              -
-                            </button>
-                            <span>{item.quantity}</span>
-                            <button
-                              onClick={() =>
-                                updateDraftQuantity(activeDraft.id, item.id, 1)
-                              }
-                              aria-label="Increase quantity"
-                            >
-                              +
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="empty-cart-message">
-                      🛒 Tap a drug above to add it to this ticket
-                    </div>
-                  )}
-                </div>
-
-                <div className="cart-summary">
-                  <div className="total-display">
-                    <span>Ticket Total</span>
-                    <strong>₦{draftTotal(activeDraft).toLocaleString()}</strong>
+                <div className="ticket-builder-cart">
+                  <div className="customer-input-row">
+                    <input
+                      type="text"
+                      placeholder="Customer Name"
+                      value={activeDraft.customerName}
+                      onChange={(e) =>
+                        setDraftField(activeDraft.id, 'customerName', e.target.value)
+                      }
+                    />
+                    <input
+                      type="text"
+                      placeholder="Customer Phone"
+                      value={activeDraft.customerPhone}
+                      onChange={(e) =>
+                        setDraftField(activeDraft.id, 'customerPhone', e.target.value)
+                      }
+                    />
                   </div>
 
-                  <button
-                    className="checkout-btn"
-                    disabled={activeDraft.items.length === 0 || isSubmittingTicket}
-                    onClick={() => handleSubmitTicket(activeDraft.id)}
+                  <div className="draft-price-toggle">
+                    <button
+                      type="button"
+                      className={activeDraft.saleType === 'retail' ? 'active' : ''}
+                      onClick={() => setDraftSaleType(activeDraft.id, 'retail')}
+                    >
+                      Retail
+                    </button>
+                    <button
+                      type="button"
+                      className={activeDraft.saleType === 'wholesale' ? 'active' : ''}
+                      onClick={() => setDraftSaleType(activeDraft.id, 'wholesale')}
+                    >
+                      Wholesale
+                    </button>
+                  </div>
+
+                  <div
+                    className="cart-items-list ticket-items-list"
+                    ref={draftCartListRef}
                   >
-                    {isSubmittingTicket
-                      ? 'Submitting…'
-                      : '🖨️ Print Ticket & Send to Cashier'}
-                  </button>
+                    {activeDraft.items.length > 0 ? (
+                      activeDraft.items.map((item) => {
+                        const pricing = computePackPricing(item);
+                        return (
+                          <div
+                            key={item.id}
+                            className={`cart-item ${
+                              lastAddedItemId === item.id ? 'just-added' : ''
+                            }`}
+                          >
+                            <div className="cart-item-info">
+                              <strong className="cart-item-name">{item.name}</strong>
+                              <div className="unit-price">
+                                ₦{(item.activePrice || 0).toLocaleString()} /{' '}
+                                {item.unitType || item.unit_type}
+                              </div>
+                              {pricing.hasDiscount && (
+                                <div className="pack-discount-note">
+                                  Pack discount applied
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="qty-controls">
+                              <button
+                                onClick={() =>
+                                  updateDraftQuantity(activeDraft.id, item.id, -1)
+                                }
+                                aria-label="Decrease quantity"
+                              >
+                                -
+                              </button>
+                              <span>{item.quantity}</span>
+                              <button
+                                onClick={() =>
+                                  updateDraftQuantity(activeDraft.id, item.id, 1)
+                                }
+                                aria-label="Increase quantity"
+                              >
+                                +
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="empty-cart-message">
+                        🛒 Tap a drug to add it to this ticket
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="cart-summary">
+                    <div className="total-display">
+                      <span>Ticket Total</span>
+                      <strong>₦{draftTotal(activeDraft).toLocaleString()}</strong>
+                    </div>
+
+                    <button
+                      className="checkout-btn"
+                      disabled={activeDraft.items.length === 0 || isSubmittingTicket}
+                      onClick={() => handleSubmitTicket(activeDraft.id)}
+                    >
+                      {isSubmittingTicket
+                        ? 'Submitting…'
+                        : '🖨️ Print Ticket & Send to Cashier'}
+                    </button>
+                  </div>
                 </div>
+
               </div>
             ) : (
               <div className="empty-state">
@@ -2267,7 +2318,10 @@ export default function App() {
                 {myRecentTickets.map((t) => (
                   <div key={t.id} className="ticket-row">
                     <div>
-                      <strong>{t.customerName}</strong>
+                      <strong>
+                        {t.dailyNumber ? `#${t.dailyNumber} · ` : ''}
+                        {t.customerName}
+                      </strong>
                       <div className="deleted-drug-meta">
                         {t.items.length} item(s) · ₦{t.total.toLocaleString()}
                       </div>
@@ -2594,13 +2648,32 @@ export default function App() {
             {pendingTickets.length > 0 ? (
               <div className="ticket-list">
                 {pendingTickets.map((t) => (
-                  <div key={t.id} className="ticket-row">
-                    <div>
+                  <div key={t.id} className="ticket-row ticket-row-detailed">
+                    <div className="ticket-row-header">
+                      <span className="ticket-daily-number">
+                        {t.dailyNumber ? `Customer #${t.dailyNumber}` : 'Customer #—'}
+                      </span>
+                      <span
+                        className={`ticket-saletype-badge ${
+                          t.saleType === 'wholesale' ? 'wholesale' : 'retail'
+                        }`}
+                      >
+                        {t.saleType === 'wholesale' ? 'Wholesale' : 'Retail'}
+                      </span>
                       <strong>{t.customerName}</strong>
-                      <div className="deleted-drug-meta">
-                        {t.items.map((i) => `${i.name} x${i.quantity}`).join(', ')}
-                        {' · '}₦{t.total.toLocaleString()} · by {t.attendantEmail}
-                      </div>
+                    </div>
+
+                    <ul className="ticket-row-items">
+                      {t.items.map((i, idx) => (
+                        <li key={idx}>
+                          <span className="ticket-row-item-name">{i.name}</span>
+                          <span className="ticket-row-item-qty">× {i.quantity}</span>
+                        </li>
+                      ))}
+                    </ul>
+
+                    <div className="deleted-drug-meta">
+                      Total Due: ₦{t.total.toLocaleString()} · by {t.attendantEmail}
                     </div>
 
                     <div className="deleted-drug-actions">
@@ -2948,9 +3021,7 @@ export default function App() {
                 </h2>
 
                 <p>
-                  Sales Receipt (
-                  {saleSuccessData.saleType.toUpperCase()}
-                  )
+                  Sales Receipt
                 </p>
 
                 <p>
@@ -3098,6 +3169,9 @@ export default function App() {
             </div>
 
             <div>Ticket #: {printingTicket.id}</div>
+            {printingTicket.dailyNumber && (
+              <div>Customer #: {printingTicket.dailyNumber}</div>
+            )}
             <div>Customer: {printingTicket.customerName}</div>
 
             <div className="receipt-items">
@@ -3150,6 +3224,36 @@ export default function App() {
           <div className="modal-card">
 
             <h3>Approve Payment — {approvingTicket.customerName}</h3>
+
+            <div className="ticket-row-header approval-modal-header">
+              <span className="ticket-daily-number">
+                {approvingTicket.dailyNumber
+                  ? `Customer #${approvingTicket.dailyNumber}`
+                  : 'Customer #—'}
+              </span>
+              <span
+                className={`ticket-saletype-badge ${
+                  approvingTicket.saleType === 'wholesale' ? 'wholesale' : 'retail'
+                }`}
+              >
+                {approvingTicket.saleType === 'wholesale' ? 'Wholesale' : 'Retail'}
+              </span>
+            </div>
+
+            <ul className="ticket-row-items approval-modal-items">
+              {approvingTicket.items.map((item, idx) => (
+                <li key={idx}>
+                  <span className="ticket-row-item-name">{item.name}</span>
+                  <span className="ticket-row-item-qty">× {item.quantity}</span>
+                  <span className="ticket-row-item-amount">
+                    ₦
+                    {(
+                      item.lineTotal ?? (item.activePrice || 0) * item.quantity
+                    ).toLocaleString()}
+                  </span>
+                </li>
+              ))}
+            </ul>
 
             <p className="form-section-hint">
               Total Due: ₦{approvingTicket.total.toLocaleString()}. Enter how

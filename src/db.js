@@ -936,11 +936,59 @@ export async function rejectReversalRequest(request, actor) {
 // device via fetchCloudTickets(), not just the attendant's own device.
 // ============================================================
 
+// YYYY-MM-DD in the browser's own local timezone (not UTC), so "today"
+// lines up with when the pharmacy's day actually starts/ends.
+function localDateKey(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+// "Customer #1, #2, #3..." for the day, assigned the moment a ticket is
+// submitted (ready for payment) — not when the draft was created — so
+// the number reflects arrival order at the till. This has to be an
+// atomic database increment (next_daily_ticket_number, added in
+// migration_v6): two attendants on two different devices could submit
+// within the same second, and a locally-computed "count + 1" could hand
+// both of them the same number.
+async function getNextDailyTicketNumber() {
+  if (navigator.onLine) {
+    try {
+      const { data, error } = await supabase.rpc('next_daily_ticket_number', {
+        p_date: localDateKey()
+      });
+      if (!error && typeof data === 'number') return data;
+      if (error) console.warn('Daily ticket number RPC error:', error.message);
+    } catch (err) {
+      console.warn('Daily ticket number RPC failed:', err.message);
+    }
+  }
+
+  // Offline fallback (or the function isn't deployed yet): best-effort
+  // count of today's local tickets + 1. Not race-safe across devices,
+  // but better than no number — the common case (online) uses the
+  // atomic function above.
+  try {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todays = await db.tickets
+      .filter((t) => new Date(t.createdAt) >= todayStart)
+      .toArray();
+    return todays.length + 1;
+  } catch {
+    return null;
+  }
+}
+
 export async function createTicket(ticketPayload, actor) {
+  const dailyNumber = await getNextDailyTicketNumber();
+
   const ticket = {
     ...ticketPayload,
     id: ticketPayload.id || generateId('TICKET'),
     status: 'PENDING_PAYMENT',
+    dailyNumber,
     createdAt: new Date().toISOString(),
     synced: 0
   };
@@ -965,6 +1013,7 @@ export async function createTicket(ticketPayload, actor) {
           customer_phone: ticket.customerPhone,
           attendant_id: ticket.attendantId,
           attendant_email: ticket.attendantEmail,
+          daily_number: ticket.dailyNumber,
           created_at: ticket.createdAt
         }
       ]);
@@ -1026,6 +1075,7 @@ export async function fetchCloudTickets() {
         saleType: t.sale_type || 'retail',
         customerName: t.customer_name || '',
         customerPhone: t.customer_phone || '',
+        dailyNumber: t.daily_number ?? null,
         attendantId: t.attendant_id,
         attendantEmail: t.attendant_email,
         cashierId: t.cashier_id || null,
@@ -1060,6 +1110,7 @@ export async function syncPendingTicketsToCloud() {
           sale_type: ticket.saleType,
           customer_name: ticket.customerName,
           customer_phone: ticket.customerPhone,
+          daily_number: ticket.dailyNumber ?? null,
           attendant_id: ticket.attendantId,
           attendant_email: ticket.attendantEmail,
           cashier_id: ticket.cashierId || null,
