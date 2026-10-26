@@ -57,6 +57,21 @@ db.version(7).stores({
   bankOptions: 'id, name, active, synced'
 });
 
+// Schema Version 8: `reversalRequests` — a cashier reversing an item (or
+// part of one) no longer happens instantly. It's recorded as a request
+// here and only actually applied (stock restored, sale total reduced)
+// once a manager or administrator approves it. A manager/administrator
+// reversing something themselves still happens immediately — this table
+// only exists for the cashier-initiated, needs-approval path.
+db.version(8).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -669,6 +684,247 @@ export async function syncPendingReversalsToCloud() {
 }
 
 // ============================================================
+// REVERSAL REQUESTS (cashier-initiated reversal, needs manager sign-off)
+// ------------------------------------------------------------
+// A manager/administrator reversing a sale still happens immediately via
+// reverseSaleItems() above. A CASHIER reversing something instead creates
+// a request here — nothing about the sale changes (no stock restored, no
+// total reduced) until a manager or administrator approves it. Separation
+// of duties: the person who confirmed the refund to a customer isn't the
+// same person who authorizes it.
+// ============================================================
+
+export async function requestSaleReversal(sale, reversals, actor) {
+  const request = {
+    id: generateId('RREQ'),
+    saleId: String(sale.id),
+    saleSnapshot: {
+      id: sale.id,
+      customerName: sale.customerName,
+      total: sale.total,
+      items: sale.items
+    },
+    reversals,
+    status: 'PENDING',
+    requestedBy: actor?.id || null,
+    requestedByEmail: actor?.email || 'unknown',
+    createdAt: new Date().toISOString(),
+    decidedBy: null,
+    decidedByEmail: null,
+    decidedAt: null,
+    synced: 0
+  };
+
+  try {
+    await db.reversalRequests.add(request);
+  } catch (err) {
+    console.warn('Unable to write reversal request locally:', err.message);
+    return { success: false, reason: err.message };
+  }
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('reversal_requests').insert([
+        {
+          id: request.id,
+          sale_id: request.saleId,
+          sale_snapshot: request.saleSnapshot,
+          reversals: request.reversals,
+          status: request.status,
+          requested_by: request.requestedBy,
+          requested_by_email: request.requestedByEmail,
+          created_at: request.createdAt
+        }
+      ]);
+      if (!error) await db.reversalRequests.update(request.id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud reversal request creation postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'reversal_requested',
+    targetType: 'sale',
+    targetId: request.saleId,
+    details: { requestId: request.id, reversals }
+  });
+
+  return { success: true, request };
+}
+
+export async function fetchCloudReversalRequests() {
+  try {
+    const { data, error } = await supabase
+      .from('reversal_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.reversalRequests.where('synced').equals(0).toArray()).map((r) =>
+        String(r.id)
+      )
+    );
+
+    const mapped = data
+      .filter((r) => !pendingIds.has(String(r.id)))
+      .map((r) => ({
+        id: String(r.id),
+        saleId: String(r.sale_id),
+        saleSnapshot: r.sale_snapshot || null,
+        reversals: r.reversals || [],
+        status: r.status,
+        requestedBy: r.requested_by || null,
+        requestedByEmail: r.requested_by_email || 'unknown',
+        createdAt: r.created_at,
+        decidedBy: r.decided_by || null,
+        decidedByEmail: r.decided_by_email || null,
+        decidedAt: r.decided_at || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.reversalRequests.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch reversal requests from cloud:', err.message);
+  }
+}
+
+export async function syncPendingReversalRequestsToCloud() {
+  try {
+    const pending = await db.reversalRequests.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const request of pending) {
+      const { error } = await supabase.from('reversal_requests').upsert([
+        {
+          id: request.id,
+          sale_id: request.saleId,
+          sale_snapshot: request.saleSnapshot,
+          reversals: request.reversals,
+          status: request.status,
+          requested_by: request.requestedBy,
+          requested_by_email: request.requestedByEmail,
+          created_at: request.createdAt,
+          decided_by: request.decidedBy,
+          decided_by_email: request.decidedByEmail,
+          decided_at: request.decidedAt
+        }
+      ]);
+      if (!error) await db.reversalRequests.update(request.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending reversal requests:', err.message);
+  }
+}
+
+// Approving a request is what actually calls reverseSaleItems() — the
+// request just gated WHEN that happens. `sale` must be the current full
+// sale record (caller looks it up by request.saleId).
+export async function approveReversalRequest(request, sale, actor) {
+  try {
+    const freshLocal = await db.reversalRequests.get(request.id);
+    if (freshLocal && freshLocal.status !== 'PENDING') {
+      return { success: false, reason: 'This request has already been handled.' };
+    }
+
+    const result = await reverseSaleItems(sale, request.reversals, actor);
+    if (!result.success) return result;
+
+    const decidedAt = new Date().toISOString();
+
+    await db.reversalRequests.update(request.id, {
+      status: 'APPROVED',
+      decidedBy: actor?.id || null,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('reversal_requests')
+          .update({
+            status: 'APPROVED',
+            decided_by: actor?.id || null,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', request.id);
+        if (!error) await db.reversalRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud reversal request approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'reversal_request_approved',
+      targetType: 'sale',
+      targetId: request.saleId,
+      details: { requestId: request.id }
+    });
+
+    return { success: true, ...result };
+  } catch (err) {
+    console.warn('Unable to approve reversal request:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectReversalRequest(request, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+
+    await db.reversalRequests.update(request.id, {
+      status: 'REJECTED',
+      decidedBy: actor?.id || null,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('reversal_requests')
+          .update({
+            status: 'REJECTED',
+            decided_by: actor?.id || null,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', request.id);
+        if (!error) await db.reversalRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud reversal request rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'reversal_request_rejected',
+      targetType: 'sale',
+      targetId: request.saleId,
+      details: { requestId: request.id }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject reversal request:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
 // ATTENDANT / CASHIER TICKET WORKFLOW
 // ------------------------------------------------------------
 // DRAFT tickets (an attendant still building a customer's cart) live
@@ -914,6 +1170,61 @@ export async function cancelTicket(ticket, actor) {
 // with a link back to that sale.
 export async function approveTicket(ticket, paymentBreakdown, actor) {
   try {
+    // Guard #1 (same device): if this device's own local copy already
+    // moved on from PENDING_PAYMENT — a second click, or a stale queue
+    // that hasn't re-rendered yet — stop here before touching stock.
+    const freshLocal = await db.tickets.get(ticket.id);
+    if (freshLocal && freshLocal.status !== 'PENDING_PAYMENT') {
+      return {
+        success: false,
+        reason: 'This ticket has already been handled.'
+      };
+    }
+
+    // Guard #2 (different devices/accounts): the actual fix for two
+    // cashiers approving the same ticket at the same time. This
+    // conditional update only succeeds for whichever device gets here
+    // first — `.eq('status', 'PENDING_PAYMENT')` means the row only
+    // matches (and `claimed` comes back non-empty) if nobody else has
+    // already flipped it to PAID/CANCELLED/EXPIRED. Losing this race
+    // means someone else got there first; bail out instead of
+    // double-deducting stock and creating two sales for one ticket.
+    if (navigator.onLine) {
+      try {
+        const { data: claimed, error: claimError } = await supabase
+          .from('tickets')
+          .update({
+            status: 'PAID',
+            cashier_id: actor?.id,
+            cashier_email: actor?.email
+          })
+          .eq('id', ticket.id)
+          .eq('status', 'PENDING_PAYMENT')
+          .select();
+
+        if (claimError) throw claimError;
+
+        if (!claimed || claimed.length === 0) {
+          // Someone else already claimed it — pull the real state down
+          // so this device's queue updates and stops offering it.
+          await fetchCloudTickets();
+          return {
+            success: false,
+            reason:
+              'This ticket was already approved (or cancelled) by someone else.'
+          };
+        }
+      } catch (err) {
+        // Couldn't even reach Supabase to check — fall through to the
+        // offline path below. Two different OFFLINE devices approving
+        // the same ticket at the same time is a real remaining edge
+        // case (true conflict-free offline sync would need more than
+        // this), but this still protects the common case: anyone
+        // online, and the same device twice.
+        console.warn('Ticket claim check failed, proceeding offline-style:', err.message);
+      }
+    }
+
     const saleId = generateId('SALE');
     const paidAt = new Date().toISOString();
 
@@ -935,6 +1246,15 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
     };
 
     await db.transaction('rw', db.drugs, db.sales, db.tickets, async () => {
+      // Re-check one more time inside the transaction, in case a
+      // fetchCloudTickets() triggered by something else slipped this
+      // ticket's status out from under us between the checks above and
+      // here.
+      const txTicket = await db.tickets.get(ticket.id);
+      if (txTicket && txTicket.status === 'PAID' && txTicket.saleId && txTicket.saleId !== saleId) {
+        throw new Error('This ticket has already been handled.');
+      }
+
       for (const item of ticket.items) {
         if (!item.id) continue;
         const drugKey = String(item.id);

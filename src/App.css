@@ -2148,6 +2148,54 @@ select {
   min-width: 0;
 }
 
+.admin-section-nav {
+  display: flex;
+  flex-wrap: wrap;
+
+  gap: 6px;
+}
+
+.admin-section-nav button {
+  background: #f1f5f9;
+  color: #334155;
+
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+
+  padding: 6px 11px;
+
+  font-size: 0.72rem;
+  font-weight: 600;
+
+  cursor: pointer;
+
+  white-space: nowrap;
+}
+
+.admin-section-nav button.active {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+.audit-filter-nav {
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.audit-filter-nav button {
+  background: #f8fafc;
+  font-size: 0.66rem;
+  padding: 4px 9px;
+}
+
+.audit-filter-nav button.active {
+  background: #0284c7;
+  border-color: #0284c7;
+}
+
 .admin-section {
   width: 100%;
 
@@ -2593,10 +2641,82 @@ select {
   gap: 8px;
 }
 
+/* Deliberately separate from the old header .price-mode-toggle — that
+   class carried flex/width rules meant for sitting next to .nav-tabs in
+   the header row, which made it render oversized once it was (briefly)
+   reused inside the draft builder's own column layout. This is a small,
+   self-contained toggle sized for its actual spot: next to the customer
+   name/phone fields, one per ticket draft. */
+.draft-price-toggle {
+  display: flex;
+  flex: 0 0 auto;
+
+  gap: 2px;
+
+  background: #f1f5f9;
+
+  padding: 2px;
+
+  border-radius: 6px;
+
+  width: 100%;
+  max-width: 220px;
+}
+
+.draft-price-toggle button {
+  flex: 1 1 0;
+
+  border: none;
+  background: transparent;
+
+  color: #475569;
+
+  padding: 5px 6px;
+
+  border-radius: 5px;
+
+  font-size: 0.68rem;
+  font-weight: 600;
+
+  cursor: pointer;
+}
+
+.draft-price-toggle button.active {
+  background: #ffffff;
+  color: #0284c7;
+
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
 .ticket-drug-list,
 .ticket-items-list {
-  max-height: 260px;
   overflow-y: auto;
+}
+
+/* Keep these short enough that the total + submit button never needs a
+   big scroll to reach, even on a small phone — a constant complaint was
+   not being able to see the cart without scrolling past a tall catalog
+   and item list first. */
+.ticket-drug-list {
+  max-height: 160px;
+}
+
+.ticket-items-list {
+  max-height: 110px;
+}
+
+@media (min-width: 768px) {
+  .ticket-drug-list {
+    max-height: 220px;
+  }
+
+  .ticket-items-list {
+    max-height: 160px;
+  }
+
+  .draft-price-toggle {
+    max-width: 260px;
+  }
 }
 
 .ticket-list {

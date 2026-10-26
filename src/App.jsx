@@ -16,6 +16,11 @@ import {
   bulkDeleteSalesByDateRange,
   reverseSaleItems,
   syncPendingReversalsToCloud,
+  requestSaleReversal,
+  fetchCloudReversalRequests,
+  syncPendingReversalRequestsToCloud,
+  approveReversalRequest,
+  rejectReversalRequest,
   createTicket,
   fetchCloudTickets,
   syncPendingTicketsToCloud,
@@ -132,6 +137,16 @@ export default function App() {
   // Drug-sale accountability search: "who sold this and when" for a
   // named drug, independent of the Sales History tab's own filters.
   const [drugSearchTerm, setDrugSearchTerm] = useState('');
+
+  // Which admin panel is open — defaults to the Audit Log (the thing an
+  // admin checks most), with the less-used tools (drug search, recovery,
+  // bulk delete, bank options) tucked behind their own buttons instead
+  // of all being shown stacked on top of each other at once.
+  const [adminSection, setAdminSection] = useState('audit');
+
+  // Audit Log action-type filter — 'all' shows the full list (the
+  // default), or narrow to one action like 'drug_added'.
+  const [auditActionFilter, setAuditActionFilter] = useState('all');
 
   // ============================================================
   // ATTENDANT / CASHIER TICKET WORKFLOW
@@ -278,8 +293,19 @@ export default function App() {
           .order('created_at', { ascending: false })
           .range(from, from + SALES_FETCH_PAGE_SIZE - 1);
 
-        if (!hasRole(userRole, 'manager')) {
+        // Same visibility rule as the local query above: manager/admin
+        // see everything, a cashier sees what THEY closed, a
+        // salesperson sees what THEY initiated (falling back to
+        // "cashier of record" only for pre-ticket-workflow sales that
+        // have no attendant on them at all).
+        if (hasRole(userRole, 'manager')) {
+          // no filter
+        } else if (userRole === 'cashier') {
           query = query.eq('cashier_id', session.user.id);
+        } else {
+          query = query.or(
+            `attendant_id.eq.${session.user.id},and(attendant_id.is.null,cashier_id.eq.${session.user.id})`
+          );
         }
 
         const { data: pageData, error } = await query;
@@ -334,6 +360,10 @@ export default function App() {
 
       syncPendingReversalsToCloud();
 
+      syncPendingReversalRequestsToCloud().then(() => {
+        fetchCloudReversalRequests();
+      });
+
       syncAuditLogToCloud();
       fetchCloudAuditLog();
 
@@ -379,6 +409,17 @@ export default function App() {
   useEffect(() => {
     if (userRole === 'cashier' && activeTab === 'pos') {
       setActiveTab('tickets');
+    }
+  }, [userRole, activeTab]);
+
+  // An administrator account is oversight-only — it never sells, builds
+  // tickets or approves payment, so the only tab that exists for it is
+  // Admin. Bounce straight there, same pattern as the cashier redirect
+  // above, whether that's the default tab on first login or a role
+  // change happened mid-session.
+  useEffect(() => {
+    if (userRole === 'administrator' && activeTab !== 'admin') {
+      setActiveTab('admin');
     }
   }, [userRole, activeTab]);
 
@@ -442,6 +483,20 @@ export default function App() {
     return db.auditLog.orderBy('createdAt').reverse().toArray();
   }, [userRole]);
 
+  // Every distinct action type actually present in the log, so the
+  // filter buttons only ever show options that exist (no "Drug Added"
+  // button sitting there uselessly if nobody has added a drug yet).
+  const auditActionTypes = React.useMemo(() => {
+    if (!auditLog) return [];
+    return Array.from(new Set(auditLog.map((e) => e.action))).sort();
+  }, [auditLog]);
+
+  const filteredAuditLog = React.useMemo(() => {
+    if (!auditLog) return [];
+    if (auditActionFilter === 'all') return auditLog;
+    return auditLog.filter((e) => e.action === auditActionFilter);
+  }, [auditLog, auditActionFilter]);
+
   const unseenManagerChanges = React.useMemo(() => {
     if (!auditLog) return 0;
     const managerEntries = auditLog.filter((entry) => entry.actorRole === 'manager');
@@ -487,6 +542,24 @@ export default function App() {
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   }, [allTickets]);
 
+  // Ticket-payment approval is a cashier's job, or a manager stepping in
+  // for accountability reasons — deliberately NOT administrator, even
+  // though admin outranks both of them everywhere else in the app.
+  const canApproveTickets = userRole === 'cashier' || userRole === 'manager';
+
+  // ============================================================
+  // REVERSAL REQUESTS (cashier-initiated reversal, pending manager sign-off)
+  // ============================================================
+  const allReversalRequests = useLiveQuery(
+    () => db.reversalRequests.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+
+  const pendingReversalRequests = React.useMemo(() => {
+    if (!allReversalRequests) return [];
+    return allReversalRequests.filter((r) => r.status === 'PENDING');
+  }, [allReversalRequests]);
+
   // ============================================================
   // CASHIER CHIME — a short two-note tone whenever a NEW ticket lands
   // in the Queue, so a cashier doesn't have to keep staring at the
@@ -527,7 +600,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!hasRole(userRole, 'cashier')) return;
+    if (!canApproveTickets) return;
 
     const count = pendingTickets.length;
 
@@ -578,11 +651,30 @@ export default function App() {
       (s) => new Date(s.createdAt) >= oneYearAgo
     );
 
-    if (!hasRole(userRole, 'manager')) {
+    // Manager and administrator see every sale — both the ones they
+    // personally closed and the ones everyone else closed. A cashier
+    // sees only the sales THEY closed (approved payment on). A
+    // salesperson sees only the sales THEY initiated (built the
+    // ticket for) — or, for an old-style sale that has no attendant on
+    // record at all, one they're the cashier of record for, so sales
+    // from before the ticket workflow existed don't just disappear.
+    if (hasRole(userRole, 'manager')) {
+      // no filter — everything
+    } else if (userRole === 'cashier') {
       records = records.filter(
         (s) =>
           s.cashierId === session.user.id ||
           s.cashierEmail === session.user.email
+      );
+    } else {
+      records = records.filter(
+        (s) =>
+          s.attendantId === session.user.id ||
+          s.attendantEmail === session.user.email ||
+          (!s.attendantId &&
+            !s.attendantEmail &&
+            (s.cashierId === session.user.id ||
+              s.cashierEmail === session.user.email))
       );
     }
 
@@ -691,10 +783,15 @@ export default function App() {
   }, [drugSearchTerm, allSalesForSearch]);
 
   // ============================================================
-  // PARTIAL SALE REVERSAL (manager feature)
-  // reversalQtys is keyed by item id → how many units of that line the
-  // manager wants to reverse right now (never more than quantity minus
-  // whatever was already reversed earlier).
+  // PARTIAL SALE REVERSAL
+  // reversalQtys is keyed by item id → how many units of that line to
+  // reverse (never more than quantity minus whatever was already
+  // reversed earlier). A manager/administrator's reversal takes effect
+  // immediately (reverseSaleItems). A cashier doesn't have the
+  // authority to reverse their own approval unchecked, so theirs only
+  // files a REQUEST — nothing about the sale changes until a manager
+  // approves it from their own account (see Pending Reversal Requests
+  // in Sales History).
   // ============================================================
   const handleConfirmReversal = async () => {
     if (!reversingSale) return;
@@ -711,36 +808,103 @@ export default function App() {
     setIsReversing(true);
 
     try {
-      const result = await reverseSaleItems(reversingSale, reversals, {
-        email: session?.user?.email,
-        role: userRole
-      });
+      if (hasRole(userRole, 'manager')) {
+        const result = await reverseSaleItems(reversingSale, reversals, {
+          email: session?.user?.email,
+          role: userRole
+        });
 
-      if (result.success) {
-        // Keep cloudSales in sync too, in case this sale only exists
-        // in the cloud (made on a different device) — localSales
-        // already updates itself via useLiveQuery.
-        setCloudSales((prev) =>
-          prev.map((s) =>
-            String(s.id) === String(reversingSale.id)
-              ? {
-                  ...s,
-                  items: result.updatedItems,
-                  total: result.newTotal,
-                  reversalLog: result.reversalLog
-                }
-              : s
-          )
-        );
+        if (result.success) {
+          // Keep cloudSales in sync too, in case this sale only exists
+          // in the cloud (made on a different device) — localSales
+          // already updates itself via useLiveQuery.
+          setCloudSales((prev) =>
+            prev.map((s) =>
+              String(s.id) === String(reversingSale.id)
+                ? {
+                    ...s,
+                    items: result.updatedItems,
+                    total: result.newTotal,
+                    reversalLog: result.reversalLog
+                  }
+                : s
+            )
+          );
 
-        setReversingSale(null);
-        setReversalQtys({});
+          setReversingSale(null);
+          setReversalQtys({});
+        } else {
+          alert(result.reason || 'Unable to reverse those items.');
+        }
       } else {
-        alert(result.reason || 'Unable to reverse those items.');
+        const result = await requestSaleReversal(reversingSale, reversals, {
+          id: session?.user?.id,
+          email: session?.user?.email,
+          role: userRole
+        });
+
+        if (result.success) {
+          alert(
+            'Reversal request sent. Nothing changes on this sale until a manager approves it.'
+          );
+          setReversingSale(null);
+          setReversalQtys({});
+        } else {
+          alert(result.reason || 'Unable to submit that reversal request.');
+        }
       }
     } finally {
       setIsReversing(false);
     }
+  };
+
+  // ============================================================
+  // MANAGER: APPROVE / REJECT A CASHIER'S REVERSAL REQUEST
+  // ============================================================
+  const handleApproveReversalRequest = async (request) => {
+    const sale =
+      salesHistory.find((s) => String(s.id) === String(request.saleId)) ||
+      allSalesForSearch.find((s) => String(s.id) === String(request.saleId));
+
+    if (!sale) {
+      alert('Could not find the underlying sale for this request.');
+      return;
+    }
+
+    const result = await approveReversalRequest(request, sale, {
+      id: session?.user?.id,
+      email: session?.user?.email,
+      role: userRole
+    });
+
+    if (result.success) {
+      setCloudSales((prev) =>
+        prev.map((s) =>
+          String(s.id) === String(request.saleId)
+            ? {
+                ...s,
+                items: result.updatedItems,
+                total: result.newTotal,
+                reversalLog: result.reversalLog
+              }
+            : s
+        )
+      );
+    } else {
+      alert(result.reason || 'Unable to approve this reversal request.');
+    }
+  };
+
+  const handleRejectReversalRequest = async (request) => {
+    if (!window.confirm('Reject this reversal request? The sale stays as-is.')) {
+      return;
+    }
+
+    await rejectReversalRequest(request, {
+      id: session?.user?.id,
+      email: session?.user?.email,
+      role: userRole
+    });
   };
 
   // ============================================================
@@ -910,15 +1074,35 @@ export default function App() {
   // so several customers can be worked on at once. Nothing here is
   // persisted until handleSubmitTicket runs.
   // ============================================================
+  // Draft labels count up A, B, C, ... Z, AA, AB, ... and never reuse a
+  // letter within a session, even if an earlier draft was closed — so
+  // two customers being worked on "at the same time" never end up
+  // sharing a label just because one finished first.
+  const draftLetterCounterRef = useRef(0);
+
+  const nextDraftLetter = () => {
+    let n = draftLetterCounterRef.current;
+    draftLetterCounterRef.current += 1;
+
+    let label = '';
+    do {
+      label = String.fromCharCode(65 + (n % 26)) + label;
+      n = Math.floor(n / 26) - 1;
+    } while (n >= 0);
+
+    return label;
+  };
+
   const createNewDraft = () => {
     const draftId = `draft-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const label = `Customer ${nextDraftLetter()}`;
 
     setTicketDrafts((prev) => [
       ...prev,
       {
         id: draftId,
         items: [],
-        customerName: '',
+        customerName: label,
         customerPhone: '',
         saleType
       }
@@ -1735,9 +1919,13 @@ export default function App() {
           <div className="nav-tabs">
             {/* A pure cashier's whole job is the approval queue — they
                 never see the drug catalog or build tickets themselves,
-                so the POS tab doesn't exist for that role. Managers and
-                administrators outrank cashier, so they still get it. */}
-            {userRole !== 'cashier' && (
+                so the POS tab doesn't exist for that role. An
+                administrator's whole job here is oversight (Admin tab
+                only) — they don't sell, build tickets or approve
+                payment, so POS doesn't exist for them either. Managers
+                outrank cashier but aren't administrator, so they still
+                get it. */}
+            {userRole !== 'cashier' && userRole !== 'administrator' && (
               <button
                 className={
                   activeTab === 'pos'
@@ -1752,25 +1940,32 @@ export default function App() {
               </button>
             )}
 
-            <button
-              className={
-                activeTab === 'history'
-                  ? 'active-tab'
-                  : ''
-              }
-              onClick={() =>
-                setActiveTab(
-                  'history'
-                )
-              }
-            >
-              📋 History
-            </button>
+            {/* Same reasoning — Sales History is for the people actually
+                making/approving sales, not for the Admin account. */}
+            {userRole !== 'administrator' && (
+              <button
+                className={
+                  activeTab === 'history'
+                    ? 'active-tab'
+                    : ''
+                }
+                onClick={() =>
+                  setActiveTab(
+                    'history'
+                  )
+                }
+              >
+                📋 History
+              </button>
+            )}
 
-            {/* The approval Queue is only for cashier rank and above —
-                a plain salesperson/attendant builds tickets from the
-                POS tab instead and never approves payment. */}
-            {hasRole(userRole, 'cashier') && (
+            {/* The approval Queue is for cashier or manager only —
+                deliberately NOT administrator (approving payment is a
+                cashier's job; a manager can stand in for one, for
+                accountability an admin account shouldn't double as
+                both). A plain salesperson/attendant builds tickets from
+                the POS tab instead and never approves payment. */}
+            {canApproveTickets && (
               <button
                 className={
                   activeTab === 'tickets'
@@ -1807,39 +2002,11 @@ export default function App() {
             )}
           </div>
 
-          {activeTab === 'pos' && (
-            <div className="price-mode-toggle">
-              <button
-                className={
-                  saleType === 'retail'
-                    ? 'active'
-                    : ''
-                }
-                onClick={() =>
-                  handleSaleTypeChange(
-                    'retail'
-                  )
-                }
-              >
-                Retail
-              </button>
-
-              <button
-                className={
-                  saleType === 'wholesale'
-                    ? 'active'
-                    : ''
-                }
-                onClick={() =>
-                  handleSaleTypeChange(
-                    'wholesale'
-                  )
-                }
-              >
-                Wholesale
-              </button>
-            </div>
-          )}
+          {/* The old single global Retail/Wholesale toggle lived here —
+              removed. Each customer's ticket draft now has its own
+              compact Retail/Wholesale toggle (different customers can be
+              on different price tiers at once), and keeping both was
+              just wasted vertical space pushing the cart off-screen. */}
 
           {activeTab === 'pos' &&
             hasRole(userRole, 'manager') && (
@@ -1854,28 +2021,12 @@ export default function App() {
             )}
         </div>
 
-        {activeTab === 'pos' && (
-          <div className="search-row">
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Search drug name or barcode..."
-              value={searchTerm}
-              onChange={(e) =>
-                setSearchTerm(
-                  e.target.value
-                )
-              }
-              autoFocus
-            />
-          </div>
-        )}
       </header>
 
       {/* ========================================================
           POS TERMINAL
       ======================================================== */}
-      {activeTab === 'pos' && (
+      {activeTab === 'pos' && userRole !== 'cashier' && userRole !== 'administrator' && (
         <div className="tickets-screen no-print">
 
           <section className="admin-section">
@@ -1941,7 +2092,7 @@ export default function App() {
                   />
                 </div>
 
-                <div className="price-mode-toggle">
+                <div className="draft-price-toggle">
                   <button
                     type="button"
                     className={activeDraft.saleType === 'retail' ? 'active' : ''}
@@ -2140,8 +2291,59 @@ export default function App() {
       {/* ========================================================
           SALES HISTORY
       ======================================================== */}
-      {activeTab === 'history' && (
+      {activeTab === 'history' && userRole !== 'administrator' && (
         <div className="history-screen no-print">
+
+          {hasRole(userRole, 'manager') && pendingReversalRequests.length > 0 && (
+            <section className="admin-section reversal-requests-section">
+              <div className="admin-section-header">
+                <h3>Pending Reversal Requests</h3>
+                <span className="admin-section-sub">
+                  A cashier asked to reverse part of a sale — nothing changes
+                  on the sale until you approve it from here
+                </span>
+              </div>
+
+              <div className="ticket-list">
+                {pendingReversalRequests.map((request) => (
+                  <div key={request.id} className="ticket-row">
+                    <div>
+                      <strong>
+                        {request.saleSnapshot?.customerName || 'Walk-in Customer'}
+                      </strong>
+                      <div className="deleted-drug-meta">
+                        {request.reversals
+                          .map((r) => {
+                            const item = (request.saleSnapshot?.items || []).find(
+                              (i) => String(i.id) === String(r.id)
+                            );
+                            return `${item?.name || r.id} x${r.quantity}`;
+                          })
+                          .join(', ')}
+                        {' · '}Sale {request.saleId} · requested by{' '}
+                        {request.requestedByEmail}
+                      </div>
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleApproveReversalRequest(request)}
+                      >
+                        ✓ Approve
+                      </button>
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() => handleRejectReversalRequest(request)}
+                      >
+                        ✕ Reject
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           <div className="history-header-row">
 
@@ -2331,6 +2533,18 @@ export default function App() {
                         </button>
                       )}
 
+                      {userRole === 'cashier' && (
+                        <button
+                          className="reverse-btn"
+                          onClick={() => {
+                            setReversingSale(sale);
+                            setReversalQtys({});
+                          }}
+                        >
+                          ↩️ Request Reversal
+                        </button>
+                      )}
+
                       <button
                         className="receipt-btn"
                         onClick={() => {
@@ -2364,7 +2578,7 @@ export default function App() {
       {/* ========================================================
           TICKETS: attendant ticket-building + cashier approval queue
       ======================================================== */}
-      {activeTab === 'tickets' && (
+      {activeTab === 'tickets' && canApproveTickets && (
         <div className="tickets-screen no-print">
 
           <section className="admin-section">
@@ -2420,6 +2634,40 @@ export default function App() {
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
         <div className="admin-screen no-print">
 
+          <div className="admin-section-nav">
+            <button
+              className={adminSection === 'audit' ? 'active' : ''}
+              onClick={() => setAdminSection('audit')}
+            >
+              📜 Audit Log
+            </button>
+            <button
+              className={adminSection === 'search' ? 'active' : ''}
+              onClick={() => setAdminSection('search')}
+            >
+              🔍 Drug Sale Search
+            </button>
+            <button
+              className={adminSection === 'deleted' ? 'active' : ''}
+              onClick={() => setAdminSection('deleted')}
+            >
+              🗑️ Recently Deleted Drugs
+            </button>
+            <button
+              className={adminSection === 'bulk' ? 'active' : ''}
+              onClick={() => setAdminSection('bulk')}
+            >
+              📅 Bulk Delete Sales History
+            </button>
+            <button
+              className={adminSection === 'banks' ? 'active' : ''}
+              onClick={() => setAdminSection('banks')}
+            >
+              🏦 Bank Options
+            </button>
+          </div>
+
+          {adminSection === 'search' && (
           <section className="admin-section">
             <div className="admin-section-header">
               <h3>Drug Sale Search</h3>
@@ -2477,7 +2725,9 @@ export default function App() {
               )
             )}
           </section>
+          )}
 
+          {adminSection === 'deleted' && (
           <section className="admin-section">
             <div className="admin-section-header">
               <h3>Recently Deleted Drugs</h3>
@@ -2522,7 +2772,9 @@ export default function App() {
               <div className="empty-state">No deleted drugs to recover.</div>
             )}
           </section>
+          )}
 
+          {adminSection === 'bulk' && (
           <section className="admin-section">
             <div className="admin-section-header">
               <h3>Bulk Delete Sales History</h3>
@@ -2557,7 +2809,9 @@ export default function App() {
               </button>
             </div>
           </section>
+          )}
 
+          {adminSection === 'banks' && (
           <section className="admin-section">
             <div className="admin-section-header">
               <h3>Bank Options</h3>
@@ -2603,7 +2857,9 @@ export default function App() {
               </div>
             )}
           </section>
+          )}
 
+          {adminSection === 'audit' && (
           <section className="admin-section">
             <div className="admin-section-header">
               <h3>Audit Log</h3>
@@ -2612,9 +2868,31 @@ export default function App() {
               </span>
             </div>
 
-            {auditLog && auditLog.length > 0 ? (
+            {auditActionTypes.length > 0 && (
+              <div className="admin-section-nav audit-filter-nav">
+                <button
+                  className={auditActionFilter === 'all' ? 'active' : ''}
+                  onClick={() => setAuditActionFilter('all')}
+                >
+                  All
+                </button>
+                {auditActionTypes.map((action) => (
+                  <button
+                    key={action}
+                    className={auditActionFilter === action ? 'active' : ''}
+                    onClick={() => setAuditActionFilter(action)}
+                  >
+                    {action
+                      .replace(/_/g, ' ')
+                      .replace(/\b\w/g, (c) => c.toUpperCase())}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {filteredAuditLog.length > 0 ? (
               <div className="audit-log-list">
-                {auditLog.map((entry) => (
+                {filteredAuditLog.map((entry) => (
                   <div key={entry.id} className="audit-log-entry">
                     <div className="audit-log-main">
                       <strong>{entry.action.replace(/_/g, ' ')}</strong>
@@ -2642,9 +2920,14 @@ export default function App() {
                 ))}
               </div>
             ) : (
-              <div className="empty-state">No audit log entries yet.</div>
+              <div className="empty-state">
+                {auditActionFilter === 'all'
+                  ? 'No audit log entries yet.'
+                  : 'No entries of this type yet.'}
+              </div>
             )}
           </section>
+          )}
 
         </div>
       )}
