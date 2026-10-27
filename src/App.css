@@ -2386,6 +2386,125 @@ select {
   margin-top: 2px;
 }
 
+/* ---- Restock from supplier ---- */
+
+.restock-supplier-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.restock-supplier-picker label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.restock-supplier-picker select {
+  flex: 1 1 auto;
+  min-width: 160px;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+}
+
+.new-supplier-form,
+.new-drug-line-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  padding: 10px;
+  margin-bottom: 10px;
+
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.new-supplier-form label,
+.new-drug-line-form label {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.new-supplier-form input,
+.new-drug-line-form input,
+.new-drug-line-form select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  margin-top: 2px;
+}
+
+.restock-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.restock-new-drug-toggle {
+  align-self: flex-start;
+}
+
+.restock-cart-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+
+  align-items: stretch;
+}
+
+.restock-cart-item-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+}
+
+.restock-line-fields {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.restock-line-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.restock-line-fields input {
+  width: 72px;
+  padding: 4px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  font-size: 0.78rem;
+}
+
+.ticket-status-pill.status-pending {
+  background: #fef9c3;
+  color: #854d0e;
+}
+
+.ticket-status-pill.status-applied {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.ticket-status-pill.status-rejected {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 /* ---- Bulk delete sales ---- */
 
 .bulk-delete-panel {

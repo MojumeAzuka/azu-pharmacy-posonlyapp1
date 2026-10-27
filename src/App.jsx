@@ -34,7 +34,15 @@ import {
   addBankOption,
   removeBankOption,
   syncPendingBankOptionsToCloud,
-  logAuditEvent
+  logAuditEvent,
+  fetchSuppliers,
+  addSupplier,
+  syncPendingSuppliersToCloud,
+  createStockEntry,
+  approveStockEntry,
+  rejectStockEntry,
+  fetchCloudStockEntries,
+  syncPendingStockEntriesToCloud
 } from './db';
 import './App.css';
 
@@ -197,6 +205,42 @@ export default function App() {
   // cashier" slip modal (separate from the receipt modal, which is only
   // for a completed/PAID sale).
   const [printingTicket, setPrintingTicket] = useState(null);
+
+  // ============================================================
+  // RESTOCK FROM SUPPLIER
+  // A selected existing supplier id, OR the sentinel '__new__' while
+  // the inline "new supplier" form is open. restockCart holds the line
+  // items being built up before submitting — each one either an
+  // existing drug (drugId set, isNewDrug false) or a brand-new one
+  // (isNewDrug true, no drugId until submit time).
+  // ============================================================
+  const [restockSupplierId, setRestockSupplierId] = useState('');
+  const [newSupplierForm, setNewSupplierForm] = useState({
+    name: '',
+    contactPerson: '',
+    phone: '',
+    email: '',
+    address: ''
+  });
+  const [isSavingSupplier, setIsSavingSupplier] = useState(false);
+
+  const [restockCart, setRestockCart] = useState([]);
+  const [restockSearchTerm, setRestockSearchTerm] = useState('');
+  const [showNewDrugForm, setShowNewDrugForm] = useState(false);
+  const [newDrugLine, setNewDrugLine] = useState({
+    name: '',
+    unitType: 'Unit',
+    quantity: '',
+    costPrice: '',
+    retailPrice: '',
+    wholesalePrice: '',
+    barcode: ''
+  });
+
+  const [isSubmittingStockEntry, setIsSubmittingStockEntry] = useState(false);
+  const [rejectingStockEntry, setRejectingStockEntry] = useState(null);
+  const [stockRejectReason, setStockRejectReason] = useState('');
+  const [isRejectingStockEntry, setIsRejectingStockEntry] = useState(false);
 
   // ============================================================
   // AUTO-SCROLL CART
@@ -411,6 +455,14 @@ export default function App() {
         fetchBankOptions();
       });
 
+      syncPendingSuppliersToCloud().then(() => {
+        fetchSuppliers();
+      });
+
+      syncPendingStockEntriesToCloud().then(() => {
+        fetchCloudStockEntries();
+      });
+
       expireStaleTickets();
 
       pruneSalesOlderThanOneYear();
@@ -589,6 +641,36 @@ export default function App() {
   // for accountability reasons — deliberately NOT administrator, even
   // though admin outranks both of them everywhere else in the app.
   const canApproveTickets = userRole === 'cashier' || userRole === 'manager';
+
+  // ============================================================
+  // RESTOCK FROM SUPPLIER — data
+  // ============================================================
+  const suppliers = useLiveQuery(() => db.suppliers.toArray(), []);
+
+  const allStockEntries = useLiveQuery(
+    () => db.stockEntries.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+
+  // Only cashiers and managers touch this feature at all — a manager's
+  // own entry is applied the moment they submit it; a cashier's sits
+  // PENDING until a manager approves it.
+  const canUseRestock = userRole === 'cashier' || userRole === 'manager';
+  const canApproveStockEntries = userRole === 'manager';
+
+  const pendingStockEntries = React.useMemo(() => {
+    if (!allStockEntries) return [];
+    return allStockEntries.filter((e) => e.status === 'PENDING');
+  }, [allStockEntries]);
+
+  // What the person who entered it sees: their own stock entries of any
+  // status, so a cashier can tell whether theirs went through yet.
+  const myStockEntries = React.useMemo(() => {
+    if (!allStockEntries || !session) return [];
+    return allStockEntries.filter(
+      (e) => e.enteredByEmail === session.user.email
+    );
+  }, [allStockEntries, session]);
 
   // ============================================================
   // REVERSAL REQUESTS (cashier-initiated reversal, pending manager sign-off)
@@ -1439,6 +1521,241 @@ export default function App() {
   };
 
   // ============================================================
+  // RESTOCK FROM SUPPLIER
+  // ============================================================
+  const handleSaveNewSupplier = async () => {
+    if (!newSupplierForm.name.trim()) {
+      alert("Enter the supplier's name.");
+      return;
+    }
+
+    setIsSavingSupplier(true);
+    try {
+      const supplier = await addSupplier(newSupplierForm, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      setRestockSupplierId(supplier.id);
+      setNewSupplierForm({
+        name: '',
+        contactPerson: '',
+        phone: '',
+        email: '',
+        address: ''
+      });
+    } finally {
+      setIsSavingSupplier(false);
+    }
+  };
+
+  // Adding a drug already in the catalog to the restock cart — cost
+  // price defaults to what's already on file but stays editable, since
+  // this particular supplier/delivery may charge differently.
+  const handleAddExistingDrugToRestock = (drug) => {
+    setRestockCart((prev) => {
+      const idx = prev.findIndex(
+        (item) => !item.isNewDrug && String(item.drugId) === String(drug.id)
+      );
+      if (idx > -1) {
+        const updated = [...prev];
+        updated[idx] = {
+          ...updated[idx],
+          quantity: Number(updated[idx].quantity || 0) + 1
+        };
+        return updated;
+      }
+
+      return [
+        ...prev,
+        {
+          drugId: drug.id,
+          isNewDrug: false,
+          name: drug.name,
+          unitType: drug.unitType,
+          quantity: 1,
+          costPrice: drug.costPrice ?? 0
+        }
+      ];
+    });
+  };
+
+  const handleAddNewDrugLineToRestock = () => {
+    const name = newDrugLine.name.trim();
+    const quantity = Number(newDrugLine.quantity) || 0;
+
+    if (!name) {
+      alert("Enter the new drug's name.");
+      return;
+    }
+    if (quantity <= 0) {
+      alert('Enter a quantity greater than 0.');
+      return;
+    }
+
+    setRestockCart((prev) => [
+      ...prev,
+      {
+        drugId: null,
+        isNewDrug: true,
+        name,
+        unitType: newDrugLine.unitType || 'Unit',
+        quantity,
+        costPrice: Number(newDrugLine.costPrice) || 0,
+        retailPrice: Number(newDrugLine.retailPrice) || 0,
+        wholesalePrice: Number(newDrugLine.wholesalePrice) || 0,
+        barcode: newDrugLine.barcode.trim()
+      }
+    ]);
+
+    setNewDrugLine({
+      name: '',
+      unitType: 'Unit',
+      quantity: '',
+      costPrice: '',
+      retailPrice: '',
+      wholesalePrice: '',
+      barcode: ''
+    });
+    setShowNewDrugForm(false);
+  };
+
+  const updateRestockLine = (index, field, value) => {
+    setRestockCart((prev) =>
+      prev.map((item, i) => (i === index ? { ...item, [field]: value } : item))
+    );
+  };
+
+  const removeRestockLine = (index) => {
+    setRestockCart((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const restockTotalCost = React.useMemo(
+    () =>
+      restockCart.reduce(
+        (sum, item) =>
+          sum + Number(item.quantity || 0) * Number(item.costPrice || 0),
+        0
+      ),
+    [restockCart]
+  );
+
+  const selectedSupplier =
+    suppliers?.find((s) => s.id === restockSupplierId) || null;
+
+  const handleSubmitStockEntry = async () => {
+    if (restockSupplierId === '__new__' || !selectedSupplier) {
+      alert('Select or add a supplier first.');
+      return;
+    }
+    if (restockCart.length === 0) {
+      alert('Add at least one drug to this stock entry.');
+      return;
+    }
+
+    // Any new-drug line needs real retail/wholesale prices before it can
+    // become an actual catalog entry — quantity and cost alone aren't
+    // enough to sell it afterward.
+    const incompleteNewDrug = restockCart.find(
+      (item) =>
+        item.isNewDrug &&
+        (!item.retailPrice || !item.wholesalePrice)
+    );
+    if (incompleteNewDrug) {
+      alert(
+        `"${incompleteNewDrug.name}" is missing a retail or wholesale price — every new drug needs both before it can be added.`
+      );
+      return;
+    }
+
+    setIsSubmittingStockEntry(true);
+    try {
+      const result = await createStockEntry(
+        {
+          supplierId: selectedSupplier.id,
+          supplierName: selectedSupplier.name,
+          items: restockCart.map((item) => ({
+            drugId: item.drugId,
+            isNewDrug: item.isNewDrug,
+            name: item.name,
+            unitType: item.unitType,
+            quantity: Number(item.quantity) || 0,
+            costPrice: Number(item.costPrice) || 0,
+            retailPrice: item.isNewDrug ? Number(item.retailPrice) || 0 : undefined,
+            wholesalePrice: item.isNewDrug ? Number(item.wholesalePrice) || 0 : undefined,
+            barcode: item.isNewDrug ? item.barcode || '' : undefined
+          })),
+          totalCost: restockTotalCost
+        },
+        { id: session?.user?.id, email: session?.user?.email, role: userRole }
+      );
+
+      if (result.success) {
+        const applied = result.entry.status === 'APPLIED';
+        alert(
+          applied
+            ? `Stock updated — ${restockCart.length} line item(s) from ${selectedSupplier.name}.`
+            : `Sent to a manager for approval — ${restockCart.length} line item(s) from ${selectedSupplier.name}.`
+        );
+        setRestockCart([]);
+        setRestockSupplierId('');
+      } else {
+        alert(result.reason || 'Unable to submit this stock entry.');
+      }
+    } finally {
+      setIsSubmittingStockEntry(false);
+    }
+  };
+
+  const handleApproveStockEntry = async (entry) => {
+    if (
+      !window.confirm(
+        `Approve this ₦${entry.totalCost.toLocaleString()} stock entry from ${entry.supplierName}? Stock will be updated immediately.`
+      )
+    ) {
+      return;
+    }
+
+    const result = await approveStockEntry(entry, {
+      email: session?.user?.email,
+      role: userRole
+    });
+
+    if (!result.success) {
+      alert(result.reason || 'Unable to approve this stock entry.');
+    }
+  };
+
+  const handleOpenRejectStockModal = (entry) => {
+    setRejectingStockEntry(entry);
+    setStockRejectReason('');
+  };
+
+  const handleConfirmRejectStockEntry = async () => {
+    if (!rejectingStockEntry) return;
+    if (!stockRejectReason.trim()) {
+      alert('Enter a short reason so the person who entered it knows why.');
+      return;
+    }
+
+    setIsRejectingStockEntry(true);
+    try {
+      const result = await rejectStockEntry(
+        rejectingStockEntry,
+        stockRejectReason,
+        { email: session?.user?.email, role: userRole }
+      );
+      if (result.success) {
+        setRejectingStockEntry(null);
+        setStockRejectReason('');
+      } else {
+        alert(result.reason || 'Unable to reject this stock entry.');
+      }
+    } finally {
+      setIsRejectingStockEntry(false);
+    }
+  };
+
+  // ============================================================
   // ADMIN: BANK OPTIONS
   // ============================================================
   const handleAddBankOption = async () => {
@@ -2098,6 +2415,30 @@ export default function App() {
                 {pendingTickets.length > 0 && (
                   <span className="nav-badge">
                     {pendingTickets.length > 9 ? '9+' : pendingTickets.length}
+                  </span>
+                )}
+              </button>
+            )}
+
+            {/* Restocking from a supplier — cashier or manager only,
+                same two roles the approval Queue uses. A manager's own
+                entry applies right away; a cashier's waits here for a
+                manager to approve it, so the badge counts THEIR pending
+                entries for a manager, and just shows they have one
+                outstanding for a cashier. */}
+            {canUseRestock && (
+              <button
+                className={
+                  activeTab === 'restock'
+                    ? 'active-tab'
+                    : ''
+                }
+                onClick={() => setActiveTab('restock')}
+              >
+                📦 Restock
+                {canApproveStockEntries && pendingStockEntries.length > 0 && (
+                  <span className="nav-badge">
+                    {pendingStockEntries.length > 9 ? '9+' : pendingStockEntries.length}
                   </span>
                 )}
               </button>
@@ -2829,6 +3170,483 @@ export default function App() {
       )}
 
       {/* ========================================================
+          RESTOCK FROM SUPPLIER (cashier or manager)
+      ======================================================== */}
+      {activeTab === 'restock' && canUseRestock && (
+        <div className="tickets-screen no-print">
+
+          {canApproveStockEntries && pendingStockEntries.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Stock Entries Awaiting Approval</h3>
+                <span className="admin-section-sub">
+                  Submitted by a cashier — nothing in the catalog changes
+                  until you approve or reject each one.
+                </span>
+              </div>
+
+              <div className="ticket-list">
+                {pendingStockEntries.map((entry) => (
+                  <div key={entry.id} className="ticket-row ticket-row-detailed">
+                    <div className="ticket-row-header">
+                      <strong>{entry.supplierName}</strong>
+                    </div>
+
+                    <ul className="ticket-row-items">
+                      {entry.items.map((item, idx) => (
+                        <li key={idx}>
+                          <span className="ticket-row-item-name">
+                            {item.name}
+                            {item.isNewDrug ? ' (new drug)' : ''}
+                          </span>
+                          <span className="ticket-row-item-qty">
+                            × {item.quantity}
+                          </span>
+                          <span className="ticket-row-item-amount">
+                            ₦{Number(item.costPrice).toLocaleString()} ea
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+
+                    <div className="deleted-drug-meta">
+                      Total Cost: ₦{entry.totalCost.toLocaleString()} · by{' '}
+                      {entry.enteredByEmail}
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleApproveStockEntry(entry)}
+                      >
+                        ✓ Approve
+                      </button>
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() => handleOpenRejectStockModal(entry)}
+                      >
+                        ✕ Reject
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Restock From Supplier</h3>
+              <span className="admin-section-sub">
+                {userRole === 'cashier'
+                  ? "Your entries need a manager's approval before stock updates."
+                  : 'Your entries update stock immediately.'}
+              </span>
+            </div>
+
+            <div className="restock-supplier-picker">
+              <label>Supplier:</label>
+              <select
+                value={restockSupplierId}
+                onChange={(e) => setRestockSupplierId(e.target.value)}
+              >
+                <option value="">Select a supplier…</option>
+                {(suppliers || [])
+                  .slice()
+                  .sort((a, b) => a.name.localeCompare(b.name))
+                  .map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                <option value="__new__">+ New Supplier</option>
+              </select>
+            </div>
+
+            {restockSupplierId === '__new__' && (
+              <div className="new-supplier-form">
+                <div className="form-row">
+                  <div>
+                    <label>Supplier Name:</label>
+                    <input
+                      type="text"
+                      value={newSupplierForm.name}
+                      onChange={(e) =>
+                        setNewSupplierForm({ ...newSupplierForm, name: e.target.value })
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label>Contact Person:</label>
+                    <input
+                      type="text"
+                      value={newSupplierForm.contactPerson}
+                      onChange={(e) =>
+                        setNewSupplierForm({
+                          ...newSupplierForm,
+                          contactPerson: e.target.value
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+
+                <div className="form-row">
+                  <div>
+                    <label>Phone:</label>
+                    <input
+                      type="text"
+                      value={newSupplierForm.phone}
+                      onChange={(e) =>
+                        setNewSupplierForm({ ...newSupplierForm, phone: e.target.value })
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label>Email:</label>
+                    <input
+                      type="text"
+                      value={newSupplierForm.email}
+                      onChange={(e) =>
+                        setNewSupplierForm({ ...newSupplierForm, email: e.target.value })
+                      }
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label>Address:</label>
+                  <input
+                    type="text"
+                    value={newSupplierForm.address}
+                    onChange={(e) =>
+                      setNewSupplierForm({ ...newSupplierForm, address: e.target.value })
+                    }
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  className="save-btn"
+                  disabled={isSavingSupplier}
+                  onClick={handleSaveNewSupplier}
+                >
+                  {isSavingSupplier ? 'Saving…' : '✓ Save Supplier & Continue'}
+                </button>
+              </div>
+            )}
+
+            {selectedSupplier && (
+              <div className="restock-builder">
+
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder="Search drugs being restocked..."
+                  value={restockSearchTerm}
+                  onChange={(e) => setRestockSearchTerm(e.target.value)}
+                />
+
+                <div className="drug-list ticket-drug-list restock-drug-list">
+                  {(drugs || [])
+                    .filter(
+                      (d) =>
+                        !d.deletedAt &&
+                        d.name.toLowerCase().includes(restockSearchTerm.toLowerCase())
+                    )
+                    .map((d) => (
+                      <div
+                        key={d.id}
+                        className="drug-card"
+                        onClick={() => handleAddExistingDrugToRestock(d)}
+                      >
+                        <div className="drug-info">
+                          <div className="drug-name">{d.name}</div>
+                          <div className="tags-row">
+                            <span className="unit-tag">{d.unitType}</span>
+                            <span
+                              className={`stock-tag ${d.stock < 10 ? 'low-stock' : ''}`}
+                            >
+                              Stock: {d.stock}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="price-stack">
+                          <div className="price-item cost-price">
+                            <small>Cost:</small> ₦{Number(d.costPrice || 0).toLocaleString()}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+
+                <button
+                  type="button"
+                  className="add-drug-btn restock-new-drug-toggle"
+                  onClick={() => setShowNewDrugForm((v) => !v)}
+                >
+                  {showNewDrugForm ? '✕ Cancel' : '+ Drug Not In Catalog'}
+                </button>
+
+                {showNewDrugForm && (
+                  <div className="new-drug-line-form">
+                    <div className="form-row">
+                      <div>
+                        <label>Drug Name:</label>
+                        <input
+                          type="text"
+                          value={newDrugLine.name}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, name: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label>Unit Type:</label>
+                        <select
+                          value={newDrugLine.unitType}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, unitType: e.target.value })
+                          }
+                        >
+                          <option value="Sachet">Sachet</option>
+                          <option value="Bottle">Bottle</option>
+                          <option value="Tube">Tube</option>
+                          <option value="Ampoule">Ampoule</option>
+                          <option value="Drop">Drop</option>
+                          <option value="Vial">Vial</option>
+                          <option value="Strip">Strip</option>
+                          <option value="Unit">Unit</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="form-row">
+                      <div>
+                        <label>Quantity Received:</label>
+                        <input
+                          type="number"
+                          min="1"
+                          value={newDrugLine.quantity}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, quantity: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label>Cost Price (₦):</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.costPrice}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, costPrice: e.target.value })
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="form-row">
+                      <div>
+                        <label>Retail Price (₦):</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.retailPrice}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, retailPrice: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label>Wholesale Price (₦):</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.wholesalePrice}
+                          onChange={(e) =>
+                            setNewDrugLine({
+                              ...newDrugLine,
+                              wholesalePrice: e.target.value
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label>Barcode (optional):</label>
+                      <input
+                        type="text"
+                        value={newDrugLine.barcode}
+                        onChange={(e) =>
+                          setNewDrugLine({ ...newDrugLine, barcode: e.target.value })
+                        }
+                      />
+                    </div>
+
+                    <button
+                      type="button"
+                      className="save-btn"
+                      onClick={handleAddNewDrugLineToRestock}
+                    >
+                      + Add To Entry
+                    </button>
+                  </div>
+                )}
+
+                <div className="cart-items-list ticket-items-list restock-cart-list">
+                  {restockCart.length === 0 ? (
+                    <div className="empty-state">
+                      No drugs added yet — search above or add one not in the
+                      catalog.
+                    </div>
+                  ) : (
+                    restockCart.map((item, idx) => (
+                      <div key={idx} className="cart-item restock-cart-item">
+                        <div className="restock-cart-item-name">
+                          <strong>{item.name}</strong>
+                          {item.isNewDrug && (
+                            <span className="ticket-saletype-badge wholesale">
+                              NEW
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="restock-line-fields">
+                          <label>
+                            Qty
+                            <input
+                              type="number"
+                              min="1"
+                              value={item.quantity}
+                              onChange={(e) =>
+                                updateRestockLine(
+                                  idx,
+                                  'quantity',
+                                  Number(e.target.value) || 0
+                                )
+                              }
+                            />
+                          </label>
+                          <label>
+                            Cost ₦
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.costPrice}
+                              onChange={(e) =>
+                                updateRestockLine(
+                                  idx,
+                                  'costPrice',
+                                  Number(e.target.value) || 0
+                                )
+                              }
+                            />
+                          </label>
+                          {item.isNewDrug && (
+                            <>
+                              <label>
+                                Retail ₦
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={item.retailPrice}
+                                  onChange={(e) =>
+                                    updateRestockLine(
+                                      idx,
+                                      'retailPrice',
+                                      Number(e.target.value) || 0
+                                    )
+                                  }
+                                />
+                              </label>
+                              <label>
+                                Wholesale ₦
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={item.wholesalePrice}
+                                  onChange={(e) =>
+                                    updateRestockLine(
+                                      idx,
+                                      'wholesalePrice',
+                                      Number(e.target.value) || 0
+                                    )
+                                  }
+                                />
+                              </label>
+                            </>
+                          )}
+                          <button
+                            type="button"
+                            className="permanent-delete-btn"
+                            onClick={() => removeRestockLine(idx)}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div className="cart-summary">
+                  <div className="cart-total">
+                    Total Cost: ₦{restockTotalCost.toLocaleString()}
+                  </div>
+                  <button
+                    type="button"
+                    className="checkout-btn"
+                    disabled={isSubmittingStockEntry || restockCart.length === 0}
+                    onClick={handleSubmitStockEntry}
+                  >
+                    {isSubmittingStockEntry
+                      ? 'Submitting…'
+                      : userRole === 'cashier'
+                      ? '📤 Submit For Approval'
+                      : '✓ Add Stock'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+
+          {myStockEntries.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>My Recent Stock Entries</h3>
+              </div>
+              <div className="ticket-list">
+                {myStockEntries.slice(0, 10).map((entry) => (
+                  <div key={entry.id} className="ticket-row">
+                    <div>
+                      <strong>{entry.supplierName}</strong>
+                      <div className="deleted-drug-meta">
+                        {entry.items.length} item(s) · ₦
+                        {entry.totalCost.toLocaleString()}
+                      </div>
+                      {entry.status === 'REJECTED' && entry.rejectionReason && (
+                        <div className="sent-back-reason">
+                          Rejected: "{entry.rejectionReason}"
+                        </div>
+                      )}
+                    </div>
+                    <span
+                      className={`ticket-status-pill status-${entry.status.toLowerCase()}`}
+                    >
+                      {entry.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+        </div>
+      )}
+
+      {/* ========================================================
           ADMINISTRATOR SCREEN
       ======================================================== */}
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
@@ -3506,6 +4324,53 @@ export default function App() {
                 type="button"
                 className="cancel-btn"
                 onClick={() => setSendingBackTicket(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MANAGER: REJECT STOCK ENTRY MODAL
+      ======================================================== */}
+      {rejectingStockEntry && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Reject Stock Entry — {rejectingStockEntry.supplierName}</h3>
+
+            <p className="form-section-hint">
+              Nothing changes in the catalog — this just tells{' '}
+              {rejectingStockEntry.enteredByEmail} why it was turned down.
+            </p>
+
+            <div>
+              <label>Reason:</label>
+              <textarea
+                rows={3}
+                value={stockRejectReason}
+                onChange={(e) => setStockRejectReason(e.target.value)}
+                placeholder="e.g. Wrong cost prices entered — please re-check the invoice"
+              />
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isRejectingStockEntry}
+                onClick={handleConfirmRejectStockEntry}
+              >
+                {isRejectingStockEntry ? 'Rejecting…' : 'Reject'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setRejectingStockEntry(null)}
               >
                 Cancel
               </button>

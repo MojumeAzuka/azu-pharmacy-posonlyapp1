@@ -72,6 +72,25 @@ db.version(8).stores({
   reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced'
 });
 
+// Schema Version 9: the supplier restock workflow — `suppliers` (a
+// simple reusable address book, same shape of pattern as bankOptions)
+// and `stockEntries` (a batch of drugs received from one supplier on
+// one occasion, each either an existing drug's stock going up or a
+// brand-new drug being created). A cashier's stock entry sits as
+// PENDING until a manager approves it; a manager's own entry applies
+// immediately (APPLIED) — the same cashier-needs-approval shape as
+// reversalRequests above, reused for a different kind of change.
+db.version(9).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -921,6 +940,427 @@ export async function rejectReversalRequest(request, actor) {
   } catch (err) {
     console.warn('Unable to reject reversal request:', err.message);
     return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
+// SUPPLIERS & STOCK ENTRIES (restocking workflow)
+// ------------------------------------------------------------
+// A stock entry is a batch of drugs received from one supplier on one
+// occasion — each line either tops up an existing drug's stock (and
+// updates its cost price to what this supplier charged) or creates a
+// brand-new drug that didn't exist yet. Cashiers and managers can both
+// enter stock; a manager's entry applies immediately, a cashier's sits
+// as PENDING until a manager approves it (same shape as the reversal-
+// request workflow above, deliberately manager-only — not
+// administrator — since the person asking for this said "approval from
+// managers" and cashiers/managers are the only two roles that touch
+// this feature at all).
+// ============================================================
+
+export async function fetchSuppliers() {
+  try {
+    const { data, error } = await supabase.from('suppliers').select('*');
+    if (error) throw error;
+    if (!data) return;
+
+    const pendingIds = new Set(
+      (await db.suppliers.where('synced').equals(0).toArray()).map((s) =>
+        String(s.id)
+      )
+    );
+
+    const mapped = data
+      .filter((s) => !pendingIds.has(String(s.id)))
+      .map((s) => ({
+        id: String(s.id),
+        name: s.name,
+        contactPerson: s.contact_person || '',
+        phone: s.phone || '',
+        email: s.email || '',
+        address: s.address || '',
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.suppliers.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch suppliers:', err.message);
+  }
+}
+
+export async function addSupplier(payload, actor) {
+  const supplier = {
+    id: generateId('SUPPLIER'),
+    name: (payload.name || '').trim(),
+    contactPerson: (payload.contactPerson || '').trim(),
+    phone: (payload.phone || '').trim(),
+    email: (payload.email || '').trim(),
+    address: (payload.address || '').trim(),
+    synced: 0
+  };
+
+  await db.suppliers.add(supplier);
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('suppliers').insert([
+        {
+          id: supplier.id,
+          name: supplier.name,
+          contact_person: supplier.contactPerson,
+          phone: supplier.phone,
+          email: supplier.email,
+          address: supplier.address
+        }
+      ]);
+      if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud supplier create postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'supplier_added',
+    targetType: 'supplier',
+    targetId: supplier.id,
+    details: { name: supplier.name }
+  });
+
+  return supplier;
+}
+
+export async function syncPendingSuppliersToCloud() {
+  try {
+    const pending = await db.suppliers.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const supplier of pending) {
+      const { error } = await supabase.from('suppliers').upsert([
+        {
+          id: supplier.id,
+          name: supplier.name,
+          contact_person: supplier.contactPerson,
+          phone: supplier.phone,
+          email: supplier.email,
+          address: supplier.address
+        }
+      ]);
+      if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending suppliers:', err.message);
+  }
+}
+
+// Actually moves the stock: for each line item, either tops up an
+// existing drug (stock += quantity, cost price updated to what this
+// supplier charged) or creates the new drug the line describes, with
+// its starting stock set to the quantity received. Shared by both the
+// "manager enters stock directly" path and the "manager approves a
+// cashier's pending entry" path below.
+async function applyStockEntryToDrugs(entry) {
+  await db.transaction('rw', db.drugs, async () => {
+    for (const item of entry.items) {
+      if (item.isNewDrug) {
+        const newId = item.drugId || generateId('DRUG');
+        const existing = await db.drugs.get(newId);
+        if (existing) {
+          // Extremely unlikely id collision — fold into the existing
+          // row instead of silently overwriting it.
+          await db.drugs.update(newId, {
+            stock: (existing.stock || 0) + Number(item.quantity || 0),
+            costPrice: Number(item.costPrice || existing.costPrice || 0),
+            synced: 0
+          });
+        } else {
+          await db.drugs.add({
+            id: newId,
+            name: item.name,
+            unitType: item.unitType || 'Unit',
+            costPrice: Number(item.costPrice || 0),
+            retailPrice: Number(item.retailPrice || 0),
+            wholesalePrice: Number(item.wholesalePrice || 0),
+            stock: Number(item.quantity || 0),
+            barcode: item.barcode || '',
+            synced: 0
+          });
+        }
+      } else if (item.drugId) {
+        const existingDrug =
+          (await db.drugs.get(String(item.drugId))) ||
+          (await db.drugs.get(Number(item.drugId)));
+        if (existingDrug) {
+          await db.drugs.update(existingDrug.id, {
+            stock: (existingDrug.stock || 0) + Number(item.quantity || 0),
+            costPrice:
+              item.costPrice !== undefined && item.costPrice !== null
+                ? Number(item.costPrice)
+                : existingDrug.costPrice,
+            synced: 0
+          });
+        }
+      }
+    }
+  });
+
+  // Push every drug this just touched (or created) up to the cloud. The
+  // generic drug-sync retry already covers it if this fails or the
+  // device is offline — this is just for immediate freshness.
+  if (navigator.onLine) {
+    await syncPendingDrugsToCloud();
+  }
+}
+
+export async function createStockEntry(payload, actor) {
+  try {
+    const role = actor?.role;
+    const status = role === 'manager' || role === 'administrator'
+      ? 'APPLIED'
+      : 'PENDING';
+
+    const entry = {
+      id: generateId('STOCK'),
+      status,
+      supplierId: payload.supplierId,
+      supplierName: payload.supplierName,
+      items: payload.items,
+      totalCost: payload.totalCost,
+      enteredById: actor?.id || null,
+      enteredByEmail: actor?.email || 'unknown',
+      enteredByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.stockEntries.add(entry);
+
+    if (status === 'APPLIED') {
+      await applyStockEntryToDrugs(entry);
+    }
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('stock_entries').insert([
+          {
+            id: entry.id,
+            status: entry.status,
+            supplier_id: entry.supplierId,
+            supplier_name: entry.supplierName,
+            items: entry.items,
+            total_cost: entry.totalCost,
+            entered_by: entry.enteredById,
+            entered_by_email: entry.enteredByEmail,
+            entered_by_role: entry.enteredByRole,
+            created_at: entry.createdAt,
+            decided_by_email: entry.decidedByEmail,
+            decided_at: entry.decidedAt,
+            rejection_reason: entry.rejectionReason
+          }
+        ]);
+        if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry create postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: status === 'APPLIED' ? 'stock_entry_applied' : 'stock_entry_requested',
+      targetType: 'stock_entry',
+      targetId: entry.id,
+      details: {
+        supplierName: entry.supplierName,
+        itemCount: entry.items.length,
+        totalCost: entry.totalCost
+      }
+    });
+
+    return { success: true, entry };
+  } catch (err) {
+    console.warn('Unable to create stock entry:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function approveStockEntry(entry, actor) {
+  try {
+    const freshLocal = await db.stockEntries.get(entry.id);
+    if (freshLocal && freshLocal.status !== 'PENDING') {
+      return { success: false, reason: 'This stock entry has already been handled.' };
+    }
+
+    const target = freshLocal || entry;
+    await applyStockEntryToDrugs(target);
+
+    const decidedAt = new Date().toISOString();
+
+    await db.stockEntries.update(entry.id, {
+      status: 'APPLIED',
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('stock_entries')
+          .update({
+            status: 'APPLIED',
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', entry.id);
+        if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'stock_entry_approved',
+      targetType: 'stock_entry',
+      targetId: entry.id,
+      details: { supplierName: target.supplierName, totalCost: target.totalCost }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to approve stock entry:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectStockEntry(entry, reason, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+    const trimmedReason = (reason || '').trim();
+
+    await db.stockEntries.update(entry.id, {
+      status: 'REJECTED',
+      rejectionReason: trimmedReason,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('stock_entries')
+          .update({
+            status: 'REJECTED',
+            rejection_reason: trimmedReason,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', entry.id);
+        if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'stock_entry_rejected',
+      targetType: 'stock_entry',
+      targetId: entry.id,
+      details: { reason: trimmedReason }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject stock entry:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchCloudStockEntries() {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const { data, error } = await supabase
+      .from('stock_entries')
+      .select('*')
+      .gte('created_at', thirtyDaysAgo.toISOString())
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.stockEntries.where('synced').equals(0).toArray()).map((e) =>
+        String(e.id)
+      )
+    );
+
+    const mapped = data
+      .filter((e) => !pendingIds.has(String(e.id)))
+      .map((e) => ({
+        id: String(e.id),
+        status: e.status,
+        supplierId: e.supplier_id,
+        supplierName: e.supplier_name,
+        items: e.items || [],
+        totalCost: Number(e.total_cost || 0),
+        enteredById: e.entered_by || null,
+        enteredByEmail: e.entered_by_email || 'unknown',
+        enteredByRole: e.entered_by_role || 'unknown',
+        createdAt: e.created_at,
+        decidedByEmail: e.decided_by_email || null,
+        decidedAt: e.decided_at || null,
+        rejectionReason: e.rejection_reason || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.stockEntries.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch stock entries from cloud:', err.message);
+  }
+}
+
+export async function syncPendingStockEntriesToCloud() {
+  try {
+    const pending = await db.stockEntries.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const entry of pending) {
+      const { error } = await supabase.from('stock_entries').upsert([
+        {
+          id: entry.id,
+          status: entry.status,
+          supplier_id: entry.supplierId,
+          supplier_name: entry.supplierName,
+          items: entry.items,
+          total_cost: entry.totalCost,
+          entered_by: entry.enteredById,
+          entered_by_email: entry.enteredByEmail,
+          entered_by_role: entry.enteredByRole,
+          created_at: entry.createdAt,
+          decided_by_email: entry.decidedByEmail,
+          decided_at: entry.decidedAt,
+          rejection_reason: entry.rejectionReason
+        }
+      ]);
+      if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending stock entries:', err.message);
   }
 }
 
