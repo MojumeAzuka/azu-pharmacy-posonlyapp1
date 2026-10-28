@@ -42,7 +42,16 @@ import {
   approveStockEntry,
   rejectStockEntry,
   fetchCloudStockEntries,
-  syncPendingStockEntriesToCloud
+  syncPendingStockEntriesToCloud,
+  editStockEntry,
+  approveStockEntryEdit,
+  rejectStockEntryEdit,
+  fetchCloudStockEntryEdits,
+  syncPendingStockEntryEditsToCloud,
+  STOCK_ENTRY_EDIT_WINDOW_DAYS,
+  getRestockDraft,
+  saveRestockDraft,
+  clearRestockDraft
 } from './db';
 import './App.css';
 
@@ -234,13 +243,130 @@ export default function App() {
     costPrice: '',
     retailPrice: '',
     wholesalePrice: '',
-    barcode: ''
+    barcode: '',
+    // Optional, same as the main "Add Drug" form — a blank slot means
+    // "no discounted pack pricing for this drug", not a free pack.
+    halfPackQty: '',
+    halfPackPrice: '',
+    packQty: '',
+    packPrice: ''
   });
 
   const [isSubmittingStockEntry, setIsSubmittingStockEntry] = useState(false);
   const [rejectingStockEntry, setRejectingStockEntry] = useState(null);
   const [stockRejectReason, setStockRejectReason] = useState('');
   const [isRejectingStockEntry, setIsRejectingStockEntry] = useState(false);
+
+  // Editing an already-submitted stock entry (even one already APPLIED)
+  // within the edit window — a manager's edit applies immediately, a
+  // cashier's edit to their own entry queues for manager approval.
+  const [editingStockEntry, setEditingStockEntry] = useState(null);
+  const [editStockItems, setEditStockItems] = useState([]);
+  const [isSavingStockEdit, setIsSavingStockEdit] = useState(false);
+
+  // Manager reviewing a cashier's pending edit request.
+  const [rejectingStockEdit, setRejectingStockEdit] = useState(null);
+  const [stockEditRejectReason, setStockEditRejectReason] = useState('');
+  const [isRejectingStockEdit, setIsRejectingStockEdit] = useState(false);
+
+  // Whether the restock draft saved for this account has been loaded
+  // yet — guards against saving an empty draft over a real one before
+  // the load effect has had a chance to run.
+  const restockDraftLoadedRef = useRef(false);
+  // Which account's draft is currently loaded into the state above —
+  // the save effect writes under THIS email, not whatever
+  // session?.user?.email happens to read as at save time (those can
+  // briefly disagree for one render during an account switch).
+  const restockDraftEmailRef = useRef(null);
+
+  const blankNewDrugLine = {
+    name: '',
+    unitType: 'Unit',
+    quantity: '',
+    costPrice: '',
+    retailPrice: '',
+    wholesalePrice: '',
+    barcode: '',
+    halfPackQty: '',
+    halfPackPrice: '',
+    packQty: '',
+    packPrice: ''
+  };
+
+  // Load (or reset) the restock draft whenever the signed-in account
+  // changes. The reset happens FIRST and unconditionally — before
+  // anything is loaded — so switching from a manager to a cashier login
+  // on the same device never shows the manager's in-progress supplier
+  // or cart, even for the one render before the cashier's own saved
+  // draft (if any) comes back from Dexie.
+  useEffect(() => {
+    const email = session?.user?.email || null;
+
+    restockDraftLoadedRef.current = false;
+    restockDraftEmailRef.current = null;
+
+    setRestockSupplierId('');
+    setNewSupplierForm({ name: '', contactPerson: '', phone: '', email: '', address: '' });
+    setRestockCart([]);
+    setShowNewDrugForm(false);
+    setNewDrugLine(blankNewDrugLine);
+
+    if (!email) return;
+
+    let cancelled = false;
+
+    getRestockDraft(email).then((draft) => {
+      if (cancelled) return;
+
+      if (draft) {
+        if (draft.restockSupplierId) setRestockSupplierId(draft.restockSupplierId);
+        if (draft.newSupplierForm) setNewSupplierForm(draft.newSupplierForm);
+        if (draft.restockCart) setRestockCart(draft.restockCart);
+        if (draft.showNewDrugForm) setShowNewDrugForm(draft.showNewDrugForm);
+        if (draft.newDrugLine) setNewDrugLine(draft.newDrugLine);
+      }
+
+      // Only now does this account's draft count as "loaded" — the
+      // save effect below stays silent until this flips true, so it
+      // can never stomp a real saved draft with the blank reset above.
+      restockDraftEmailRef.current = email;
+      restockDraftLoadedRef.current = true;
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user?.email]);
+
+  // Persist the in-progress restock screen as it's built, so stepping
+  // away to attend a customer — or closing the tab entirely — doesn't
+  // lose the work. Tied to restockDraftEmailRef (the account whose
+  // draft is actually loaded right now), not raw state alone, so it
+  // never writes under the wrong account for that one render during a
+  // switch.
+  useEffect(() => {
+    if (!restockDraftLoadedRef.current || !restockDraftEmailRef.current) return;
+
+    const email = restockDraftEmailRef.current;
+    const hasContent =
+      !!restockSupplierId ||
+      restockCart.length > 0 ||
+      !!newSupplierForm.name.trim() ||
+      showNewDrugForm;
+
+    if (!hasContent) {
+      clearRestockDraft(email);
+      return;
+    }
+
+    saveRestockDraft(email, {
+      restockSupplierId,
+      newSupplierForm,
+      restockCart,
+      showNewDrugForm,
+      newDrugLine
+    });
+  }, [restockSupplierId, newSupplierForm, restockCart, showNewDrugForm, newDrugLine]);
 
   // ============================================================
   // AUTO-SCROLL CART
@@ -463,6 +589,10 @@ export default function App() {
         fetchCloudStockEntries();
       });
 
+      syncPendingStockEntryEditsToCloud().then(() => {
+        fetchCloudStockEntryEdits();
+      });
+
       expireStaleTickets();
 
       pruneSalesOlderThanOneYear();
@@ -671,6 +801,39 @@ export default function App() {
       (e) => e.enteredByEmail === session.user.email
     );
   }, [allStockEntries, session]);
+
+  // A stock entry (any status) is still correctable if it's within the
+  // edit window and the viewer is either the one who entered it or a
+  // manager/administrator — mirrors editStockEntry's own rule in db.js.
+  const isStockEntryEditable = (entry) => {
+    if (!entry || entry.status === 'REJECTED') return false;
+    const ageMs = Date.now() - new Date(entry.createdAt).getTime();
+    if (ageMs > STOCK_ENTRY_EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000) return false;
+    const isOwner = entry.enteredByEmail === session?.user?.email;
+    return isOwner || hasRole(userRole, 'manager');
+  };
+
+  // Pending edit requests (a cashier correcting their own already-
+  // submitted entry) — same cashier-needs-approval shape as the entries
+  // themselves.
+  const allStockEntryEdits = useLiveQuery(
+    () => db.stockEntryEdits.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+
+  const pendingStockEntryEdits = React.useMemo(() => {
+    if (!allStockEntryEdits) return [];
+    return allStockEntryEdits.filter((e) => e.status === 'PENDING');
+  }, [allStockEntryEdits]);
+
+  // A quick lookup from stockEntryId -> its own still-pending edit
+  // request (if any), so a stock-entry row can show "edit awaiting
+  // approval" instead of offering another Edit button on top of it.
+  const pendingEditByStockEntryId = React.useMemo(() => {
+    const map = new Map();
+    pendingStockEntryEdits.forEach((e) => map.set(String(e.stockEntryId), e));
+    return map;
+  }, [pendingStockEntryEdits]);
 
   // ============================================================
   // REVERSAL REQUESTS (cashier-initiated reversal, pending manager sign-off)
@@ -1573,7 +1736,13 @@ export default function App() {
           name: drug.name,
           unitType: drug.unitType,
           quantity: 1,
-          costPrice: drug.costPrice ?? 0
+          // Pre-filled from what's already on file so the common case
+          // (this delivery is priced the same as last time) needs no
+          // typing — but all three stay editable in case this supplier
+          // or delivery charges differently.
+          costPrice: drug.costPrice ?? 0,
+          retailPrice: drug.retailPrice ?? 0,
+          wholesalePrice: drug.wholesalePrice ?? 0
         }
       ];
     });
@@ -1592,6 +1761,12 @@ export default function App() {
       return;
     }
 
+    // Blank stays null rather than 0 — same convention as the main Add
+    // Drug form, so an empty pack field never gets mistaken for a free
+    // pack.
+    const optionalNumber = (value) =>
+      value === '' || value === null || value === undefined ? null : Number(value);
+
     setRestockCart((prev) => [
       ...prev,
       {
@@ -1603,7 +1778,11 @@ export default function App() {
         costPrice: Number(newDrugLine.costPrice) || 0,
         retailPrice: Number(newDrugLine.retailPrice) || 0,
         wholesalePrice: Number(newDrugLine.wholesalePrice) || 0,
-        barcode: newDrugLine.barcode.trim()
+        barcode: newDrugLine.barcode.trim(),
+        halfPackQty: optionalNumber(newDrugLine.halfPackQty),
+        halfPackPrice: optionalNumber(newDrugLine.halfPackPrice),
+        packQty: optionalNumber(newDrugLine.packQty),
+        packPrice: optionalNumber(newDrugLine.packPrice)
       }
     ]);
 
@@ -1614,7 +1793,11 @@ export default function App() {
       costPrice: '',
       retailPrice: '',
       wholesalePrice: '',
-      barcode: ''
+      barcode: '',
+      halfPackQty: '',
+      halfPackPrice: '',
+      packQty: '',
+      packPrice: ''
     });
     setShowNewDrugForm(false);
   };
@@ -1680,9 +1863,22 @@ export default function App() {
             unitType: item.unitType,
             quantity: Number(item.quantity) || 0,
             costPrice: Number(item.costPrice) || 0,
-            retailPrice: item.isNewDrug ? Number(item.retailPrice) || 0 : undefined,
-            wholesalePrice: item.isNewDrug ? Number(item.wholesalePrice) || 0 : undefined,
-            barcode: item.isNewDrug ? item.barcode || '' : undefined
+            // Retail/wholesale travel with every line now, not just new
+            // drugs — an existing drug's restock line can correct its
+            // price too, defaulting to what was already on file.
+            retailPrice:
+              item.retailPrice !== '' && item.retailPrice !== undefined
+                ? Number(item.retailPrice) || 0
+                : undefined,
+            wholesalePrice:
+              item.wholesalePrice !== '' && item.wholesalePrice !== undefined
+                ? Number(item.wholesalePrice) || 0
+                : undefined,
+            barcode: item.isNewDrug ? item.barcode || '' : undefined,
+            halfPackQty: item.isNewDrug ? item.halfPackQty ?? null : undefined,
+            halfPackPrice: item.isNewDrug ? item.halfPackPrice ?? null : undefined,
+            packQty: item.isNewDrug ? item.packQty ?? null : undefined,
+            packPrice: item.isNewDrug ? item.packPrice ?? null : undefined
           })),
           totalCost: restockTotalCost
         },
@@ -1698,6 +1894,12 @@ export default function App() {
         );
         setRestockCart([]);
         setRestockSupplierId('');
+        // The draft this was built from is now a real submitted entry —
+        // nothing left to resume, so clear it rather than leaving a
+        // stale (now-redundant) draft sitting around for next time.
+        if (session?.user?.email) {
+          clearRestockDraft(session.user.email);
+        }
       } else {
         alert(result.reason || 'Unable to submit this stock entry.');
       }
@@ -1752,6 +1954,145 @@ export default function App() {
       }
     } finally {
       setIsRejectingStockEntry(false);
+    }
+  };
+
+  // ============================================================
+  // EDITING AN ALREADY-SUBMITTED STOCK ENTRY (within the edit window)
+  // ============================================================
+  const handleOpenEditStockEntry = (entry) => {
+    setEditingStockEntry(entry);
+    // Work from a deep-ish copy with number fields as editable strings,
+    // same convention the rest of the form inputs use.
+    setEditStockItems(
+      entry.items.map((item) => ({
+        ...item,
+        quantity: String(item.quantity ?? ''),
+        costPrice: String(item.costPrice ?? ''),
+        retailPrice: item.retailPrice !== undefined && item.retailPrice !== null
+          ? String(item.retailPrice)
+          : '',
+        wholesalePrice: item.wholesalePrice !== undefined && item.wholesalePrice !== null
+          ? String(item.wholesalePrice)
+          : '',
+        halfPackQty: item.halfPackQty ?? '',
+        halfPackPrice: item.halfPackPrice ?? '',
+        packQty: item.packQty ?? '',
+        packPrice: item.packPrice ?? ''
+      }))
+    );
+  };
+
+  const updateEditStockItem = (index, field, value) => {
+    setEditStockItems((prev) =>
+      prev.map((item, i) => (i === index ? { ...item, [field]: value } : item))
+    );
+  };
+
+  // Dropping a line during an edit is allowed (it just won't be in
+  // newItems, same as editStockEntry's own doc comment describes) —
+  // adding a brand-new line isn't, since that's really a new delivery.
+  const removeEditStockItem = (index) => {
+    setEditStockItems((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleSaveStockEdit = async () => {
+    if (!editingStockEntry) return;
+
+    if (editStockItems.length === 0) {
+      alert('An entry needs at least one line — remove the whole entry instead if none of this is right.');
+      return;
+    }
+
+    setIsSavingStockEdit(true);
+    try {
+      const optionalNumber = (value) =>
+        value === '' || value === null || value === undefined ? null : Number(value);
+
+      const newItems = editStockItems.map((item) => ({
+        drugId: item.drugId,
+        isNewDrug: item.isNewDrug,
+        name: item.name,
+        unitType: item.unitType,
+        quantity: Number(item.quantity) || 0,
+        costPrice: Number(item.costPrice) || 0,
+        retailPrice: item.retailPrice === '' ? undefined : Number(item.retailPrice) || 0,
+        wholesalePrice: item.wholesalePrice === '' ? undefined : Number(item.wholesalePrice) || 0,
+        barcode: item.isNewDrug ? item.barcode || '' : undefined,
+        halfPackQty: item.isNewDrug ? optionalNumber(item.halfPackQty) : undefined,
+        halfPackPrice: item.isNewDrug ? optionalNumber(item.halfPackPrice) : undefined,
+        packQty: item.isNewDrug ? optionalNumber(item.packQty) : undefined,
+        packPrice: item.isNewDrug ? optionalNumber(item.packPrice) : undefined
+      }));
+
+      const result = await editStockEntry(editingStockEntry, newItems, {
+        id: session?.user?.id,
+        email: session?.user?.email,
+        role: userRole
+      });
+
+      if (result.success) {
+        alert(
+          result.pending
+            ? "Sent to a manager for approval — the entry won't change until then."
+            : 'Stock entry updated.'
+        );
+        setEditingStockEntry(null);
+        setEditStockItems([]);
+      } else {
+        alert(result.reason || 'Unable to save these changes.');
+      }
+    } finally {
+      setIsSavingStockEdit(false);
+    }
+  };
+
+  const handleApproveStockEdit = async (editRequest) => {
+    if (
+      !window.confirm(
+        `Approve this correction to the stock entry from ${editRequest.requestedByEmail}? Stock will update immediately.`
+      )
+    ) {
+      return;
+    }
+
+    const result = await approveStockEntryEdit(editRequest, {
+      email: session?.user?.email,
+      role: userRole
+    });
+
+    if (!result.success) {
+      alert(result.reason || 'Unable to approve this edit.');
+    }
+  };
+
+  const handleOpenRejectStockEdit = (editRequest) => {
+    setRejectingStockEdit(editRequest);
+    setStockEditRejectReason('');
+  };
+
+  const handleConfirmRejectStockEdit = async () => {
+    if (!rejectingStockEdit) return;
+    if (!stockEditRejectReason.trim()) {
+      alert('Enter a short reason so the person who requested it knows why.');
+      return;
+    }
+
+    setIsRejectingStockEdit(true);
+    try {
+      const result = await rejectStockEntryEdit(
+        rejectingStockEdit,
+        stockEditRejectReason,
+        { email: session?.user?.email, role: userRole }
+      );
+      if (result.success) {
+        setRejectingStockEdit(null);
+        setStockEditRejectReason('');
+      } else {
+        alert(result.reason || 'Unable to reject this edit.');
+      }
+    } finally {
+      setIsRejectingStockEdit(false);
     }
   };
 
@@ -3221,9 +3562,84 @@ export default function App() {
                       >
                         ✓ Approve
                       </button>
+                      {isStockEntryEditable(entry) && (
+                        <button
+                          className="send-back-btn"
+                          onClick={() => handleOpenEditStockEntry(entry)}
+                        >
+                          ✎ Edit
+                        </button>
+                      )}
                       <button
                         className="permanent-delete-btn"
                         onClick={() => handleOpenRejectStockModal(entry)}
+                      >
+                        ✕ Reject
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {canApproveStockEntries && pendingStockEntryEdits.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Stock Entry Corrections Awaiting Approval</h3>
+                <span className="admin-section-sub">
+                  A cashier corrected something on an entry they already
+                  submitted — the entry stays as it is until you approve or
+                  reject the change.
+                </span>
+              </div>
+
+              <div className="ticket-list">
+                {pendingStockEntryEdits.map((editRequest) => (
+                  <div key={editRequest.id} className="ticket-row ticket-row-detailed">
+                    <div className="ticket-row-header">
+                      <strong>Correction from {editRequest.requestedByEmail}</strong>
+                    </div>
+
+                    <ul className="ticket-row-items">
+                      {editRequest.proposedItems.map((item, idx) => {
+                        const before = editRequest.originalItems.find(
+                          (o) => String(o.drugId) === String(item.drugId)
+                        );
+                        const qtyChanged =
+                          before && Number(before.quantity) !== Number(item.quantity);
+                        return (
+                          <li key={idx}>
+                            <span className="ticket-row-item-name">
+                              {item.name}
+                              {item.isNewDrug ? ' (new drug)' : ''}
+                            </span>
+                            <span className="ticket-row-item-qty">
+                              × {item.quantity}
+                              {qtyChanged ? ` (was ${before.quantity})` : ''}
+                            </span>
+                            <span className="ticket-row-item-amount">
+                              ₦{Number(item.costPrice).toLocaleString()} ea
+                            </span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+
+                    <div className="deleted-drug-meta">
+                      New Total: ₦{editRequest.proposedTotalCost.toLocaleString()}
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleApproveStockEdit(editRequest)}
+                      >
+                        ✓ Approve Correction
+                      </button>
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() => handleOpenRejectStockEdit(editRequest)}
                       >
                         ✕ Reject
                       </button>
@@ -3485,6 +3901,62 @@ export default function App() {
                       />
                     </div>
 
+                    <p className="form-section-hint">
+                      Optional — only fill these in if this drug is sold at a
+                      discount for a half pack or full pack. Leave blank
+                      otherwise.
+                    </p>
+
+                    <div className="form-row">
+                      <div>
+                        <label>Half Pack Qty:</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.halfPackQty}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, halfPackQty: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label>Half Pack Price (₦):</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.halfPackPrice}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, halfPackPrice: e.target.value })
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="form-row">
+                      <div>
+                        <label>Full Pack Qty:</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.packQty}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, packQty: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div>
+                        <label>Full Pack Price (₦):</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={newDrugLine.packPrice}
+                          onChange={(e) =>
+                            setNewDrugLine({ ...newDrugLine, packPrice: e.target.value })
+                          }
+                        />
+                      </div>
+                    </div>
+
                     <button
                       type="button"
                       className="save-btn"
@@ -3544,34 +4016,99 @@ export default function App() {
                               }
                             />
                           </label>
+                          {/* Retail/wholesale show for EVERY line now —
+                              not just new drugs — pre-filled from the
+                              catalog for an existing drug, editable in
+                              case this supplier/delivery is priced
+                              differently. */}
+                          <label>
+                            Retail ₦
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.retailPrice}
+                              onChange={(e) =>
+                                updateRestockLine(
+                                  idx,
+                                  'retailPrice',
+                                  Number(e.target.value) || 0
+                                )
+                              }
+                            />
+                          </label>
+                          <label>
+                            Wholesale ₦
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.wholesalePrice}
+                              onChange={(e) =>
+                                updateRestockLine(
+                                  idx,
+                                  'wholesalePrice',
+                                  Number(e.target.value) || 0
+                                )
+                              }
+                            />
+                          </label>
                           {item.isNewDrug && (
                             <>
                               <label>
-                                Retail ₦
+                                Half Pack Qty
                                 <input
                                   type="number"
                                   min="0"
-                                  value={item.retailPrice}
+                                  value={item.halfPackQty ?? ''}
                                   onChange={(e) =>
                                     updateRestockLine(
                                       idx,
-                                      'retailPrice',
-                                      Number(e.target.value) || 0
+                                      'halfPackQty',
+                                      e.target.value === '' ? null : Number(e.target.value)
                                     )
                                   }
                                 />
                               </label>
                               <label>
-                                Wholesale ₦
+                                Half Pack ₦
                                 <input
                                   type="number"
                                   min="0"
-                                  value={item.wholesalePrice}
+                                  value={item.halfPackPrice ?? ''}
                                   onChange={(e) =>
                                     updateRestockLine(
                                       idx,
-                                      'wholesalePrice',
-                                      Number(e.target.value) || 0
+                                      'halfPackPrice',
+                                      e.target.value === '' ? null : Number(e.target.value)
+                                    )
+                                  }
+                                />
+                              </label>
+                              <label>
+                                Full Pack Qty
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={item.packQty ?? ''}
+                                  onChange={(e) =>
+                                    updateRestockLine(
+                                      idx,
+                                      'packQty',
+                                      e.target.value === '' ? null : Number(e.target.value)
+                                    )
+                                  }
+                                />
+                              </label>
+                              <label>
+                                Full Pack ₦
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={item.packPrice ?? ''}
+                                  onChange={(e) =>
+                                    updateRestockLine(
+                                      idx,
+                                      'packPrice',
+                                      e.target.value === '' ? null : Number(e.target.value)
                                     )
                                   }
                                 />
@@ -3618,27 +4155,99 @@ export default function App() {
                 <h3>My Recent Stock Entries</h3>
               </div>
               <div className="ticket-list">
-                {myStockEntries.slice(0, 10).map((entry) => (
-                  <div key={entry.id} className="ticket-row">
-                    <div>
-                      <strong>{entry.supplierName}</strong>
-                      <div className="deleted-drug-meta">
-                        {entry.items.length} item(s) · ₦
-                        {entry.totalCost.toLocaleString()}
-                      </div>
-                      {entry.status === 'REJECTED' && entry.rejectionReason && (
-                        <div className="sent-back-reason">
-                          Rejected: "{entry.rejectionReason}"
+                {myStockEntries.slice(0, 10).map((entry) => {
+                  const pendingEdit = pendingEditByStockEntryId.get(String(entry.id));
+                  return (
+                    <div key={entry.id} className="ticket-row">
+                      <div>
+                        <strong>{entry.supplierName}</strong>
+                        <div className="deleted-drug-meta">
+                          {entry.items.length} item(s) · ₦
+                          {entry.totalCost.toLocaleString()}
                         </div>
-                      )}
+                        {entry.status === 'REJECTED' && entry.rejectionReason && (
+                          <div className="sent-back-reason">
+                            Rejected: "{entry.rejectionReason}"
+                          </div>
+                        )}
+                        {pendingEdit && (
+                          <div className="sent-back-reason">
+                            A correction is awaiting manager approval.
+                          </div>
+                        )}
+                      </div>
+                      <div className="deleted-drug-actions">
+                        {isStockEntryEditable(entry) && !pendingEdit && (
+                          <button
+                            className="send-back-btn"
+                            onClick={() => handleOpenEditStockEntry(entry)}
+                          >
+                            ✎ Edit
+                          </button>
+                        )}
+                        <span
+                          className={`ticket-status-pill status-${entry.status.toLowerCase()}`}
+                        >
+                          {entry.status}
+                        </span>
+                      </div>
                     </div>
-                    <span
-                      className={`ticket-status-pill status-${entry.status.toLowerCase()}`}
-                    >
-                      {entry.status}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          {canApproveStockEntries && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>All Stock Entries (last 7 days)</h3>
+                <span className="admin-section-sub">
+                  Anyone's entry — managers can correct a mistake on any of
+                  these, not just their own.
+                </span>
+              </div>
+              <div className="ticket-list">
+                {(allStockEntries || [])
+                  .filter((e) => {
+                    const ageMs = Date.now() - new Date(e.createdAt).getTime();
+                    return ageMs <= STOCK_ENTRY_EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+                  })
+                  .map((entry) => {
+                    const pendingEdit = pendingEditByStockEntryId.get(String(entry.id));
+                    return (
+                      <div key={entry.id} className="ticket-row">
+                        <div>
+                          <strong>{entry.supplierName}</strong>
+                          <div className="deleted-drug-meta">
+                            {entry.items.length} item(s) · ₦
+                            {entry.totalCost.toLocaleString()} · by{' '}
+                            {entry.enteredByEmail}
+                          </div>
+                          {pendingEdit && (
+                            <div className="sent-back-reason">
+                              A correction is awaiting approval above.
+                            </div>
+                          )}
+                        </div>
+                        <div className="deleted-drug-actions">
+                          {isStockEntryEditable(entry) && !pendingEdit && (
+                            <button
+                              className="send-back-btn"
+                              onClick={() => handleOpenEditStockEntry(entry)}
+                            >
+                              ✎ Edit
+                            </button>
+                          )}
+                          <span
+                            className={`ticket-status-pill status-${entry.status.toLowerCase()}`}
+                          >
+                            {entry.status}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
               </div>
             </section>
           )}
@@ -4371,6 +4980,213 @@ export default function App() {
                 type="button"
                 className="cancel-btn"
                 onClick={() => setRejectingStockEntry(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          EDIT STOCK ENTRY MODAL (correcting a mistake, within the
+          7-day edit window)
+      ======================================================== */}
+      {editingStockEntry && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Edit Stock Entry — {editingStockEntry.supplierName}</h3>
+
+            <p className="form-section-hint">
+              {editingStockEntry.status === 'APPLIED' && userRole === 'cashier'
+                ? "Stock already moved from this entry — your correction will need a manager's approval before it takes effect."
+                : editingStockEntry.status === 'APPLIED'
+                ? 'Stock already moved from this entry — saving will adjust stock immediately by the difference.'
+                : "This entry hasn't been approved yet — your correction applies straight away."}
+            </p>
+
+            <div className="cart-items-list restock-cart-list edit-stock-items-list">
+              {editStockItems.map((item, idx) => (
+                <div key={idx} className="cart-item restock-cart-item">
+                  <div className="restock-cart-item-name">
+                    <strong>{item.name}</strong>
+                    {item.isNewDrug && (
+                      <span className="ticket-saletype-badge wholesale">NEW</span>
+                    )}
+                  </div>
+
+                  <div className="restock-line-fields">
+                    <label>
+                      Qty
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.quantity}
+                        onChange={(e) =>
+                          updateEditStockItem(idx, 'quantity', e.target.value)
+                        }
+                      />
+                    </label>
+                    <label>
+                      Cost ₦
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.costPrice}
+                        onChange={(e) =>
+                          updateEditStockItem(idx, 'costPrice', e.target.value)
+                        }
+                      />
+                    </label>
+                    <label>
+                      Retail ₦
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.retailPrice}
+                        onChange={(e) =>
+                          updateEditStockItem(idx, 'retailPrice', e.target.value)
+                        }
+                      />
+                    </label>
+                    <label>
+                      Wholesale ₦
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.wholesalePrice}
+                        onChange={(e) =>
+                          updateEditStockItem(idx, 'wholesalePrice', e.target.value)
+                        }
+                      />
+                    </label>
+                    {item.isNewDrug && (
+                      <>
+                        <label>
+                          Half Pack Qty
+                          <input
+                            type="number"
+                            min="0"
+                            value={item.halfPackQty}
+                            onChange={(e) =>
+                              updateEditStockItem(idx, 'halfPackQty', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          Half Pack ₦
+                          <input
+                            type="number"
+                            min="0"
+                            value={item.halfPackPrice}
+                            onChange={(e) =>
+                              updateEditStockItem(idx, 'halfPackPrice', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          Full Pack Qty
+                          <input
+                            type="number"
+                            min="0"
+                            value={item.packQty}
+                            onChange={(e) =>
+                              updateEditStockItem(idx, 'packQty', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          Full Pack ₦
+                          <input
+                            type="number"
+                            min="0"
+                            value={item.packPrice}
+                            onChange={(e) =>
+                              updateEditStockItem(idx, 'packPrice', e.target.value)
+                            }
+                          />
+                        </label>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      className="permanent-delete-btn"
+                      onClick={() => removeEditStockItem(idx)}
+                    >
+                      ✕ Remove Line
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isSavingStockEdit}
+                onClick={handleSaveStockEdit}
+              >
+                {isSavingStockEdit ? 'Saving…' : 'Save Correction'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => {
+                  setEditingStockEntry(null);
+                  setEditStockItems([]);
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MANAGER: REJECT STOCK ENTRY CORRECTION MODAL
+      ======================================================== */}
+      {rejectingStockEdit && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Reject Correction</h3>
+
+            <p className="form-section-hint">
+              The original entry stays exactly as it was — this just tells{' '}
+              {rejectingStockEdit.requestedByEmail} why the correction was
+              turned down.
+            </p>
+
+            <div>
+              <label>Reason:</label>
+              <textarea
+                rows={3}
+                value={stockEditRejectReason}
+                onChange={(e) => setStockEditRejectReason(e.target.value)}
+                placeholder="e.g. Please re-check the invoice quantities before resubmitting"
+              />
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isRejectingStockEdit}
+                onClick={handleConfirmRejectStockEdit}
+              >
+                {isRejectingStockEdit ? 'Rejecting…' : 'Reject'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setRejectingStockEdit(null)}
               >
                 Cancel
               </button>

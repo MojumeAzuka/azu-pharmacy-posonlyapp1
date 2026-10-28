@@ -91,6 +91,33 @@ db.version(9).stores({
   stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced'
 });
 
+// Schema Version 10:
+//  - `stockEntryEdits` — editing a stock entry within a week of it being
+//    entered (even one already APPLIED) follows the same cashier-needs-
+//    approval shape as everything else here. A manager's edit applies
+//    immediately; a cashier's edit to their own entry sits here as
+//    PENDING until a manager approves or rejects it.
+//  - `restockDrafts` — the in-progress "building a restock entry"
+//    screen (chosen/new supplier, drugs added so far) persists across
+//    tab switches and reloads so a cashier/manager can step away to
+//    attend a customer and come back later, WITHOUT it following them
+//    onto a different account on the same device. One row per account
+//    (keyed by email), local-only — this is scratch/WIP state, never
+//    pushed to the cloud, so it doesn't follow an account across
+//    devices, only across sessions on the same device.
+db.version(10).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -1062,7 +1089,15 @@ export async function syncPendingSuppliersToCloud() {
 // its starting stock set to the quantity received. Shared by both the
 // "manager enters stock directly" path and the "manager approves a
 // cashier's pending entry" path below.
+// Returns the same item list back with every new-drug line's `drugId`
+// filled in with the id it was actually created under, so the stock
+// entry itself always ends up pointing at real drug ids once applied —
+// needed for editing an already-applied entry later (see
+// applyStockEntryEditDelta below), which has to know exactly which drug
+// each line affected.
 async function applyStockEntryToDrugs(entry) {
+  const resolvedItems = [];
+
   await db.transaction('rw', db.drugs, async () => {
     for (const item of entry.items) {
       if (item.isNewDrug) {
@@ -1086,23 +1121,42 @@ async function applyStockEntryToDrugs(entry) {
             wholesalePrice: Number(item.wholesalePrice || 0),
             stock: Number(item.quantity || 0),
             barcode: item.barcode || '',
+            halfPackQty: item.halfPackQty ?? null,
+            halfPackPrice: item.halfPackPrice ?? null,
+            packQty: item.packQty ?? null,
+            packPrice: item.packPrice ?? null,
             synced: 0
           });
         }
+        resolvedItems.push({ ...item, drugId: newId });
       } else if (item.drugId) {
         const existingDrug =
           (await db.drugs.get(String(item.drugId))) ||
           (await db.drugs.get(Number(item.drugId)));
         if (existingDrug) {
-          await db.drugs.update(existingDrug.id, {
+          // Cost, retail and wholesale price all come pre-filled from
+          // the catalog in the UI but stay editable — if the person
+          // changed them (this supplier/delivery priced it
+          // differently), the drug record picks up the new price too,
+          // not just the stock bump.
+          const updates = {
             stock: (existingDrug.stock || 0) + Number(item.quantity || 0),
-            costPrice:
-              item.costPrice !== undefined && item.costPrice !== null
-                ? Number(item.costPrice)
-                : existingDrug.costPrice,
             synced: 0
-          });
+          };
+          if (item.costPrice !== undefined && item.costPrice !== null) {
+            updates.costPrice = Number(item.costPrice);
+          }
+          if (item.retailPrice !== undefined && item.retailPrice !== null) {
+            updates.retailPrice = Number(item.retailPrice);
+          }
+          if (item.wholesalePrice !== undefined && item.wholesalePrice !== null) {
+            updates.wholesalePrice = Number(item.wholesalePrice);
+          }
+          await db.drugs.update(existingDrug.id, updates);
         }
+        resolvedItems.push(item);
+      } else {
+        resolvedItems.push(item);
       }
     }
   });
@@ -1113,7 +1167,73 @@ async function applyStockEntryToDrugs(entry) {
   if (navigator.onLine) {
     await syncPendingDrugsToCloud();
   }
+
+  return resolvedItems;
 }
+
+// Applying an EDIT to a stock entry that's already APPLIED (stock
+// already moved) can't just re-run applyStockEntryToDrugs — that would
+// double-count. Instead this works out, per line, how much the
+// quantity changed since the entry was first applied and nudges stock
+// by just that difference, and overwrites cost/retail/wholesale/pack
+// prices to whatever the edit set them to. Deliberately scoped to
+// modifying or removing lines that were already part of the entry —
+// adding a brand-new line during an edit isn't supported (that's a new
+// delivery, i.e. a new stock entry); every line in `newItems` must
+// already have a `drugId` that was in `oldItems`.
+async function applyStockEntryEditDelta(oldItems, newItems) {
+  await db.transaction('rw', db.drugs, async () => {
+    const newByDrugId = new Map(
+      newItems.filter((it) => it.drugId).map((it) => [String(it.drugId), it])
+    );
+
+    for (const oldIt of oldItems) {
+      if (!oldIt.drugId) continue;
+
+      const key = String(oldIt.drugId);
+      const newIt = newByDrugId.get(key);
+      const oldQty = Number(oldIt.quantity || 0);
+      const newQty = newIt ? Number(newIt.quantity || 0) : 0; // line removed entirely
+      const quantityDelta = newQty - oldQty;
+
+      const existingDrug =
+        (await db.drugs.get(oldIt.drugId)) || (await db.drugs.get(Number(oldIt.drugId)));
+      if (!existingDrug) continue;
+
+      const updates = { synced: 0 };
+      if (quantityDelta !== 0) {
+        updates.stock = Math.max(0, (existingDrug.stock || 0) + quantityDelta);
+      }
+      if (newIt) {
+        if (newIt.costPrice !== undefined && newIt.costPrice !== null) {
+          updates.costPrice = Number(newIt.costPrice);
+        }
+        if (newIt.retailPrice !== undefined && newIt.retailPrice !== null) {
+          updates.retailPrice = Number(newIt.retailPrice);
+        }
+        if (newIt.wholesalePrice !== undefined && newIt.wholesalePrice !== null) {
+          updates.wholesalePrice = Number(newIt.wholesalePrice);
+        }
+        if (newIt.isNewDrug) {
+          if (newIt.halfPackQty !== undefined) updates.halfPackQty = newIt.halfPackQty;
+          if (newIt.halfPackPrice !== undefined) updates.halfPackPrice = newIt.halfPackPrice;
+          if (newIt.packQty !== undefined) updates.packQty = newIt.packQty;
+          if (newIt.packPrice !== undefined) updates.packPrice = newIt.packPrice;
+        }
+      }
+
+      if (Object.keys(updates).length > 1) {
+        await db.drugs.update(existingDrug.id, updates);
+      }
+    }
+  });
+
+  if (navigator.onLine) {
+    await syncPendingDrugsToCloud();
+  }
+}
+
+const STOCK_ENTRY_EDIT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export async function createStockEntry(payload, actor) {
   try {
@@ -1142,7 +1262,13 @@ export async function createStockEntry(payload, actor) {
     await db.stockEntries.add(entry);
 
     if (status === 'APPLIED') {
-      await applyStockEntryToDrugs(entry);
+      // New-drug lines only get a real drugId once applyStockEntryToDrugs
+      // actually creates them — write that back onto both the in-memory
+      // entry (used for the cloud insert below) and the local Dexie
+      // record (already written above with unresolved items), so a
+      // later edit can tell exactly which drug each line affects.
+      entry.items = await applyStockEntryToDrugs(entry);
+      await db.stockEntries.update(entry.id, { items: entry.items });
     }
 
     if (navigator.onLine) {
@@ -1198,12 +1324,13 @@ export async function approveStockEntry(entry, actor) {
     }
 
     const target = freshLocal || entry;
-    await applyStockEntryToDrugs(target);
+    const resolvedItems = await applyStockEntryToDrugs(target);
 
     const decidedAt = new Date().toISOString();
 
     await db.stockEntries.update(entry.id, {
       status: 'APPLIED',
+      items: resolvedItems,
       decidedByEmail: actor?.email || 'unknown',
       decidedAt,
       synced: 0
@@ -1215,6 +1342,7 @@ export async function approveStockEntry(entry, actor) {
           .from('stock_entries')
           .update({
             status: 'APPLIED',
+            items: resolvedItems,
             decided_by_email: actor?.email || 'unknown',
             decided_at: decidedAt
           })
@@ -1361,6 +1489,424 @@ export async function syncPendingStockEntriesToCloud() {
     }
   } catch (err) {
     console.warn('Unable to sync pending stock entries:', err.message);
+  }
+}
+
+// Exported so App.jsx can grey out an "Edit" button for an entry once
+// it's too old, without duplicating the seven-day rule.
+export const STOCK_ENTRY_EDIT_WINDOW_DAYS = 7;
+
+// Correcting a mistake in a stock entry — wrong quantity, wrong price, a
+// line that shouldn't have been there — within a week of it being
+// entered, even one that's already APPLIED (stock already moved).
+// `newItems` is the corrected full item list (same shape as the
+// original entry's items; a line can be dropped entirely by leaving it
+// out). Who can edit what:
+//  - The entry's own creator, or any manager/administrator, can edit it
+//    (a cashier can't touch someone else's entry).
+//  - If the entry is still PENDING (nothing applied to stock yet), the
+//    edit just overwrites it in place — there's nothing live to
+//    protect, and it's still subject to the original approve/reject.
+//  - If the entry is already APPLIED, a manager/administrator's edit
+//    recalculates the stock delta and applies it immediately; a
+//    cashier's edit is recorded as a PENDING stockEntryEdits request
+//    instead, and does nothing to stock until a manager approves it.
+export async function editStockEntry(entry, newItems, actor) {
+  try {
+    const freshLocal = await db.stockEntries.get(entry.id);
+    if (!freshLocal) {
+      return { success: false, reason: 'This stock entry could not be found.' };
+    }
+
+    if (freshLocal.status === 'REJECTED') {
+      return {
+        success: false,
+        reason: 'This entry was rejected — create a new stock entry instead of editing it.'
+      };
+    }
+
+    const ageMs = Date.now() - new Date(freshLocal.createdAt).getTime();
+    if (ageMs > STOCK_ENTRY_EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000) {
+      return {
+        success: false,
+        reason: `This entry is more than ${STOCK_ENTRY_EDIT_WINDOW_DAYS} days old and can no longer be edited.`
+      };
+    }
+
+    const isOwner = freshLocal.enteredByEmail === actor?.email;
+    const isManager = actor?.role === 'manager' || actor?.role === 'administrator';
+    if (!isOwner && !isManager) {
+      return { success: false, reason: "You can only edit your own stock entries." };
+    }
+
+    const newTotalCost = newItems.reduce(
+      (sum, item) => sum + Number(item.quantity || 0) * Number(item.costPrice || 0),
+      0
+    );
+
+    if (freshLocal.status === 'PENDING') {
+      // Nothing has touched stock yet — just correct the pending
+      // request in place, whoever is editing it.
+      await db.stockEntries.update(entry.id, {
+        items: newItems,
+        totalCost: newTotalCost,
+        synced: 0
+      });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('stock_entries')
+            .update({ items: newItems, total_cost: newTotalCost })
+            .eq('id', entry.id);
+          if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud stock entry edit postponed:', err.message);
+        }
+      }
+
+      await logAuditEvent({
+        actorEmail: actor?.email,
+        actorRole: actor?.role,
+        action: 'stock_entry_edited',
+        targetType: 'stock_entry',
+        targetId: entry.id,
+        details: { supplierName: freshLocal.supplierName, totalCost: newTotalCost }
+      });
+
+      return { success: true, applied: true };
+    }
+
+    // freshLocal.status === 'APPLIED' from here on.
+    if (isManager) {
+      await applyStockEntryEditDelta(freshLocal.items, newItems);
+
+      await db.stockEntries.update(entry.id, {
+        items: newItems,
+        totalCost: newTotalCost,
+        synced: 0
+      });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('stock_entries')
+            .update({ items: newItems, total_cost: newTotalCost })
+            .eq('id', entry.id);
+          if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud stock entry edit postponed:', err.message);
+        }
+      }
+
+      await logAuditEvent({
+        actorEmail: actor?.email,
+        actorRole: actor?.role,
+        action: 'stock_entry_edited',
+        targetType: 'stock_entry',
+        targetId: entry.id,
+        details: { supplierName: freshLocal.supplierName, totalCost: newTotalCost }
+      });
+
+      return { success: true, applied: true };
+    }
+
+    // Cashier editing their own already-APPLIED entry — queue it
+    // instead of touching stock directly.
+    const editRequest = {
+      id: generateId('STOCKEDIT'),
+      stockEntryId: entry.id,
+      originalItems: freshLocal.items,
+      proposedItems: newItems,
+      proposedTotalCost: newTotalCost,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: actor?.role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.stockEntryEdits.add(editRequest);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('stock_entry_edits').insert([
+          {
+            id: editRequest.id,
+            stock_entry_id: editRequest.stockEntryId,
+            original_items: editRequest.originalItems,
+            proposed_items: editRequest.proposedItems,
+            proposed_total_cost: editRequest.proposedTotalCost,
+            status: editRequest.status,
+            requested_by: editRequest.requestedById,
+            requested_by_email: editRequest.requestedByEmail,
+            requested_by_role: editRequest.requestedByRole,
+            created_at: editRequest.createdAt,
+            decided_by_email: editRequest.decidedByEmail,
+            decided_at: editRequest.decidedAt,
+            rejection_reason: editRequest.rejectionReason
+          }
+        ]);
+        if (!error) await db.stockEntryEdits.update(editRequest.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry edit request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'stock_entry_edit_requested',
+      targetType: 'stock_entry',
+      targetId: entry.id,
+      details: { supplierName: freshLocal.supplierName, proposedTotalCost: newTotalCost }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to edit stock entry:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function approveStockEntryEdit(editRequest, actor) {
+  try {
+    const freshEdit = await db.stockEntryEdits.get(editRequest.id);
+    if (freshEdit && freshEdit.status !== 'PENDING') {
+      return { success: false, reason: 'This edit request has already been handled.' };
+    }
+    const target = freshEdit || editRequest;
+
+    const stockEntry = await db.stockEntries.get(target.stockEntryId);
+    if (!stockEntry) {
+      return { success: false, reason: 'The original stock entry could not be found.' };
+    }
+
+    await applyStockEntryEditDelta(stockEntry.items, target.proposedItems);
+
+    await db.stockEntries.update(stockEntry.id, {
+      items: target.proposedItems,
+      totalCost: target.proposedTotalCost,
+      synced: 0
+    });
+
+    const decidedAt = new Date().toISOString();
+    await db.stockEntryEdits.update(target.id, {
+      status: 'APPROVED',
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        await supabase
+          .from('stock_entries')
+          .update({ items: target.proposedItems, total_cost: target.proposedTotalCost })
+          .eq('id', stockEntry.id);
+        await db.stockEntries.update(stockEntry.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry (from edit) sync postponed:', err.message);
+      }
+      try {
+        const { error } = await supabase
+          .from('stock_entry_edits')
+          .update({
+            status: 'APPROVED',
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', target.id);
+        if (!error) await db.stockEntryEdits.update(target.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry edit approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'stock_entry_edit_approved',
+      targetType: 'stock_entry',
+      targetId: stockEntry.id,
+      details: { editRequestId: target.id, totalCost: target.proposedTotalCost }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to approve stock entry edit:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectStockEntryEdit(editRequest, reason, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+    const trimmedReason = (reason || '').trim();
+
+    await db.stockEntryEdits.update(editRequest.id, {
+      status: 'REJECTED',
+      rejectionReason: trimmedReason,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('stock_entry_edits')
+          .update({
+            status: 'REJECTED',
+            rejection_reason: trimmedReason,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', editRequest.id);
+        if (!error) await db.stockEntryEdits.update(editRequest.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud stock entry edit rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'stock_entry_edit_rejected',
+      targetType: 'stock_entry',
+      targetId: editRequest.stockEntryId,
+      details: { reason: trimmedReason }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject stock entry edit:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchCloudStockEntryEdits() {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const { data, error } = await supabase
+      .from('stock_entry_edits')
+      .select('*')
+      .gte('created_at', thirtyDaysAgo.toISOString())
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.stockEntryEdits.where('synced').equals(0).toArray()).map((e) =>
+        String(e.id)
+      )
+    );
+
+    const mapped = data
+      .filter((e) => !pendingIds.has(String(e.id)))
+      .map((e) => ({
+        id: String(e.id),
+        stockEntryId: e.stock_entry_id,
+        originalItems: e.original_items || [],
+        proposedItems: e.proposed_items || [],
+        proposedTotalCost: Number(e.proposed_total_cost || 0),
+        status: e.status,
+        requestedById: e.requested_by || null,
+        requestedByEmail: e.requested_by_email || 'unknown',
+        requestedByRole: e.requested_by_role || 'unknown',
+        createdAt: e.created_at,
+        decidedByEmail: e.decided_by_email || null,
+        decidedAt: e.decided_at || null,
+        rejectionReason: e.rejection_reason || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.stockEntryEdits.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch stock entry edits from cloud:', err.message);
+  }
+}
+
+export async function syncPendingStockEntryEditsToCloud() {
+  try {
+    const pending = await db.stockEntryEdits.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const editRequest of pending) {
+      const { error } = await supabase.from('stock_entry_edits').upsert([
+        {
+          id: editRequest.id,
+          stock_entry_id: editRequest.stockEntryId,
+          original_items: editRequest.originalItems,
+          proposed_items: editRequest.proposedItems,
+          proposed_total_cost: editRequest.proposedTotalCost,
+          status: editRequest.status,
+          requested_by: editRequest.requestedById,
+          requested_by_email: editRequest.requestedByEmail,
+          requested_by_role: editRequest.requestedByRole,
+          created_at: editRequest.createdAt,
+          decided_by_email: editRequest.decidedByEmail,
+          decided_at: editRequest.decidedAt,
+          rejection_reason: editRequest.rejectionReason
+        }
+      ]);
+      if (!error) await db.stockEntryEdits.update(editRequest.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending stock entry edits:', err.message);
+  }
+}
+
+// ============================================================
+// RESTOCK DRAFT (per-account, local-only, not synced to the cloud)
+// ------------------------------------------------------------
+// The restock screen's in-progress work — which supplier, which drugs
+// added so far — persists across tab switches and page reloads so a
+// cashier/manager can step away to attend a customer and pick back up
+// later. Keyed by the account's email so switching to a DIFFERENT
+// account on the same device never shows one person's unsaved work to
+// another. Deliberately local-only: this is scratch/WIP state, not a
+// real record, so it doesn't need a `synced` flag or a cloud table —
+// it just doesn't follow the account to a different device.
+// ============================================================
+export async function getRestockDraft(email) {
+  if (!email) return null;
+  try {
+    return (await db.restockDrafts.get(email)) || null;
+  } catch (err) {
+    console.warn('Unable to read restock draft:', err.message);
+    return null;
+  }
+}
+
+export async function saveRestockDraft(email, draftData) {
+  if (!email) return;
+  try {
+    await db.restockDrafts.put({
+      id: email,
+      ...draftData,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    console.warn('Unable to save restock draft:', err.message);
+  }
+}
+
+export async function clearRestockDraft(email) {
+  if (!email) return;
+  try {
+    await db.restockDrafts.delete(email);
+  } catch (err) {
+    console.warn('Unable to clear restock draft:', err.message);
   }
 }
 
