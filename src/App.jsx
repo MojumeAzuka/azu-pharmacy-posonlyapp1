@@ -51,7 +51,28 @@ import {
   STOCK_ENTRY_EDIT_WINDOW_DAYS,
   getRestockDraft,
   saveRestockDraft,
-  clearRestockDraft
+  clearRestockDraft,
+  updateSupplier,
+  softDeleteSupplier,
+  requestDeleteSupplier,
+  restoreSupplier,
+  permanentlyDeleteSupplier,
+  approveSupplierChangeRequest,
+  rejectSupplierChangeRequest,
+  fetchCloudSupplierChangeRequests,
+  syncPendingSupplierChangeRequestsToCloud,
+  recordSupplierPayment,
+  generatePurchaseList,
+  fetchCloudPurchaseLists,
+  syncPendingPurchaseListsToCloud,
+  savePurchaseList,
+  deletePurchaseList,
+  requestDrugEdit,
+  requestDeleteDrug,
+  approveDrugChangeRequest,
+  rejectDrugChangeRequest,
+  fetchCloudDrugChangeRequests,
+  syncPendingDrugChangeRequestsToCloud
 } from './db';
 import './App.css';
 
@@ -129,8 +150,58 @@ export default function App() {
     halfPackQty: '',
     halfPackPrice: '',
     packQty: '',
-    packPrice: ''
+    packPrice: '',
+    minStockQty: '',
+    recommendedPurchaseQty: ''
   });
+
+  // Unmissable confirm-delete modal, shared by drugs and suppliers — a
+  // deletion (soft-delete either way) never happens off a plain
+  // window.confirm() anymore. `deletingTarget` is either
+  // { kind: 'drug', item } or { kind: 'supplier', item }, or null when
+  // the modal is closed.
+  const [deletingTarget, setDeletingTarget] = useState(null);
+  const [isDeletingTarget, setIsDeletingTarget] = useState(false);
+
+  // ============================================================
+  // DRUGS & SUPPLIERS HUB — one bottom-bar entry point, with its own
+  // internal sub-tabs (same pattern as the Administrator screen's
+  // adminSection). 'restock' keeps everything that already existed here;
+  // the rest are new.
+  // ============================================================
+  const [catalogSection, setCatalogSection] = useState('restock');
+
+  // --- Suppliers CRUD ---
+  const [supplierSearchTerm, setSupplierSearchTerm] = useState('');
+  const [isSupplierModalOpen, setIsSupplierModalOpen] = useState(false);
+  const [editingSupplier, setEditingSupplier] = useState(null);
+  const [isSavingSupplierCrud, setIsSavingSupplierCrud] = useState(false);
+  const [supplierFormData, setSupplierFormData] = useState({
+    name: '',
+    contactPerson: '',
+    phone: '',
+    email: '',
+    address: ''
+  });
+
+  // --- Drugs CRUD list (separate from the ticket-builder search) ---
+  const [drugCrudSearchTerm, setDrugCrudSearchTerm] = useState('');
+
+  // --- Purchase List ---
+  const [draftPurchaseList, setDraftPurchaseList] = useState(null); // { id?, title, items: [...] }
+  const [isGeneratingPurchaseList, setIsGeneratingPurchaseList] = useState(false);
+  const [purchaseListAddDrugTerm, setPurchaseListAddDrugTerm] = useState('');
+  const [viewingSavedPurchaseListId, setViewingSavedPurchaseListId] = useState(null);
+  const [isSavingPurchaseList, setIsSavingPurchaseList] = useState(false);
+
+  // --- Stock History (separate from the "last 7 days" edit-window list
+  // and the 10-item "My Recent Stock Entries" slice already in restock) ---
+  const [stockHistorySearchTerm, setStockHistorySearchTerm] = useState('');
+
+  // --- Record-a-payment modal, for a stock entry that's not fully paid ---
+  const [recordingPaymentFor, setRecordingPaymentFor] = useState(null);
+  const [recordPaymentAmount, setRecordPaymentAmount] = useState('');
+  const [isRecordingPayment, setIsRecordingPayment] = useState(false);
 
   // ============================================================
   // SALES HISTORY
@@ -234,6 +305,10 @@ export default function App() {
   const [isSavingSupplier, setIsSavingSupplier] = useState(false);
 
   const [restockCart, setRestockCart] = useState([]);
+  // How much of this stock entry's total cost is being paid to the
+  // supplier right now — the rest becomes "owed", tracked per entry and
+  // addable to later via recordSupplierPayment.
+  const [restockAmountPaid, setRestockAmountPaid] = useState('');
   const [restockSearchTerm, setRestockSearchTerm] = useState('');
   const [showNewDrugForm, setShowNewDrugForm] = useState(false);
   const [newDrugLine, setNewDrugLine] = useState({
@@ -268,6 +343,13 @@ export default function App() {
   const [rejectingStockEdit, setRejectingStockEdit] = useState(null);
   const [stockEditRejectReason, setStockEditRejectReason] = useState('');
   const [isRejectingStockEdit, setIsRejectingStockEdit] = useState(false);
+
+  // Manager reviewing a cashier's pending drug or supplier change
+  // request (edit or delete) — { kind: 'drug' | 'supplier', request }.
+  const [rejectingChangeRequest, setRejectingChangeRequest] = useState(null);
+  const [changeRequestRejectReason, setChangeRequestRejectReason] = useState('');
+  const [isRejectingChangeRequest, setIsRejectingChangeRequest] = useState(false);
+  const [isApprovingChangeRequestId, setIsApprovingChangeRequestId] = useState(null);
 
   // Whether the restock draft saved for this account has been loaded
   // yet — guards against saving an empty draft over a real one before
@@ -593,6 +675,18 @@ export default function App() {
         fetchCloudStockEntryEdits();
       });
 
+      syncPendingSupplierChangeRequestsToCloud().then(() => {
+        fetchCloudSupplierChangeRequests();
+      });
+
+      syncPendingDrugChangeRequestsToCloud().then(() => {
+        fetchCloudDrugChangeRequests();
+      });
+
+      syncPendingPurchaseListsToCloud().then(() => {
+        fetchCloudPurchaseLists();
+      });
+
       expireStaleTickets();
 
       pruneSalesOlderThanOneYear();
@@ -689,6 +783,25 @@ export default function App() {
     return all.filter((drug) => !drug.deletedAt);
   }, [searchTerm]);
 
+  // Full active-drug list for the Drugs & Suppliers hub's own Drugs
+  // sub-tab — independent of the ticket-builder's searchTerm above, so
+  // typing in one search box doesn't affect the other screen.
+  const allActiveDrugsForCrud = useLiveQuery(async () => {
+    const all = await db.drugs.toArray();
+    return all.filter((d) => !d.deletedAt).sort((a, b) => a.name.localeCompare(b.name));
+  }, []);
+
+  const drugCrudMatches = React.useMemo(() => {
+    if (!allActiveDrugsForCrud) return [];
+    const term = drugCrudSearchTerm.toLowerCase().trim();
+    if (!term) return allActiveDrugsForCrud;
+    return allActiveDrugsForCrud.filter(
+      (d) =>
+        d.name?.toLowerCase().includes(term) ||
+        d.barcode?.toLowerCase().includes(term)
+    );
+  }, [allActiveDrugsForCrud, drugCrudSearchTerm]);
+
   // ============================================================
   // RECENTLY DELETED DRUGS (administrator only)
   // ============================================================
@@ -777,6 +890,56 @@ export default function App() {
   // ============================================================
   const suppliers = useLiveQuery(() => db.suppliers.toArray(), []);
 
+  // Active suppliers for pickers/lists; soft-deleted ones only surface
+  // in Admin → Recently Deleted, same split as drugs.
+  const activeSuppliers = React.useMemo(
+    () => (suppliers || []).filter((s) => !s.deletedAt),
+    [suppliers]
+  );
+  const deletedSuppliers = React.useMemo(
+    () => (suppliers || []).filter((s) => !!s.deletedAt),
+    [suppliers]
+  );
+
+  const allSupplierChangeRequests = useLiveQuery(
+    () => db.supplierChangeRequests.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+  const pendingSupplierChangeRequests = React.useMemo(() => {
+    if (!allSupplierChangeRequests) return [];
+    return allSupplierChangeRequests.filter((r) => r.status === 'PENDING');
+  }, [allSupplierChangeRequests]);
+
+  // Same shape, for a cashier's drug edit/delete requests.
+  const allDrugChangeRequests = useLiveQuery(
+    () => db.drugChangeRequests.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+  const pendingDrugChangeRequests = React.useMemo(() => {
+    if (!allDrugChangeRequests) return [];
+    return allDrugChangeRequests.filter((r) => r.status === 'PENDING');
+  }, [allDrugChangeRequests]);
+
+  // `updatedAt` isn't part of the Dexie index for this table (only id /
+  // createdByEmail / createdAt / synced are), so ordering has to happen
+  // in JS after the fetch rather than via .orderBy('updatedAt'), which
+  // would throw ("not indexed") the moment this table has rows.
+  const allPurchaseLists = useLiveQuery(async () => {
+    const all = await db.purchaseLists.toArray();
+    return all.sort(
+      (a, b) =>
+        new Date(b.updatedAt || b.createdAt) -
+        new Date(a.updatedAt || a.createdAt)
+    );
+  }, []);
+  const myPurchaseLists = React.useMemo(() => {
+    if (!allPurchaseLists || !session) return [];
+    if (hasRole(userRole, 'manager')) return allPurchaseLists;
+    return allPurchaseLists.filter(
+      (p) => p.createdByEmail === session.user.email
+    );
+  }, [allPurchaseLists, session, userRole]);
+
   const allStockEntries = useLiveQuery(
     () => db.stockEntries.orderBy('createdAt').reverse().toArray(),
     []
@@ -834,6 +997,21 @@ export default function App() {
     pendingStockEntryEdits.forEach((e) => map.set(String(e.stockEntryId), e));
     return map;
   }, [pendingStockEntryEdits]);
+
+  // Same idea for a drug/supplier already sitting in a pending change
+  // request — a row shows "awaiting approval" instead of another
+  // Edit/Delete button stacking on top of it.
+  const pendingDrugChangeByDrugId = React.useMemo(() => {
+    const map = new Map();
+    pendingDrugChangeRequests.forEach((r) => map.set(String(r.drugId), r));
+    return map;
+  }, [pendingDrugChangeRequests]);
+
+  const pendingSupplierChangeBySupplierId = React.useMemo(() => {
+    const map = new Map();
+    pendingSupplierChangeRequests.forEach((r) => map.set(String(r.supplierId), r));
+    return map;
+  }, [pendingSupplierChangeRequests]);
 
   // ============================================================
   // REVERSAL REQUESTS (cashier-initiated reversal, pending manager sign-off)
@@ -1508,12 +1686,26 @@ export default function App() {
     const draft = ticketDrafts.find((d) => d.id === draftId);
     if (!draft || draft.items.length === 0) return;
 
+    // Defense in depth, separate from whatever fixed the root cause: a
+    // cart whose total came out to ₦0 or less never reaches the cashier
+    // — someone would end up approving a "payment" of nothing and
+    // printing a real receipt for it. If this ever fires, something
+    // upstream computed a price wrong; better to block the ticket here
+    // than let a free sale through.
+    const total = draftTotal(draft);
+    if (total <= 0) {
+      alert(
+        `This ticket's total came out to ₦${total.toLocaleString()}, which can't be right. Check that every item has a real retail/wholesale price before sending it to the cashier.`
+      );
+      return;
+    }
+
     setIsSubmittingTicket(true);
 
     try {
       const ticketPayload = {
         items: slimCartItems(draft.items),
-        total: draftTotal(draft),
+        total,
         saleType: draft.saleType,
         customerName: draft.customerName.trim() || 'Walk-in Customer',
         customerPhone: draft.customerPhone.trim() || 'N/A',
@@ -1558,6 +1750,17 @@ export default function App() {
 
   const handleConfirmApproval = async () => {
     if (!approvingTicket) return;
+
+    // Same defense-in-depth as the submit side: a ticket that somehow
+    // made it into the queue with a ₦0 (or negative) total gets refused
+    // here too, rather than letting a cashier approve "payment" of
+    // nothing and hand out a real receipt for it.
+    if (!approvingTicket.total || approvingTicket.total <= 0) {
+      alert(
+        `This ticket's total is ₦${(approvingTicket.total || 0).toLocaleString()}, which can't be approved. Send it back to the attendant to fix the pricing instead.`
+      );
+      return;
+    }
 
     const cash = Number(paymentCash) || 0;
     const bank = Number(paymentBank) || 0;
@@ -1666,13 +1869,59 @@ export default function App() {
   // below knows to call resubmitTicket (same ticket id/daily number)
   // instead of createTicket (a brand-new one).
   const handleReopenSentBackTicket = (ticket) => {
+    // A ticket already reopened into a draft shouldn't get a second,
+    // duplicate draft from clicking "Reopen & Edit" again — that left
+    // two drafts racing to resubmit the same ticket. Just bring the
+    // existing one into focus instead.
+    const existingDraft = ticketDrafts.find((d) => d.resubmitOf === ticket.id);
+    if (existingDraft) {
+      setActiveDraftId(existingDraft.id);
+      return;
+    }
+
     const draftId = `draft-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    // A ticket's own items are a SLIMMED snapshot (id/name/unitType/
+    // quantity/activePrice/lineTotal only — see slimCartItems below) with
+    // no retailPrice/wholesalePrice/pack fields on them at all. Re-hydrate
+    // each line from the live catalog by id so retail/wholesale toggling
+    // on the reopened draft has real numbers to compute from — this is
+    // exactly what was making every price collapse to ₦0 the instant the
+    // toggle was touched: setDraftSaleType reads item.retailPrice /
+    // item.wholesalePrice, both undefined on a bare snapshot, so it fell
+    // back to 0 for whichever one wasn't already showing.
+    const rehydratedItems = (ticket.items || []).map((snapshotItem) => {
+      const liveDrug = (drugs || []).find(
+        (d) => String(d.id) === String(snapshotItem.id)
+      );
+
+      if (liveDrug) {
+        return {
+          ...liveDrug,
+          quantity: snapshotItem.quantity,
+          activePrice:
+            ticket.saleType === 'wholesale'
+              ? Number(liveDrug.wholesalePrice ?? 0)
+              : Number(liveDrug.retailPrice ?? 0)
+        };
+      }
+
+      // The drug was deleted from the catalog since this ticket was
+      // built — keep the snapshot, but carry its last known price into
+      // BOTH retail/wholesale slots so toggling still shows a real
+      // number instead of zeroing out.
+      return {
+        ...snapshotItem,
+        retailPrice: snapshotItem.activePrice || 0,
+        wholesalePrice: snapshotItem.activePrice || 0
+      };
+    });
 
     setTicketDrafts((prev) => [
       ...prev,
       {
         id: draftId,
-        items: (ticket.items || []).map((item) => ({ ...item })),
+        items: rehydratedItems,
         customerName: ticket.customerName || `Customer ${nextDraftLetter()}`,
         customerPhone: ticket.customerPhone || '',
         saleType: ticket.saleType || 'retail',
@@ -1681,6 +1930,25 @@ export default function App() {
     ]);
 
     setActiveDraftId(draftId);
+  };
+
+  // "Discard" on a sent-back ticket: the attendant decides the ticket
+  // shouldn't come back at all (customer left, duplicate, etc.) rather
+  // than reopening it — cancels it outright, same as cancelling any
+  // other ticket.
+  const handleDiscardSentBackTicket = async (ticket) => {
+    if (
+      !window.confirm(
+        `Discard this ₦${ticket.total.toLocaleString()} ticket for ${ticket.customerName}? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+
+    await cancelTicket(ticket, {
+      email: session?.user?.email,
+      role: userRole
+    });
   };
 
   // ============================================================
@@ -1709,6 +1977,212 @@ export default function App() {
     } finally {
       setIsSavingSupplier(false);
     }
+  };
+
+  // ============================================================
+  // SUPPLIERS CRUD (the standalone Suppliers sub-tab — separate from
+  // the inline "new supplier while restocking" form above, though both
+  // ultimately write to the same `suppliers` table via the same db.js
+  // functions).
+  // ============================================================
+  const handleOpenAddSupplierModal = () => {
+    setEditingSupplier(null);
+    setSupplierFormData({ name: '', contactPerson: '', phone: '', email: '', address: '' });
+    setIsSupplierModalOpen(true);
+  };
+
+  const handleOpenEditSupplierModal = (supplier) => {
+    setEditingSupplier(supplier);
+    setSupplierFormData({
+      name: supplier.name || '',
+      contactPerson: supplier.contactPerson || supplier.contact_person || '',
+      phone: supplier.phone || '',
+      email: supplier.email || '',
+      address: supplier.address || ''
+    });
+    setIsSupplierModalOpen(true);
+  };
+
+  const handleSaveSupplier = async (e) => {
+    e.preventDefault();
+    if (!supplierFormData.name.trim()) {
+      alert("Enter the supplier's name.");
+      return;
+    }
+    setIsSavingSupplierCrud(true);
+    try {
+      const actor = { email: session?.user?.email, role: userRole };
+      if (editingSupplier) {
+        const result = await updateSupplier(editingSupplier, supplierFormData, actor);
+        setIsSupplierModalOpen(false);
+        if (result && result.pending) {
+          alert(
+            `Your changes to "${supplierFormData.name}" have been sent to a manager for approval.`
+          );
+        } else if (result && result.success === false) {
+          alert(result.reason || 'Unable to save this supplier.');
+        }
+      } else {
+        await addSupplier(supplierFormData, actor);
+        setIsSupplierModalOpen(false);
+      }
+    } finally {
+      setIsSavingSupplierCrud(false);
+    }
+  };
+
+  // Called by the confirm-delete modal's "Delete" button, for a target
+  // of kind 'supplier'.
+  const handleConfirmDeleteSupplier = async (supplier) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    const result = await requestDeleteSupplier(supplier, actor);
+    if (result && result.success === false) {
+      alert(result.reason || 'Unable to delete this supplier.');
+      return;
+    }
+    if (result && result.pending) {
+      alert(
+        `"${supplier.name}" won't be deleted until a manager approves it — it's been sent to them for review.`
+      );
+    }
+  };
+
+  // ============================================================
+  // AUTOMATED PURCHASE LIST (scans stock, flags what's finished or
+  // below minStockQty, recommends a supplier per drug based on
+  // purchase history). The generated list lives in `draftPurchaseList`
+  // as a working copy — nothing is saved until "Save List" is clicked.
+  // Each line carries its own `unitCost` (seeded from the drug's
+  // current cost price, editable) so a total can be shown without the
+  // saved list depending on the catalog never changing underneath it.
+  // ============================================================
+  const handleGeneratePurchaseList = async () => {
+    setIsGeneratingPurchaseList(true);
+    try {
+      const { items } = await generatePurchaseList();
+      const enrichedItems = items.map((item) => {
+        const liveDrug = (drugs || []).find((d) => String(d.id) === String(item.drugId));
+        return {
+          ...item,
+          unitCost: Number(liveDrug?.costPrice ?? 0)
+        };
+      });
+      setDraftPurchaseList({
+        id: null,
+        title: `Purchase List — ${new Date().toLocaleDateString()}`,
+        items: enrichedItems,
+        createdById: null,
+        createdByEmail: null,
+        createdAt: null
+      });
+      setViewingSavedPurchaseListId(null);
+    } finally {
+      setIsGeneratingPurchaseList(false);
+    }
+  };
+
+  const handleOpenSavedPurchaseList = (list) => {
+    setDraftPurchaseList({
+      id: list.id,
+      title: list.title,
+      items: (list.items || []).map((item) => ({ ...item })),
+      createdById: list.createdById,
+      createdByEmail: list.createdByEmail,
+      createdAt: list.createdAt
+    });
+    setViewingSavedPurchaseListId(list.id);
+  };
+
+  const handleCloseDraftPurchaseList = () => {
+    setDraftPurchaseList(null);
+    setViewingSavedPurchaseListId(null);
+    setPurchaseListAddDrugTerm('');
+  };
+
+  // Any drug not already on the list can be added by hand — covers
+  // "other drugs that are not finished or not below the recommended
+  // minimum quantity should also be able to be added to the list."
+  const handleAddDrugToPurchaseList = (drug) => {
+    if (!draftPurchaseList) return;
+    const already = draftPurchaseList.items.some(
+      (item) => String(item.drugId) === String(drug.id)
+    );
+    if (already) {
+      setPurchaseListAddDrugTerm('');
+      return;
+    }
+    const newItem = {
+      drugId: drug.id,
+      drugName: drug.name,
+      unitType: drug.unitType,
+      currentStock: Number(drug.stock || 0),
+      minStockQty: drug.minStockQty ?? null,
+      quantity: Math.max(1, Math.round(Number(drug.recommendedPurchaseQty) || 10)),
+      supplierId: null,
+      supplierName: null,
+      unitCost: Number(drug.costPrice ?? 0)
+    };
+    setDraftPurchaseList({
+      ...draftPurchaseList,
+      items: [...draftPurchaseList.items, newItem]
+    });
+    setPurchaseListAddDrugTerm('');
+  };
+
+  const handleUpdatePurchaseListItem = (drugId, changes) => {
+    if (!draftPurchaseList) return;
+    setDraftPurchaseList({
+      ...draftPurchaseList,
+      items: draftPurchaseList.items.map((item) =>
+        String(item.drugId) === String(drugId) ? { ...item, ...changes } : item
+      )
+    });
+  };
+
+  const handleRemovePurchaseListItem = (drugId) => {
+    if (!draftPurchaseList) return;
+    setDraftPurchaseList({
+      ...draftPurchaseList,
+      items: draftPurchaseList.items.filter(
+        (item) => String(item.drugId) !== String(drugId)
+      )
+    });
+  };
+
+  const handleSaveDraftPurchaseList = async () => {
+    if (!draftPurchaseList) return;
+    setIsSavingPurchaseList(true);
+    try {
+      const actor = { email: session?.user?.email, role: userRole };
+      const result = await savePurchaseList(draftPurchaseList, actor);
+      if (result.success) {
+        setDraftPurchaseList({
+          ...draftPurchaseList,
+          id: result.list.id,
+          createdById: result.list.createdById,
+          createdByEmail: result.list.createdByEmail,
+          createdAt: result.list.createdAt
+        });
+        setViewingSavedPurchaseListId(result.list.id);
+      } else {
+        alert(result.reason || 'Unable to save this purchase list.');
+      }
+    } finally {
+      setIsSavingPurchaseList(false);
+    }
+  };
+
+  const handleDeleteSavedPurchaseList = async (list) => {
+    if (!window.confirm(`Delete "${list.title}"? This can't be undone.`)) return;
+    const actor = { email: session?.user?.email, role: userRole };
+    await deletePurchaseList(list.id, actor);
+    if (viewingSavedPurchaseListId === list.id) {
+      handleCloseDraftPurchaseList();
+    }
+  };
+
+  const handlePrintPurchaseList = () => {
+    window.print();
   };
 
   // Adding a drug already in the catalog to the restock cart — cost
@@ -1880,7 +2354,11 @@ export default function App() {
             packQty: item.isNewDrug ? item.packQty ?? null : undefined,
             packPrice: item.isNewDrug ? item.packPrice ?? null : undefined
           })),
-          totalCost: restockTotalCost
+          totalCost: restockTotalCost,
+          amountPaid: Math.min(
+            Number(restockAmountPaid) || 0,
+            restockTotalCost
+          )
         },
         { id: session?.user?.id, email: session?.user?.email, role: userRole }
       );
@@ -1893,6 +2371,7 @@ export default function App() {
             : `Sent to a manager for approval — ${restockCart.length} line item(s) from ${selectedSupplier.name}.`
         );
         setRestockCart([]);
+        setRestockAmountPaid('');
         setRestockSupplierId('');
         // The draft this was built from is now a real submitted entry —
         // nothing left to resume, so clear it rather than leaving a
@@ -1905,6 +2384,30 @@ export default function App() {
       }
     } finally {
       setIsSubmittingStockEntry(false);
+    }
+  };
+
+  const handleConfirmRecordPayment = async () => {
+    if (!recordingPaymentFor) return;
+    const amount = Number(recordPaymentAmount) || 0;
+    if (amount <= 0) {
+      alert('Enter an amount greater than 0.');
+      return;
+    }
+    setIsRecordingPayment(true);
+    try {
+      const result = await recordSupplierPayment(recordingPaymentFor, amount, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      if (result.success) {
+        setRecordingPaymentFor(null);
+        setRecordPaymentAmount('');
+      } else {
+        alert(result.reason || 'Unable to record this payment.');
+      }
+    } finally {
+      setIsRecordingPayment(false);
     }
   };
 
@@ -2093,6 +2596,56 @@ export default function App() {
       }
     } finally {
       setIsRejectingStockEdit(false);
+    }
+  };
+
+  // ============================================================
+  // MANAGER: APPROVE/REJECT A DRUG OR SUPPLIER CHANGE REQUEST
+  // (a cashier's edit/delete of a drug or supplier, queued for sign-off)
+  // ============================================================
+  const handleApproveChangeRequest = async (kind, request) => {
+    setIsApprovingChangeRequestId(request.id);
+    try {
+      const actor = { email: session?.user?.email, role: userRole };
+      const result =
+        kind === 'drug'
+          ? await approveDrugChangeRequest(request, actor)
+          : await approveSupplierChangeRequest(request, actor);
+      if (!result.success) {
+        alert(result.reason || 'Unable to approve this request.');
+      }
+    } finally {
+      setIsApprovingChangeRequestId(null);
+    }
+  };
+
+  const handleOpenRejectChangeRequest = (kind, request) => {
+    setRejectingChangeRequest({ kind, request });
+    setChangeRequestRejectReason('');
+  };
+
+  const handleConfirmRejectChangeRequest = async () => {
+    if (!rejectingChangeRequest) return;
+    if (!changeRequestRejectReason.trim()) {
+      alert('Enter a short reason so the person who requested it knows why.');
+      return;
+    }
+    setIsRejectingChangeRequest(true);
+    try {
+      const actor = { email: session?.user?.email, role: userRole };
+      const { kind, request } = rejectingChangeRequest;
+      const result =
+        kind === 'drug'
+          ? await rejectDrugChangeRequest(request, changeRequestRejectReason, actor)
+          : await rejectSupplierChangeRequest(request, changeRequestRejectReason, actor);
+      if (result.success) {
+        setRejectingChangeRequest(null);
+        setChangeRequestRejectReason('');
+      } else {
+        alert(result.reason || 'Unable to reject this request.');
+      }
+    } finally {
+      setIsRejectingChangeRequest(false);
     }
   };
 
@@ -2291,14 +2844,16 @@ export default function App() {
       halfPackQty: '',
       halfPackPrice: '',
       packQty: '',
-      packPrice: ''
+      packPrice: '',
+      minStockQty: '',
+      recommendedPurchaseQty: ''
     });
 
     setIsModalOpen(true);
   };
 
   const handleOpenEditModal = (drug, e) => {
-    e.stopPropagation();
+    if (e) e.stopPropagation();
 
     setEditingDrug(drug);
 
@@ -2337,6 +2892,14 @@ export default function App() {
       packPrice:
         drug.packPrice ??
         drug.pack_price ??
+        '',
+      minStockQty:
+        drug.minStockQty ??
+        drug.min_stock_qty ??
+        '',
+      recommendedPurchaseQty:
+        drug.recommendedPurchaseQty ??
+        drug.recommended_purchase_qty ??
         ''
     });
 
@@ -2345,19 +2908,32 @@ export default function App() {
 
   // A manager's delete is now a SOFT delete — the drug moves to the
   // administrator's "Recently Deleted" list instead of disappearing
-  // for good. Only an administrator can remove it permanently.
+  // for good. Only an administrator can remove it permanently. This is
+  // now called only after the unmissable confirm-delete modal confirms
+  // (see confirmDeleteTarget), and for a cashier it goes through
+  // requestDeleteDrug so it needs a manager's approval first instead of
+  // disappearing immediately.
   const handleDeleteDrug = async (id, e) => {
-    e.stopPropagation();
+    if (e) e.stopPropagation();
+    const drug = drugs.find((d) => String(d.id) === String(id));
+    if (!drug) return;
+    setDeletingTarget({ kind: 'drug', item: drug });
+  };
 
-    if (
-      window.confirm(
-        'Move this drug to Recently Deleted? An administrator can restore it or remove it permanently later.'
-      )
-    ) {
-      await softDeleteDrug(id, {
-        email: session?.user?.email,
-        role: userRole
-      });
+  // Called by the confirm-delete modal's "Delete" button, for a target
+  // of kind 'drug'. Soft-deletes directly for a manager/administrator;
+  // for a cashier, queues it as a pending drugChangeRequests row instead.
+  const handleConfirmDeleteDrug = async (drug) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    const result = await requestDeleteDrug(drug, actor);
+    if (!result.success) {
+      alert(result.reason || 'Unable to delete this drug.');
+      return;
+    }
+    if (result.pending) {
+      alert(
+        `"${drug.name}" won't be deleted until a manager approves it — it's been sent to them for review.`
+      );
     }
   };
 
@@ -2382,7 +2958,9 @@ export default function App() {
       half_pack_qty: drugPayload.halfPackQty,
       half_pack_price: drugPayload.halfPackPrice,
       pack_qty: drugPayload.packQty,
-      pack_price: drugPayload.packPrice
+      pack_price: drugPayload.packPrice,
+      min_stock_qty: drugPayload.minStockQty ?? null,
+      recommended_purchase_qty: drugPayload.recommendedPurchaseQty ?? null
     };
 
     const { error: upsertError } = await supabase
@@ -2473,8 +3051,35 @@ export default function App() {
         halfPackPrice: optionalNumber(formData.halfPackPrice),
         packQty: optionalNumber(formData.packQty),
         packPrice: optionalNumber(formData.packPrice),
+        minStockQty: optionalNumber(formData.minStockQty),
+        recommendedPurchaseQty: optionalNumber(formData.recommendedPurchaseQty),
         synced: 0
       };
+
+      const wasEditing = Boolean(editingDrug);
+      const isCashierEditing = wasEditing && userRole === 'cashier';
+
+      // A cashier editing an EXISTING drug needs a manager's approval —
+      // same cashier-needs-approval shape as suppliers, stock entries,
+      // etc. Nothing in the catalog changes until it's approved.
+      // Creating a brand-new drug stays unrestricted for either role.
+      if (isCashierEditing) {
+        const { synced, id, ...changes } = drugPayload;
+        const result = await requestDrugEdit(
+          editingDrug,
+          changes,
+          { email: session?.user?.email, role: userRole }
+        );
+        setIsModalOpen(false);
+        if (!result.success) {
+          alert(result.reason || 'Unable to submit this edit.');
+        } else if (result.pending) {
+          alert(
+            `Your changes to "${trimmedName}" have been sent to a manager for approval — nothing in the catalog has changed yet.`
+          );
+        }
+        return;
+      }
 
       if (editingDrug) {
         await db.drugs.update(editingDrug.id, drugPayload);
@@ -2486,7 +3091,6 @@ export default function App() {
       // of making the user wait on the network. This also removes the
       // Save button from the screen, so there's nothing left to
       // double-click even if someone tries.
-      const wasEditing = Boolean(editingDrug);
       setIsModalOpen(false);
 
       if (isOnline) {
@@ -2761,29 +3365,12 @@ export default function App() {
               </button>
             )}
 
-            {/* Restocking from a supplier — cashier or manager only,
-                same two roles the approval Queue uses. A manager's own
-                entry applies right away; a cashier's waits here for a
-                manager to approve it, so the badge counts THEIR pending
-                entries for a manager, and just shows they have one
-                outstanding for a cashier. */}
-            {canUseRestock && (
-              <button
-                className={
-                  activeTab === 'restock'
-                    ? 'active-tab'
-                    : ''
-                }
-                onClick={() => setActiveTab('restock')}
-              >
-                📦 Restock
-                {canApproveStockEntries && pendingStockEntries.length > 0 && (
-                  <span className="nav-badge">
-                    {pendingStockEntries.length > 9 ? '9+' : pendingStockEntries.length}
-                  </span>
-                )}
-              </button>
-            )}
+            {/* "Restock" as its own top-nav button, and the "+ Add Drug"
+                button below, have both moved into the single "Drugs &
+                Suppliers" bottom bar (see just after this header) — one
+                entry point for everything catalog/supplier-related
+                instead of two separate top-nav slots competing for
+                space with POS/History/Queue. */}
 
             {hasRole(userRole, 'administrator') && (
               <button
@@ -2809,21 +3396,47 @@ export default function App() {
               compact Retail/Wholesale toggle (different customers can be
               on different price tiers at once), and keeping both was
               just wasted vertical space pushing the cart off-screen. */}
-
-          {activeTab === 'pos' &&
-            hasRole(userRole, 'manager') && (
-              <button
-                className="add-drug-btn"
-                onClick={
-                  handleOpenAddModal
-                }
-              >
-                + Add Drug
-              </button>
-            )}
         </div>
 
       </header>
+
+      {/* ========================================================
+          DRUGS & SUPPLIERS — bottom bar, not top nav.
+          Everything catalog/supplier-related (drug CRUD, supplier CRUD,
+          restocking from a supplier, the purchase list, stock history)
+          lives behind this one entry point now, instead of a separate
+          "Restock" tab and a separate "+ Add Drug" button both fighting
+          the top nav for room. Cashier/manager only — the two roles that
+          actually touch any of this.
+      ======================================================== */}
+      {canUseRestock && (
+        <div className="bottom-bar no-print">
+          <button
+            className={`bottom-bar-btn ${activeTab === 'catalog' ? 'active-tab' : ''}`}
+            onClick={() => setActiveTab('catalog')}
+          >
+            📦 Drugs &amp; Suppliers
+            {canApproveStockEntries &&
+              (pendingStockEntries.length > 0 ||
+                pendingStockEntryEdits.length > 0 ||
+                pendingSupplierChangeRequests.length > 0 ||
+                pendingDrugChangeRequests.length > 0) && (
+                <span className="nav-badge">
+                  {pendingStockEntries.length +
+                    pendingStockEntryEdits.length +
+                    pendingSupplierChangeRequests.length +
+                    pendingDrugChangeRequests.length >
+                  9
+                    ? '9+'
+                    : pendingStockEntries.length +
+                      pendingStockEntryEdits.length +
+                      pendingSupplierChangeRequests.length +
+                      pendingDrugChangeRequests.length}
+                </span>
+              )}
+          </button>
+        </div>
+      )}
 
       {/* ========================================================
           POS TERMINAL
@@ -2859,13 +3472,28 @@ export default function App() {
                         </div>
                       )}
                     </div>
-                    <button
-                      type="button"
-                      className="restore-btn"
-                      onClick={() => handleReopenSentBackTicket(t)}
-                    >
-                      ✎ Reopen & Edit
-                    </button>
+                    {ticketDrafts.some((d) => d.resubmitOf === t.id) ? (
+                      <span className="sent-back-already-open">
+                        Open in "{t.customerName}" draft above
+                      </span>
+                    ) : (
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          onClick={() => handleReopenSentBackTicket(t)}
+                        >
+                          ✎ Reopen & Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => handleDiscardSentBackTicket(t)}
+                        >
+                          ✕ Discard
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -2961,24 +3589,12 @@ export default function App() {
                               </small>{' '}
                               ₦{price.toLocaleString()}
                             </div>
-
-                            {hasRole(userRole, 'manager') && (
-                              <div className="manager-actions">
-                                <button
-                                  onClick={(e) => handleOpenEditModal(drug, e)}
-                                >
-                                  ✏️ Edit
-                                </button>
-
-                                <button
-                                  onClick={(e) => handleDeleteDrug(drug.id, e)}
-                                  className="del-btn"
-                                  title="Move to Recently Deleted"
-                                >
-                                  🗑️
-                                </button>
-                              </div>
-                            )}
+                            {/* Edit/Delete removed from here — a drug is now
+                                only ever edited or deleted from the Drugs &
+                                Suppliers hub, where a soft-delete always goes
+                                through an unmissable confirm step instead of
+                                being one accidental click away while building
+                                a customer's cart. */}
                           </div>
                         </div>
                       );
@@ -3511,9 +4127,58 @@ export default function App() {
       )}
 
       {/* ========================================================
-          RESTOCK FROM SUPPLIER (cashier or manager)
+          DRUGS & SUPPLIERS HUB (cashier or manager) — one entry point,
+          five internal sub-tabs. 'restock' is everything that already
+          existed here; drugs/suppliers/purchaselist/history are new.
       ======================================================== */}
-      {activeTab === 'restock' && canUseRestock && (
+      {activeTab === 'catalog' && canUseRestock && (
+        <div className="admin-section-nav no-print">
+          <button
+            className={catalogSection === 'restock' ? 'active' : ''}
+            onClick={() => setCatalogSection('restock')}
+          >
+            🚚 Restock
+            {canApproveStockEntries &&
+              pendingStockEntries.length + pendingStockEntryEdits.length > 0 && (
+                <span className="nav-badge">
+                  {pendingStockEntries.length + pendingStockEntryEdits.length}
+                </span>
+              )}
+          </button>
+          <button
+            className={catalogSection === 'drugs' ? 'active' : ''}
+            onClick={() => setCatalogSection('drugs')}
+          >
+            💊 Drugs
+            {canApproveStockEntries && pendingDrugChangeRequests.length > 0 && (
+              <span className="nav-badge">{pendingDrugChangeRequests.length}</span>
+            )}
+          </button>
+          <button
+            className={catalogSection === 'suppliers' ? 'active' : ''}
+            onClick={() => setCatalogSection('suppliers')}
+          >
+            🏭 Suppliers
+            {canApproveStockEntries && pendingSupplierChangeRequests.length > 0 && (
+              <span className="nav-badge">{pendingSupplierChangeRequests.length}</span>
+            )}
+          </button>
+          <button
+            className={catalogSection === 'purchaselist' ? 'active' : ''}
+            onClick={() => setCatalogSection('purchaselist')}
+          >
+            🧾 Purchase List
+          </button>
+          <button
+            className={catalogSection === 'history' ? 'active' : ''}
+            onClick={() => setCatalogSection('history')}
+          >
+            📜 Stock History
+          </button>
+        </div>
+      )}
+
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'restock' && (
         <div className="tickets-screen no-print">
 
           {canApproveStockEntries && pendingStockEntries.length > 0 && (
@@ -4132,6 +4797,26 @@ export default function App() {
                   <div className="cart-total">
                     Total Cost: ₦{restockTotalCost.toLocaleString()}
                   </div>
+
+                  <label className="amount-paid-field">
+                    Amount Paid Now (₦):
+                    <input
+                      type="number"
+                      min="0"
+                      max={restockTotalCost}
+                      placeholder="0"
+                      value={restockAmountPaid}
+                      onChange={(e) => setRestockAmountPaid(e.target.value)}
+                    />
+                  </label>
+                  <div className="deleted-drug-meta">
+                    Owed to supplier: ₦
+                    {Math.max(
+                      0,
+                      restockTotalCost - (Number(restockAmountPaid) || 0)
+                    ).toLocaleString()}
+                  </div>
+
                   <button
                     type="button"
                     className="checkout-btn"
@@ -4165,6 +4850,17 @@ export default function App() {
                           {entry.items.length} item(s) · ₦
                           {entry.totalCost.toLocaleString()}
                         </div>
+                        {entry.status === 'APPLIED' && (
+                          <div className="deleted-drug-meta">
+                            Paid: ₦{Number(entry.amountPaid || 0).toLocaleString()}
+                            {' · '}
+                            Owed: ₦
+                            {Math.max(
+                              0,
+                              entry.totalCost - Number(entry.amountPaid || 0)
+                            ).toLocaleString()}
+                          </div>
+                        )}
                         {entry.status === 'REJECTED' && entry.rejectionReason && (
                           <div className="sent-back-reason">
                             Rejected: "{entry.rejectionReason}"
@@ -4177,6 +4873,18 @@ export default function App() {
                         )}
                       </div>
                       <div className="deleted-drug-actions">
+                        {entry.status === 'APPLIED' &&
+                          entry.totalCost - Number(entry.amountPaid || 0) > 0 && (
+                            <button
+                              className="restore-btn"
+                              onClick={() => {
+                                setRecordingPaymentFor(entry);
+                                setRecordPaymentAmount('');
+                              }}
+                            >
+                              💳 Record Payment
+                            </button>
+                          )}
                         {isStockEntryEditable(entry) && !pendingEdit && (
                           <button
                             className="send-back-btn"
@@ -4252,6 +4960,564 @@ export default function App() {
             </section>
           )}
 
+        </div>
+      )}
+
+      {/* ========================================================
+          DRUGS SUB-TAB
+      ======================================================== */}
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'drugs' && (
+        <div className="tickets-screen no-print">
+
+          {canApproveStockEntries && pendingDrugChangeRequests.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Drug Changes Awaiting Approval</h3>
+                <span className="admin-section-sub">
+                  Requested by a cashier — nothing in the catalog changes
+                  until you approve or reject each one.
+                </span>
+              </div>
+              <div className="ticket-list">
+                {pendingDrugChangeRequests.map((request) => {
+                  const liveDrug = (drugs || []).find(
+                    (d) => String(d.id) === String(request.drugId)
+                  );
+                  return (
+                    <div key={request.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>
+                          {request.type === 'DELETE' ? 'Delete' : 'Edit'}:{' '}
+                          {request.proposedChanges?.name || liveDrug?.name || 'Unknown drug'}
+                        </strong>
+                        <div className="deleted-drug-meta">
+                          Requested by {request.requestedByEmail}
+                        </div>
+                      </div>
+                      {request.type === 'EDIT' && request.proposedChanges && (
+                        <ul className="ticket-row-items">
+                          <li>
+                            Retail ₦{Number(request.proposedChanges.retailPrice || 0).toLocaleString()}
+                            {' · '}Wholesale ₦{Number(request.proposedChanges.wholesalePrice || 0).toLocaleString()}
+                            {' · '}Stock {request.proposedChanges.stock ?? 0}
+                          </li>
+                        </ul>
+                      )}
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          disabled={isApprovingChangeRequestId === request.id}
+                          onClick={() => handleApproveChangeRequest('drug', request)}
+                        >
+                          {isApprovingChangeRequestId === request.id ? 'Approving…' : '✓ Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => handleOpenRejectChangeRequest('drug', request)}
+                        >
+                          ✕ Reject
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Drugs</h3>
+              <span className="admin-section-sub">
+                Create, edit or delete catalog drugs here — not from the
+                sales cart.
+              </span>
+            </div>
+
+            <div className="catalog-crud-toolbar">
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search drugs..."
+                value={drugCrudSearchTerm}
+                onChange={(e) => setDrugCrudSearchTerm(e.target.value)}
+              />
+              <button type="button" className="restore-btn" onClick={handleOpenAddModal}>
+                + Add Drug
+              </button>
+            </div>
+
+            <div className="ticket-list">
+              {(drugs || [])
+                .filter((d) =>
+                  d.name.toLowerCase().includes(drugCrudSearchTerm.trim().toLowerCase())
+                )
+                .map((drug) => {
+                  const pendingReq = pendingDrugChangeRequests.find(
+                    (r) => String(r.drugId) === String(drug.id)
+                  );
+                  return (
+                    <div key={drug.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>{drug.name}</strong>
+                        <div className="deleted-drug-meta">
+                          Stock {drug.stock ?? 0} {drug.unitType} · Retail ₦
+                          {Number(drug.retailPrice || 0).toLocaleString()} · Wholesale ₦
+                          {Number(drug.wholesalePrice || 0).toLocaleString()}
+                          {drug.minStockQty != null && <> · Min {drug.minStockQty}</>}
+                        </div>
+                        {pendingReq && (
+                          <div className="sent-back-reason">
+                            A {pendingReq.type === 'DELETE' ? 'deletion' : 'change'} is
+                            awaiting manager approval.
+                          </div>
+                        )}
+                      </div>
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="send-back-btn"
+                          onClick={(e) => handleOpenEditModal(drug, e)}
+                        >
+                          ✎ Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={(e) => handleDeleteDrug(drug.id, e)}
+                        >
+                          🗑 Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              {(drugs || []).filter((d) =>
+                d.name.toLowerCase().includes(drugCrudSearchTerm.trim().toLowerCase())
+              ).length === 0 && <p className="admin-section-sub">No drugs match.</p>}
+            </div>
+          </section>
+
+        </div>
+      )}
+
+      {/* ========================================================
+          SUPPLIERS SUB-TAB
+      ======================================================== */}
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'suppliers' && (
+        <div className="tickets-screen no-print">
+
+          {canApproveStockEntries && pendingSupplierChangeRequests.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Supplier Changes Awaiting Approval</h3>
+                <span className="admin-section-sub">
+                  Requested by a cashier — nothing changes until you
+                  approve or reject each one.
+                </span>
+              </div>
+              <div className="ticket-list">
+                {pendingSupplierChangeRequests.map((request) => {
+                  const liveSupplier = (suppliers || []).find(
+                    (s) => String(s.id) === String(request.supplierId)
+                  );
+                  return (
+                    <div key={request.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>
+                          {request.type === 'DELETE' ? 'Delete' : 'Edit'}:{' '}
+                          {request.proposedChanges?.name || liveSupplier?.name || 'Unknown supplier'}
+                        </strong>
+                        <div className="deleted-drug-meta">
+                          Requested by {request.requestedByEmail}
+                        </div>
+                      </div>
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          disabled={isApprovingChangeRequestId === request.id}
+                          onClick={() => handleApproveChangeRequest('supplier', request)}
+                        >
+                          {isApprovingChangeRequestId === request.id ? 'Approving…' : '✓ Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => handleOpenRejectChangeRequest('supplier', request)}
+                        >
+                          ✕ Reject
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Suppliers</h3>
+              <span className="admin-section-sub">
+                Create, edit or delete suppliers here — not just inline
+                while restocking.
+              </span>
+            </div>
+
+            <div className="catalog-crud-toolbar">
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search suppliers..."
+                value={supplierSearchTerm}
+                onChange={(e) => setSupplierSearchTerm(e.target.value)}
+              />
+              <button
+                type="button"
+                className="restore-btn"
+                onClick={handleOpenAddSupplierModal}
+              >
+                + New Supplier
+              </button>
+            </div>
+
+            <div className="ticket-list">
+              {(suppliers || [])
+                .filter((s) => !s.deletedAt)
+                .filter((s) =>
+                  s.name.toLowerCase().includes(supplierSearchTerm.trim().toLowerCase())
+                )
+                .map((supplier) => {
+                  const pendingReq = pendingSupplierChangeRequests.find(
+                    (r) => String(r.supplierId) === String(supplier.id)
+                  );
+                  return (
+                    <div key={supplier.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>{supplier.name}</strong>
+                        <div className="deleted-drug-meta">
+                          {[supplier.contactPerson, supplier.phone, supplier.email]
+                            .filter(Boolean)
+                            .join(' · ') || 'No contact details on file'}
+                        </div>
+                        {pendingReq && (
+                          <div className="sent-back-reason">
+                            A {pendingReq.type === 'DELETE' ? 'deletion' : 'change'} is
+                            awaiting manager approval.
+                          </div>
+                        )}
+                      </div>
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="send-back-btn"
+                          onClick={() => handleOpenEditSupplierModal(supplier)}
+                        >
+                          ✎ Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => setDeletingTarget({ kind: 'supplier', item: supplier })}
+                        >
+                          🗑 Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              {(suppliers || []).filter((s) => !s.deletedAt).length === 0 && (
+                <p className="admin-section-sub">No suppliers yet.</p>
+              )}
+            </div>
+          </section>
+
+        </div>
+      )}
+
+      {/* ========================================================
+          PURCHASE LIST SUB-TAB
+      ======================================================== */}
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'purchaselist' && (
+        <div className="tickets-screen no-print">
+
+          {!draftPurchaseList && (
+            <>
+              <section className="admin-section">
+                <div className="admin-section-header">
+                  <h3>Automated Purchase List</h3>
+                  <span className="admin-section-sub">
+                    Scans your stock for anything finished or below its
+                    minimum quantity, and suggests a supplier based on
+                    who you usually buy each drug from.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="restore-btn"
+                  disabled={isGeneratingPurchaseList}
+                  onClick={handleGeneratePurchaseList}
+                >
+                  {isGeneratingPurchaseList ? 'Scanning stock…' : '🔄 Generate Purchase List'}
+                </button>
+              </section>
+
+              {myPurchaseLists && myPurchaseLists.length > 0 && (
+                <section className="admin-section">
+                  <div className="admin-section-header">
+                    <h3>Saved Purchase Lists</h3>
+                  </div>
+                  <div className="ticket-list">
+                    {myPurchaseLists.map((list) => (
+                      <div key={list.id} className="ticket-row ticket-row-detailed">
+                        <div className="ticket-row-header">
+                          <strong>{list.title}</strong>
+                          <div className="deleted-drug-meta">
+                            {(list.items || []).length} item(s) · by {list.createdByEmail} ·{' '}
+                            {new Date(list.createdAt).toLocaleDateString()}
+                          </div>
+                        </div>
+                        <div className="deleted-drug-actions">
+                          <button
+                            type="button"
+                            className="send-back-btn"
+                            onClick={() => handleOpenSavedPurchaseList(list)}
+                          >
+                            Open
+                          </button>
+                          <button
+                            type="button"
+                            className="permanent-delete-btn"
+                            onClick={() => handleDeleteSavedPurchaseList(list)}
+                          >
+                            🗑 Delete
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </>
+          )}
+
+          {draftPurchaseList && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>{draftPurchaseList.title}</h3>
+                <span className="admin-section-sub">
+                  Quantities, suppliers and costs are all editable. Add
+                  any other drug by searching below.
+                </span>
+              </div>
+
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Add a drug to this list..."
+                value={purchaseListAddDrugTerm}
+                onChange={(e) => setPurchaseListAddDrugTerm(e.target.value)}
+              />
+              {purchaseListAddDrugTerm.trim() && (
+                <div className="ticket-list">
+                  {(drugs || [])
+                    .filter(
+                      (d) =>
+                        d.name.toLowerCase().includes(purchaseListAddDrugTerm.trim().toLowerCase()) &&
+                        !draftPurchaseList.items.some((i) => String(i.drugId) === String(d.id))
+                    )
+                    .slice(0, 6)
+                    .map((d) => (
+                      <div
+                        key={d.id}
+                        className="ticket-row"
+                        onClick={() => handleAddDrugToPurchaseList(d)}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        + {d.name}
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              <table className="purchase-list-table">
+                <thead>
+                  <tr>
+                    <th>Drug</th>
+                    <th>Stock</th>
+                    <th>Qty</th>
+                    <th>Supplier</th>
+                    <th>Unit Cost (₦)</th>
+                    <th>Line Total (₦)</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {draftPurchaseList.items.map((item) => (
+                    <tr key={item.drugId}>
+                      <td>{item.drugName}</td>
+                      <td>
+                        {item.currentStock}
+                        {item.minStockQty != null && ` / min ${item.minStockQty}`}
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min="1"
+                          value={item.quantity}
+                          onChange={(e) =>
+                            handleUpdatePurchaseListItem(item.drugId, {
+                              quantity: Number(e.target.value) || 0
+                            })
+                          }
+                        />
+                      </td>
+                      <td>
+                        <select
+                          value={item.supplierId || ''}
+                          onChange={(e) => {
+                            const s = (suppliers || []).find((x) => x.id === e.target.value);
+                            handleUpdatePurchaseListItem(item.drugId, {
+                              supplierId: e.target.value || null,
+                              supplierName: s ? s.name : null
+                            });
+                          }}
+                        >
+                          <option value="">— choose —</option>
+                          {(suppliers || [])
+                            .filter((s) => !s.deletedAt)
+                            .map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {s.name}
+                              </option>
+                            ))}
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min="0"
+                          value={item.unitCost}
+                          onChange={(e) =>
+                            handleUpdatePurchaseListItem(item.drugId, {
+                              unitCost: Number(e.target.value) || 0
+                            })
+                          }
+                        />
+                      </td>
+                      <td>
+                        ₦{(Number(item.quantity) * Number(item.unitCost)).toLocaleString()}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => handleRemovePurchaseListItem(item.drugId)}
+                        >
+                          ✕
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div className="purchase-list-total">
+                Total: ₦
+                {draftPurchaseList.items
+                  .reduce((sum, i) => sum + Number(i.quantity) * Number(i.unitCost), 0)
+                  .toLocaleString()}
+              </div>
+
+              <div className="deleted-drug-actions">
+                <button
+                  type="button"
+                  className="restore-btn"
+                  disabled={isSavingPurchaseList}
+                  onClick={handleSaveDraftPurchaseList}
+                >
+                  {isSavingPurchaseList ? 'Saving…' : '💾 Save List'}
+                </button>
+                <button type="button" className="send-back-btn" onClick={handlePrintPurchaseList}>
+                  🖨 Print
+                </button>
+                <button
+                  type="button"
+                  className="permanent-delete-btn"
+                  onClick={handleCloseDraftPurchaseList}
+                >
+                  Close
+                </button>
+              </div>
+            </section>
+          )}
+
+        </div>
+      )}
+
+      {/* ========================================================
+          STOCK HISTORY SUB-TAB (cashier: own entries; manager: all)
+      ======================================================== */}
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'history' && (
+        <div className="tickets-screen no-print">
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Stock History</h3>
+              <span className="admin-section-sub">
+                {hasRole(userRole, 'manager')
+                  ? 'Every stock entry from every cashier and manager.'
+                  : 'Stock entries you personally submitted.'}
+              </span>
+            </div>
+
+            <input
+              type="text"
+              className="history-search-input"
+              placeholder="Search by supplier or drug name..."
+              value={stockHistorySearchTerm}
+              onChange={(e) => setStockHistorySearchTerm(e.target.value)}
+            />
+
+            <div className="ticket-list">
+              {(hasRole(userRole, 'manager') ? allStockEntries || [] : myStockEntries || [])
+                .filter((entry) => {
+                  const term = stockHistorySearchTerm.trim().toLowerCase();
+                  if (!term) return true;
+                  return (
+                    entry.supplierName?.toLowerCase().includes(term) ||
+                    (entry.items || []).some((item) =>
+                      (item.drugName || '').toLowerCase().includes(term)
+                    )
+                  );
+                })
+                .map((entry) => (
+                  <div key={entry.id} className="ticket-row ticket-row-detailed">
+                    <div className="ticket-row-header">
+                      <strong>{entry.supplierName}</strong>
+                      <span
+                        className={`ticket-status-pill status-${entry.status.toLowerCase()}`}
+                      >
+                        {entry.status}
+                      </span>
+                    </div>
+                    <div className="deleted-drug-meta">
+                      {new Date(entry.createdAt).toLocaleString()} · {entry.items.length} item(s)
+                      · ₦{entry.totalCost.toLocaleString()} · Paid ₦
+                      {Number(entry.amountPaid || 0).toLocaleString()}
+                      {entry.totalCost - Number(entry.amountPaid || 0) > 0 && (
+                        <> · Owed ₦{(entry.totalCost - Number(entry.amountPaid || 0)).toLocaleString()}</>
+                      )}
+                      {hasRole(userRole, 'manager') && <> · by {entry.enteredByEmail}</>}
+                    </div>
+                  </div>
+                ))}
+              {(hasRole(userRole, 'manager') ? allStockEntries || [] : myStockEntries || [])
+                .length === 0 && <p className="admin-section-sub">No stock entries yet.</p>}
+            </div>
+          </section>
         </div>
       )}
 
@@ -5149,6 +6415,217 @@ export default function App() {
       )}
 
       {/* ========================================================
+          RECORD SUPPLIER PAYMENT MODAL
+      ======================================================== */}
+      {recordingPaymentFor && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>Record Payment — {recordingPaymentFor.supplierName}</h3>
+
+            <p className="form-section-hint">
+              Total ₦{recordingPaymentFor.totalCost.toLocaleString()} · Paid so
+              far ₦{Number(recordingPaymentFor.amountPaid || 0).toLocaleString()}{' '}
+              · Owed ₦
+              {Math.max(
+                0,
+                recordingPaymentFor.totalCost - Number(recordingPaymentFor.amountPaid || 0)
+              ).toLocaleString()}
+            </p>
+
+            <div>
+              <label>Amount Being Paid Now (₦):</label>
+              <input
+                type="number"
+                min="0"
+                max={Math.max(
+                  0,
+                  recordingPaymentFor.totalCost - Number(recordingPaymentFor.amountPaid || 0)
+                )}
+                value={recordPaymentAmount}
+                onChange={(e) => setRecordPaymentAmount(e.target.value)}
+                autoFocus
+              />
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isRecordingPayment}
+                onClick={handleConfirmRecordPayment}
+              >
+                {isRecordingPayment ? 'Recording…' : 'Record Payment'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => {
+                  setRecordingPaymentFor(null);
+                  setRecordPaymentAmount('');
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          UNMISSABLE CONFIRM-DELETE MODAL (drugs & suppliers)
+          Deletion is always a soft-delete, but there's no plain
+          window.confirm() skip-through anymore — the name has to be
+          read, and for a drug, a supplier's worth of context is shown
+          too, so nobody deletes the wrong one by habit-clicking through.
+      ======================================================== */}
+      {deletingTarget && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>
+              Delete {deletingTarget.kind === 'drug' ? 'Drug' : 'Supplier'}?
+            </h3>
+
+            <p className="form-section-hint">
+              {userRole === 'cashier'
+                ? "This needs a manager's approval before it takes effect — nothing disappears yet."
+                : "This moves it to Recently Deleted. An administrator can restore it or remove it permanently later — it isn't gone yet, but stop and make sure this is the right one."}
+            </p>
+
+            <p>
+              <strong>{deletingTarget.item?.name}</strong>
+              {deletingTarget.kind === 'drug' && (
+                <>
+                  {' '}— Stock: {deletingTarget.item?.stock ?? 0}{' '}
+                  {deletingTarget.item?.unitType || deletingTarget.item?.unit_type}
+                </>
+              )}
+              {deletingTarget.kind === 'supplier' && deletingTarget.item?.contactPerson && (
+                <> — {deletingTarget.item.contactPerson}</>
+              )}
+            </p>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="permanent-delete-btn"
+                disabled={isDeletingTarget}
+                onClick={async () => {
+                  setIsDeletingTarget(true);
+                  try {
+                    if (deletingTarget.kind === 'drug') {
+                      await handleConfirmDeleteDrug(deletingTarget.item);
+                    } else {
+                      await handleConfirmDeleteSupplier(deletingTarget.item);
+                    }
+                    setDeletingTarget(null);
+                  } finally {
+                    setIsDeletingTarget(false);
+                  }
+                }}
+              >
+                {isDeletingTarget ? 'Deleting…' : 'Yes, Delete'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setDeletingTarget(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          SUPPLIER ADD/EDIT MODAL
+      ======================================================== */}
+      {isSupplierModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+            <form onSubmit={handleSaveSupplier}>
+              <h3>{editingSupplier ? 'Edit Supplier' : 'New Supplier'}</h3>
+
+              <label>
+                Name:
+                <input
+                  type="text"
+                  required
+                  value={supplierFormData.name}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, name: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Contact Person:
+                <input
+                  type="text"
+                  value={supplierFormData.contactPerson}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, contactPerson: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Phone:
+                <input
+                  type="text"
+                  value={supplierFormData.phone}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, phone: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Email:
+                <input
+                  type="email"
+                  value={supplierFormData.email}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, email: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Address:
+                <textarea
+                  rows={2}
+                  value={supplierFormData.address}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, address: e.target.value })
+                  }
+                />
+              </label>
+
+              <div className="modal-actions">
+                <button type="submit" className="save-btn" disabled={isSavingSupplierCrud}>
+                  {isSavingSupplierCrud ? 'Saving…' : 'Save Supplier'}
+                </button>
+                <button
+                  type="button"
+                  className="cancel-btn"
+                  onClick={() => setIsSupplierModalOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
           MANAGER: REJECT STOCK ENTRY CORRECTION MODAL
       ======================================================== */}
       {rejectingStockEdit && (
@@ -5187,6 +6664,56 @@ export default function App() {
                 type="button"
                 className="cancel-btn"
                 onClick={() => setRejectingStockEdit(null)}
+              >
+                Cancel
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
+          MANAGER: REJECT DRUG/SUPPLIER CHANGE REQUEST MODAL
+      ======================================================== */}
+      {rejectingChangeRequest && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+
+            <h3>
+              Reject {rejectingChangeRequest.kind === 'drug' ? 'Drug' : 'Supplier'}{' '}
+              {rejectingChangeRequest.request.type === 'DELETE' ? 'Deletion' : 'Edit'}
+            </h3>
+
+            <p className="form-section-hint">
+              Nothing changes — this tells{' '}
+              {rejectingChangeRequest.request.requestedByEmail} why it was turned down.
+            </p>
+
+            <div>
+              <label>Reason:</label>
+              <textarea
+                rows={3}
+                value={changeRequestRejectReason}
+                onChange={(e) => setChangeRequestRejectReason(e.target.value)}
+                placeholder="e.g. Please double-check the new price against the invoice"
+              />
+            </div>
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-btn"
+                disabled={isRejectingChangeRequest}
+                onClick={handleConfirmRejectChangeRequest}
+              >
+                {isRejectingChangeRequest ? 'Rejecting…' : 'Reject'}
+              </button>
+
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={() => setRejectingChangeRequest(null)}
               >
                 Cancel
               </button>
@@ -5576,6 +7103,46 @@ export default function App() {
                           ...formData,
                           packPrice:
                             e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                </div>
+
+                <p className="form-section-hint">
+                  Restock Planning (Optional) — used for the automated
+                  purchase list, not required to save this drug.
+                </p>
+
+                <div className="form-row">
+                  <div>
+                    <label>Standard Minimum Quantity:</label>
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 20"
+                      value={formData.minStockQty}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          minStockQty: e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>Recommended Purchase Quantity:</label>
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="e.g. 50"
+                      value={formData.recommendedPurchaseQty}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          recommendedPurchaseQty: e.target.value
                         })
                       }
                     />

@@ -118,6 +118,51 @@ db.version(10).stores({
   restockDrafts: 'id'
 });
 
+// Schema Version 11:
+//  - `supplierChangeRequests` — a cashier editing or deleting a supplier
+//    follows the same cashier-needs-approval shape as everything else
+//    here; a manager's own edit/delete applies immediately.
+//  - `purchaseLists` — the saved/editable/printable output of the
+//    automated "what needs buying" scan (finished or below-minimum
+//    drugs, grouped by the supplier they're usually bought from).
+db.version(11).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced'
+});
+
+// Schema Version 12: `drugChangeRequests` — drugs can now be created,
+// edited and deleted from the Drugs & Suppliers hub by a cashier, not
+// just a manager. Creating one is unrestricted either way (same as
+// suppliers), but editing or deleting a drug as a cashier follows the
+// exact same cashier-needs-approval shape used everywhere else: a
+// manager's own edit/delete applies immediately, a cashier's sits here
+// as PENDING until a manager approves or rejects it.
+db.version(12).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced',
+  drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -218,6 +263,13 @@ export async function syncDrugsFromCloud() {
             drug.half_pack_price ?? drug.halfPackPrice ?? null,
           packQty: drug.pack_qty ?? drug.packQty ?? null,
           packPrice: drug.pack_price ?? drug.packPrice ?? null,
+          // Both optional — the standard minimum quantity a shelf should
+          // never fall below, and how many to buy when it's time to
+          // restock. Either can be left blank; the purchase-list
+          // generator just works with whatever's actually filled in.
+          minStockQty: drug.min_stock_qty ?? drug.minStockQty ?? null,
+          recommendedPurchaseQty:
+            drug.recommended_purchase_qty ?? drug.recommendedPurchaseQty ?? null,
           deletedAt: drug.deleted_at || drug.deletedAt || null,
           deletedBy: drug.deleted_by || drug.deletedBy || null,
           synced: 1
@@ -255,7 +307,9 @@ export async function syncPendingDrugsToCloud() {
           half_pack_qty: drug.halfPackQty ?? null,
           half_pack_price: drug.halfPackPrice ?? null,
           pack_qty: drug.packQty ?? null,
-          pack_price: drug.packPrice ?? null
+          pack_price: drug.packPrice ?? null,
+          min_stock_qty: drug.minStockQty ?? null,
+          recommended_purchase_qty: drug.recommendedPurchaseQty ?? null
         }
       ]);
 
@@ -491,6 +545,394 @@ export async function permanentlyDeleteDrug(id, actor) {
     });
   } catch (err) {
     console.warn('Unable to permanently delete drug:', err.message);
+  }
+}
+
+// ============================================================
+// DRUG CREATE / EDIT / DELETE from the Drugs & Suppliers hub
+// (cashier-needs-approval, same shape as suppliers above)
+// ------------------------------------------------------------
+// Creating a drug is unrestricted for cashier or manager alike (same as
+// suppliers, and same as the existing "add drug not in catalog" path
+// inside a restock entry). Editing or deleting one is where the two
+// roles diverge: a manager/administrator's change applies immediately;
+// a cashier's is recorded in `drugChangeRequests` as PENDING and does
+// nothing to the drug until a manager approves it. Deletion either way
+// reuses the existing soft-delete (softDeleteDrug) — it only disappears
+// from pickers, and an administrator still has to restore or
+// permanently delete it from Admin → Recently Deleted.
+// ============================================================
+
+export async function requestDrugEdit(drug, changes, actor) {
+  try {
+    const role = actor?.role;
+    const isManager = role === 'manager' || role === 'administrator';
+
+    if (isManager) {
+      await db.drugs.update(drug.id, { ...changes, synced: 0 });
+
+      const cloudPayload = {
+        name: changes.name,
+        unit_type: changes.unitType,
+        cost_price: changes.costPrice,
+        retail_price: changes.retailPrice,
+        wholesale_price: changes.wholesalePrice,
+        stock: changes.stock,
+        barcode: changes.barcode,
+        half_pack_qty: changes.halfPackQty ?? null,
+        half_pack_price: changes.halfPackPrice ?? null,
+        pack_qty: changes.packQty ?? null,
+        pack_price: changes.packPrice ?? null,
+        min_stock_qty: changes.minStockQty ?? null,
+        recommended_purchase_qty: changes.recommendedPurchaseQty ?? null
+      };
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('drugs')
+            .update(cloudPayload)
+            .eq('id', drug.id);
+          if (!error) await db.drugs.update(drug.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud drug edit postponed:', err.message);
+        }
+      }
+
+      await logAuditEvent({
+        actorEmail: actor?.email,
+        actorRole: actor?.role,
+        action: 'drug_updated',
+        targetType: 'drug',
+        targetId: drug.id,
+        details: { name: changes.name }
+      });
+
+      return { success: true, applied: true };
+    }
+
+    // Cashier — queue it instead of touching the drug directly.
+    const request = {
+      id: generateId('DRUGCHG'),
+      drugId: drug.id,
+      type: 'EDIT',
+      proposedChanges: changes,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.drugChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('drug_change_requests').insert([
+          {
+            id: request.id,
+            drug_id: request.drugId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.drugChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud drug edit request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_edit_requested',
+      targetType: 'drug',
+      targetId: drug.id,
+      details: { proposedName: changes.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to request drug edit:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function requestDeleteDrug(drug, actor) {
+  const role = actor?.role;
+  const isManager = role === 'manager' || role === 'administrator';
+
+  if (isManager) {
+    await softDeleteDrug(drug.id, actor);
+    return { success: true, applied: true };
+  }
+
+  try {
+    const request = {
+      id: generateId('DRUGCHG'),
+      drugId: drug.id,
+      type: 'DELETE',
+      proposedChanges: null,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.drugChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('drug_change_requests').insert([
+          {
+            id: request.id,
+            drug_id: request.drugId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.drugChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud drug delete request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_delete_requested',
+      targetType: 'drug',
+      targetId: drug.id,
+      details: { name: drug.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to request drug deletion:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function approveDrugChangeRequest(request, actor) {
+  try {
+    const freshLocal = await db.drugChangeRequests.get(request.id);
+    if (freshLocal && freshLocal.status !== 'PENDING') {
+      return { success: false, reason: 'This request has already been handled.' };
+    }
+    const target = freshLocal || request;
+
+    if (target.type === 'EDIT') {
+      await db.drugs.update(target.drugId, { ...target.proposedChanges, synced: 0 });
+
+      if (navigator.onLine) {
+        try {
+          const c = target.proposedChanges;
+          const { error } = await supabase
+            .from('drugs')
+            .update({
+              name: c.name,
+              unit_type: c.unitType,
+              cost_price: c.costPrice,
+              retail_price: c.retailPrice,
+              wholesale_price: c.wholesalePrice,
+              stock: c.stock,
+              barcode: c.barcode,
+              half_pack_qty: c.halfPackQty ?? null,
+              half_pack_price: c.halfPackPrice ?? null,
+              pack_qty: c.packQty ?? null,
+              pack_price: c.packPrice ?? null,
+              min_stock_qty: c.minStockQty ?? null,
+              recommended_purchase_qty: c.recommendedPurchaseQty ?? null
+            })
+            .eq('id', target.drugId);
+          if (!error) await db.drugs.update(target.drugId, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud drug edit (approved) postponed:', err.message);
+        }
+      }
+    } else {
+      await softDeleteDrug(target.drugId, actor);
+    }
+
+    const decidedAt = new Date().toISOString();
+    await db.drugChangeRequests.update(target.id, {
+      status: 'APPROVED',
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('drug_change_requests')
+          .update({
+            status: 'APPROVED',
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', target.id);
+        if (!error) await db.drugChangeRequests.update(target.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud drug change approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_change_approved',
+      targetType: 'drug',
+      targetId: target.drugId,
+      details: { type: target.type }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to approve drug change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectDrugChangeRequest(request, reason, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+    const trimmedReason = (reason || '').trim();
+
+    await db.drugChangeRequests.update(request.id, {
+      status: 'REJECTED',
+      rejectionReason: trimmedReason,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('drug_change_requests')
+          .update({
+            status: 'REJECTED',
+            rejection_reason: trimmedReason,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', request.id);
+        if (!error) await db.drugChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud drug change rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'drug_change_rejected',
+      targetType: 'drug',
+      targetId: request.drugId,
+      details: { reason: trimmedReason }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject drug change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchCloudDrugChangeRequests() {
+  try {
+    const { data, error } = await supabase
+      .from('drug_change_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.drugChangeRequests.where('synced').equals(0).toArray()).map((r) =>
+        String(r.id)
+      )
+    );
+
+    const mapped = data
+      .filter((r) => !pendingIds.has(String(r.id)))
+      .map((r) => ({
+        id: String(r.id),
+        drugId: r.drug_id,
+        type: r.type,
+        proposedChanges: r.proposed_changes || null,
+        status: r.status,
+        requestedById: r.requested_by || null,
+        requestedByEmail: r.requested_by_email || 'unknown',
+        requestedByRole: r.requested_by_role || 'unknown',
+        createdAt: r.created_at,
+        decidedByEmail: r.decided_by_email || null,
+        decidedAt: r.decided_at || null,
+        rejectionReason: r.rejection_reason || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.drugChangeRequests.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch drug change requests:', err.message);
+  }
+}
+
+export async function syncPendingDrugChangeRequestsToCloud() {
+  try {
+    const pending = await db.drugChangeRequests.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const request of pending) {
+      const { error } = await supabase.from('drug_change_requests').upsert([
+        {
+          id: request.id,
+          drug_id: request.drugId,
+          type: request.type,
+          proposed_changes: request.proposedChanges,
+          status: request.status,
+          requested_by: request.requestedById,
+          requested_by_email: request.requestedByEmail,
+          requested_by_role: request.requestedByRole,
+          created_at: request.createdAt,
+          decided_by_email: request.decidedByEmail,
+          decided_at: request.decidedAt,
+          rejection_reason: request.rejectionReason
+        }
+      ]);
+      if (!error) await db.drugChangeRequests.update(request.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending drug change requests:', err.message);
   }
 }
 
@@ -1006,6 +1448,8 @@ export async function fetchSuppliers() {
         phone: s.phone || '',
         email: s.email || '',
         address: s.address || '',
+        deletedAt: s.deleted_at || null,
+        deletedBy: s.deleted_by || null,
         synced: 1
       }));
 
@@ -1073,13 +1517,493 @@ export async function syncPendingSuppliersToCloud() {
           contact_person: supplier.contactPerson,
           phone: supplier.phone,
           email: supplier.email,
-          address: supplier.address
+          address: supplier.address,
+          deleted_at: supplier.deletedAt || null,
+          deleted_by: supplier.deletedBy || null
         }
       ]);
       if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
     }
   } catch (err) {
     console.warn('Unable to sync pending suppliers:', err.message);
+  }
+}
+
+// ============================================================
+// SUPPLIER EDIT / DELETE (cashier-needs-approval, same shape used
+// everywhere else in this file)
+// ------------------------------------------------------------
+// A manager/administrator's edit or delete on a supplier applies
+// immediately. A cashier's edit or delete is recorded in
+// `supplierChangeRequests` as PENDING and does nothing to the supplier
+// record until a manager approves it. Deletion either way is a SOFT
+// delete (deletedAt/deletedBy set, same as a drug) — it only disappears
+// from pickers, it isn't gone. An administrator still has to restore or
+// permanently delete it from Admin → Recently Deleted, same as a drug;
+// a manager approving a cashier's delete request only gets it to that
+// same soft-deleted/awaiting-admin state, never further.
+// ============================================================
+
+export async function updateSupplier(supplier, changes, actor) {
+  try {
+    const role = actor?.role;
+    const isManager = role === 'manager' || role === 'administrator';
+
+    const cleaned = {
+      name: (changes.name ?? supplier.name ?? '').trim(),
+      contactPerson: (changes.contactPerson ?? supplier.contactPerson ?? '').trim(),
+      phone: (changes.phone ?? supplier.phone ?? '').trim(),
+      email: (changes.email ?? supplier.email ?? '').trim(),
+      address: (changes.address ?? supplier.address ?? '').trim()
+    };
+
+    if (isManager) {
+      await db.suppliers.update(supplier.id, { ...cleaned, synced: 0 });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('suppliers')
+            .update({
+              name: cleaned.name,
+              contact_person: cleaned.contactPerson,
+              phone: cleaned.phone,
+              email: cleaned.email,
+              address: cleaned.address
+            })
+            .eq('id', supplier.id);
+          if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud supplier update postponed:', err.message);
+        }
+      }
+
+      await logAuditEvent({
+        actorEmail: actor?.email,
+        actorRole: actor?.role,
+        action: 'supplier_updated',
+        targetType: 'supplier',
+        targetId: supplier.id,
+        details: { name: cleaned.name }
+      });
+
+      return { success: true, applied: true };
+    }
+
+    // Cashier — queue it instead of touching the supplier directly.
+    const request = {
+      id: generateId('SUPCHG'),
+      supplierId: supplier.id,
+      type: 'EDIT',
+      proposedChanges: cleaned,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.supplierChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('supplier_change_requests').insert([
+          {
+            id: request.id,
+            supplier_id: request.supplierId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.supplierChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier edit request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_edit_requested',
+      targetType: 'supplier',
+      targetId: supplier.id,
+      details: { proposedName: cleaned.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to update supplier:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function softDeleteSupplier(id, actor) {
+  try {
+    const existing = await db.suppliers.get(id);
+    if (!existing) return { success: false, reason: 'Supplier not found.' };
+
+    const deletedAt = new Date().toISOString();
+    const deletedBy = actor?.email || 'unknown';
+
+    await db.suppliers.update(id, { deletedAt, deletedBy, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('suppliers')
+          .update({ deleted_at: deletedAt, deleted_by: deletedBy })
+          .eq('id', id);
+        if (!error) await db.suppliers.update(id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier soft-delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_deleted',
+      targetType: 'supplier',
+      targetId: id,
+      details: { name: existing.name }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to delete supplier:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function requestDeleteSupplier(supplier, actor) {
+  const role = actor?.role;
+  const isManager = role === 'manager' || role === 'administrator';
+
+  if (isManager) {
+    // Still only a SOFT delete, same as a manager deleting a drug — an
+    // administrator finalizes it (or restores it) from Recently Deleted.
+    return softDeleteSupplier(supplier.id, actor);
+  }
+
+  try {
+    const request = {
+      id: generateId('SUPCHG'),
+      supplierId: supplier.id,
+      type: 'DELETE',
+      proposedChanges: null,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.supplierChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('supplier_change_requests').insert([
+          {
+            id: request.id,
+            supplier_id: request.supplierId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.supplierChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier delete request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_delete_requested',
+      targetType: 'supplier',
+      targetId: supplier.id,
+      details: { name: supplier.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to request supplier deletion:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function restoreSupplier(id, actor) {
+  try {
+    const existing = await db.suppliers.get(id);
+    if (!existing) return;
+
+    await db.suppliers.update(id, { deletedAt: null, deletedBy: null, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('suppliers')
+          .update({ deleted_at: null, deleted_by: null })
+          .eq('id', id);
+        if (!error) await db.suppliers.update(id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier restore postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_restored',
+      targetType: 'supplier',
+      targetId: id,
+      details: { name: existing.name }
+    });
+  } catch (err) {
+    console.warn('Unable to restore supplier:', err.message);
+  }
+}
+
+export async function permanentlyDeleteSupplier(id, actor) {
+  try {
+    const existing = await db.suppliers.get(id);
+
+    await db.suppliers.delete(id);
+
+    if (navigator.onLine) {
+      try {
+        await supabase.from('suppliers').delete().eq('id', id);
+      } catch (err) {
+        console.warn('Cloud supplier permanent delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_permanently_deleted',
+      targetType: 'supplier',
+      targetId: id,
+      details: { name: existing?.name || 'unknown' }
+    });
+  } catch (err) {
+    console.warn('Unable to permanently delete supplier:', err.message);
+  }
+}
+
+export async function approveSupplierChangeRequest(request, actor) {
+  try {
+    const freshLocal = await db.supplierChangeRequests.get(request.id);
+    if (freshLocal && freshLocal.status !== 'PENDING') {
+      return { success: false, reason: 'This request has already been handled.' };
+    }
+    const target = freshLocal || request;
+
+    if (target.type === 'EDIT') {
+      await db.suppliers.update(target.supplierId, {
+        ...target.proposedChanges,
+        synced: 0
+      });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('suppliers')
+            .update({
+              name: target.proposedChanges.name,
+              contact_person: target.proposedChanges.contactPerson,
+              phone: target.proposedChanges.phone,
+              email: target.proposedChanges.email,
+              address: target.proposedChanges.address
+            })
+            .eq('id', target.supplierId);
+          if (!error) await db.suppliers.update(target.supplierId, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud supplier edit (approved) postponed:', err.message);
+        }
+      }
+    } else {
+      await softDeleteSupplier(target.supplierId, actor);
+    }
+
+    const decidedAt = new Date().toISOString();
+    await db.supplierChangeRequests.update(target.id, {
+      status: 'APPROVED',
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('supplier_change_requests')
+          .update({
+            status: 'APPROVED',
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', target.id);
+        if (!error) await db.supplierChangeRequests.update(target.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier change approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_change_approved',
+      targetType: 'supplier',
+      targetId: target.supplierId,
+      details: { type: target.type }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to approve supplier change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectSupplierChangeRequest(request, reason, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+    const trimmedReason = (reason || '').trim();
+
+    await db.supplierChangeRequests.update(request.id, {
+      status: 'REJECTED',
+      rejectionReason: trimmedReason,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('supplier_change_requests')
+          .update({
+            status: 'REJECTED',
+            rejection_reason: trimmedReason,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', request.id);
+        if (!error) await db.supplierChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier change rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_change_rejected',
+      targetType: 'supplier',
+      targetId: request.supplierId,
+      details: { reason: trimmedReason }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject supplier change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchCloudSupplierChangeRequests() {
+  try {
+    const { data, error } = await supabase
+      .from('supplier_change_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.supplierChangeRequests.where('synced').equals(0).toArray()).map((r) =>
+        String(r.id)
+      )
+    );
+
+    const mapped = data
+      .filter((r) => !pendingIds.has(String(r.id)))
+      .map((r) => ({
+        id: String(r.id),
+        supplierId: r.supplier_id,
+        type: r.type,
+        proposedChanges: r.proposed_changes || null,
+        status: r.status,
+        requestedById: r.requested_by || null,
+        requestedByEmail: r.requested_by_email || 'unknown',
+        requestedByRole: r.requested_by_role || 'unknown',
+        createdAt: r.created_at,
+        decidedByEmail: r.decided_by_email || null,
+        decidedAt: r.decided_at || null,
+        rejectionReason: r.rejection_reason || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.supplierChangeRequests.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch supplier change requests:', err.message);
+  }
+}
+
+export async function syncPendingSupplierChangeRequestsToCloud() {
+  try {
+    const pending = await db.supplierChangeRequests.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const request of pending) {
+      const { error } = await supabase.from('supplier_change_requests').upsert([
+        {
+          id: request.id,
+          supplier_id: request.supplierId,
+          type: request.type,
+          proposed_changes: request.proposedChanges,
+          status: request.status,
+          requested_by: request.requestedById,
+          requested_by_email: request.requestedByEmail,
+          requested_by_role: request.requestedByRole,
+          created_at: request.createdAt,
+          decided_by_email: request.decidedByEmail,
+          decided_at: request.decidedAt,
+          rejection_reason: request.rejectionReason
+        }
+      ]);
+      if (!error) await db.supplierChangeRequests.update(request.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending supplier change requests:', err.message);
   }
 }
 
@@ -1249,6 +2173,10 @@ export async function createStockEntry(payload, actor) {
       supplierName: payload.supplierName,
       items: payload.items,
       totalCost: payload.totalCost,
+      // What was handed to the supplier at the time, if any — tracked
+      // separately from totalCost so "amount owed" (totalCost -
+      // amountPaid) can be worked out per entry and per supplier.
+      amountPaid: Number(payload.amountPaid) || 0,
       enteredById: actor?.id || null,
       enteredByEmail: actor?.email || 'unknown',
       enteredByRole: role || 'unknown',
@@ -1281,6 +2209,7 @@ export async function createStockEntry(payload, actor) {
             supplier_name: entry.supplierName,
             items: entry.items,
             total_cost: entry.totalCost,
+            amount_paid: entry.amountPaid,
             entered_by: entry.enteredById,
             entered_by_email: entry.enteredByEmail,
             entered_by_role: entry.enteredByRole,
@@ -1417,13 +2346,15 @@ export async function rejectStockEntry(entry, reason, actor) {
 
 export async function fetchCloudStockEntries() {
   try {
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    // A year, not 30 days — this is also what backs the Stock History
+    // page now, which needs more than a month of lookback to be useful.
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
     const { data, error } = await supabase
       .from('stock_entries')
       .select('*')
-      .gte('created_at', thirtyDaysAgo.toISOString())
+      .gte('created_at', oneYearAgo.toISOString())
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -1444,6 +2375,7 @@ export async function fetchCloudStockEntries() {
         supplierName: e.supplier_name,
         items: e.items || [],
         totalCost: Number(e.total_cost || 0),
+        amountPaid: Number(e.amount_paid || 0),
         enteredById: e.entered_by || null,
         enteredByEmail: e.entered_by_email || 'unknown',
         enteredByRole: e.entered_by_role || 'unknown',
@@ -1476,6 +2408,7 @@ export async function syncPendingStockEntriesToCloud() {
           supplier_name: entry.supplierName,
           items: entry.items,
           total_cost: entry.totalCost,
+          amount_paid: entry.amountPaid ?? 0,
           entered_by: entry.enteredById,
           entered_by_email: entry.enteredByEmail,
           entered_by_role: entry.enteredByRole,
@@ -1489,6 +2422,62 @@ export async function syncPendingStockEntriesToCloud() {
     }
   } catch (err) {
     console.warn('Unable to sync pending stock entries:', err.message);
+  }
+}
+
+// Logging a payment made to a supplier against this entry — separate
+// from editStockEntry/the 7-day correction window, since paying off a
+// debt can happen weeks later and shouldn't be time-boxed the way
+// correcting a data-entry mistake is. Adds to whatever's already been
+// paid (so several partial payments over time just accumulate); applies
+// immediately for cashier or manager alike — it only moves a running
+// paid total, nothing about stock or the catalog.
+export async function recordSupplierPayment(entry, additionalAmount, actor) {
+  try {
+    const amount = Number(additionalAmount) || 0;
+    if (amount <= 0) {
+      return { success: false, reason: 'Enter an amount greater than 0.' };
+    }
+
+    const freshLocal = await db.stockEntries.get(entry.id);
+    const target = freshLocal || entry;
+    const newAmountPaid = Number(target.amountPaid || 0) + amount;
+
+    await db.stockEntries.update(entry.id, {
+      amountPaid: newAmountPaid,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('stock_entries')
+          .update({ amount_paid: newAmountPaid })
+          .eq('id', entry.id);
+        if (!error) await db.stockEntries.update(entry.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud supplier payment postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'supplier_payment_recorded',
+      targetType: 'stock_entry',
+      targetId: entry.id,
+      details: {
+        supplierName: target.supplierName,
+        amount,
+        newAmountPaid,
+        totalCost: target.totalCost
+      }
+    });
+
+    return { success: true, amountPaid: newAmountPaid };
+  } catch (err) {
+    console.warn('Unable to record supplier payment:', err.message);
+    return { success: false, reason: err.message };
   }
 }
 
@@ -1867,6 +2856,248 @@ export async function syncPendingStockEntryEditsToCloud() {
 }
 
 // ============================================================
+// AUTOMATED PURCHASE LIST
+// ------------------------------------------------------------
+// Scans the catalog for anything finished (stock 0) or below its
+// configured minimum (minStockQty — optional per drug), and for each
+// one works out which supplier it's usually bought from by counting
+// how often that supplier shows up across past APPLIED stock entries
+// for that exact drug (ties broken by whichever was more recent). A
+// drug with no purchase history yet is still listed, just without a
+// recommended supplier. This is pure computation — nothing is written
+// until the person saves the list.
+// ============================================================
+export async function generatePurchaseList() {
+  const [allDrugs, allEntries] = await Promise.all([
+    db.drugs.toArray(),
+    db.stockEntries.where('status').equals('APPLIED').toArray()
+  ]);
+
+  const liveDrugs = allDrugs.filter((d) => !d.deletedAt);
+
+  const needsRestocking = liveDrugs.filter((d) => {
+    const stock = Number(d.stock || 0);
+    const min = d.minStockQty !== null && d.minStockQty !== undefined
+      ? Number(d.minStockQty)
+      : null;
+    return stock <= 0 || (min !== null && stock < min);
+  });
+
+  // For each drug id: supplierId -> { count, lastSeenAt, supplierName }
+  const historyByDrug = new Map();
+  for (const entry of allEntries) {
+    if (!entry.supplierId) continue;
+    for (const item of entry.items || []) {
+      if (!item.drugId) continue;
+      const key = String(item.drugId);
+      if (!historyByDrug.has(key)) historyByDrug.set(key, new Map());
+      const bySupplier = historyByDrug.get(key);
+      const existing = bySupplier.get(entry.supplierId) || {
+        count: 0,
+        lastSeenAt: entry.createdAt,
+        supplierName: entry.supplierName
+      };
+      existing.count += 1;
+      if (new Date(entry.createdAt) > new Date(existing.lastSeenAt)) {
+        existing.lastSeenAt = entry.createdAt;
+      }
+      bySupplier.set(entry.supplierId, existing);
+    }
+  }
+
+  const recommendedSupplierFor = (drugId) => {
+    const bySupplier = historyByDrug.get(String(drugId));
+    if (!bySupplier || bySupplier.size === 0) return null;
+
+    let best = null;
+    for (const [supplierId, stat] of bySupplier.entries()) {
+      if (
+        !best ||
+        stat.count > best.count ||
+        (stat.count === best.count &&
+          new Date(stat.lastSeenAt) > new Date(best.lastSeenAt))
+      ) {
+        best = { supplierId, ...stat };
+      }
+    }
+    return best ? { supplierId: best.supplierId, supplierName: best.supplierName } : null;
+  };
+
+  const items = needsRestocking.map((d) => {
+    const recommended = recommendedSupplierFor(d.id);
+    const min = d.minStockQty !== null && d.minStockQty !== undefined
+      ? Number(d.minStockQty)
+      : null;
+    // No configured recommended quantity: fall back to "enough to get
+    // back to double the minimum," or just the minimum if that's all
+    // that's set, or a conservative default of 10 if neither is set —
+    // always editable either way.
+    const fallbackQty =
+      d.recommendedPurchaseQty ??
+      (min !== null ? Math.max(min * 2 - Number(d.stock || 0), min) : 10);
+
+    return {
+      drugId: d.id,
+      drugName: d.name,
+      unitType: d.unitType,
+      currentStock: Number(d.stock || 0),
+      minStockQty: min,
+      quantity: Math.max(1, Math.round(Number(fallbackQty) || 10)),
+      supplierId: recommended?.supplierId || null,
+      supplierName: recommended?.supplierName || null
+    };
+  });
+
+  return { items };
+}
+
+export async function fetchCloudPurchaseLists() {
+  try {
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+    const { data, error } = await supabase
+      .from('purchase_lists')
+      .select('*')
+      .gte('created_at', oneYearAgo.toISOString())
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.purchaseLists.where('synced').equals(0).toArray()).map((p) =>
+        String(p.id)
+      )
+    );
+
+    const mapped = data
+      .filter((p) => !pendingIds.has(String(p.id)))
+      .map((p) => ({
+        id: String(p.id),
+        title: p.title || '',
+        items: p.items || [],
+        createdById: p.created_by || null,
+        createdByEmail: p.created_by_email || 'unknown',
+        createdAt: p.created_at,
+        updatedAt: p.updated_at || p.created_at,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.purchaseLists.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch purchase lists from cloud:', err.message);
+  }
+}
+
+export async function syncPendingPurchaseListsToCloud() {
+  try {
+    const pending = await db.purchaseLists.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const list of pending) {
+      const { error } = await supabase.from('purchase_lists').upsert([
+        {
+          id: list.id,
+          title: list.title,
+          items: list.items,
+          created_by: list.createdById,
+          created_by_email: list.createdByEmail,
+          created_at: list.createdAt,
+          updated_at: list.updatedAt
+        }
+      ]);
+      if (!error) await db.purchaseLists.update(list.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending purchase lists:', err.message);
+  }
+}
+
+// Saves a purchase list for the first time (no id yet) or updates one
+// already saved (id passed in) — either way it's just a personal/team
+// planning document, so no approval chain: whoever's working on it
+// (cashier or manager) can save and keep re-editing it freely.
+export async function savePurchaseList(list, actor) {
+  try {
+    const now = new Date().toISOString();
+    const isNew = !list.id;
+
+    const record = {
+      id: list.id || generateId('PURCHLIST'),
+      title: list.title || `Purchase List — ${new Date().toLocaleDateString()}`,
+      items: list.items || [],
+      createdById: list.createdById || actor?.id || null,
+      createdByEmail: list.createdByEmail || actor?.email || 'unknown',
+      createdAt: list.createdAt || now,
+      updatedAt: now,
+      synced: 0
+    };
+
+    await db.purchaseLists.put(record);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('purchase_lists').upsert([
+          {
+            id: record.id,
+            title: record.title,
+            items: record.items,
+            created_by: record.createdById,
+            created_by_email: record.createdByEmail,
+            created_at: record.createdAt,
+            updated_at: record.updatedAt
+          }
+        ]);
+        if (!error) await db.purchaseLists.update(record.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud purchase list save postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: isNew ? 'purchase_list_created' : 'purchase_list_updated',
+      targetType: 'purchase_list',
+      targetId: record.id,
+      details: { title: record.title, itemCount: record.items.length }
+    });
+
+    return { success: true, list: record };
+  } catch (err) {
+    console.warn('Unable to save purchase list:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function deletePurchaseList(id, actor) {
+  try {
+    await db.purchaseLists.delete(id);
+    if (navigator.onLine) {
+      try {
+        await supabase.from('purchase_lists').delete().eq('id', id);
+      } catch (err) {
+        console.warn('Cloud purchase list delete postponed:', err.message);
+      }
+    }
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'purchase_list_deleted',
+      targetType: 'purchase_list',
+      targetId: id
+    });
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to delete purchase list:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
 // RESTOCK DRAFT (per-account, local-only, not synced to the cloud)
 // ------------------------------------------------------------
 // The restock screen's in-progress work — which supplier, which drugs
@@ -1968,6 +3199,15 @@ async function getNextDailyTicketNumber() {
 }
 
 export async function createTicket(ticketPayload, actor) {
+  // Same ₦0-ticket guard as App.jsx, duplicated here so a bug anywhere
+  // else that calls this directly can't slip a free "sale" through.
+  if (!ticketPayload.total || ticketPayload.total <= 0) {
+    return {
+      success: false,
+      reason: `This ticket's total (₦${ticketPayload.total || 0}) can't be submitted — check item pricing first.`
+    };
+  }
+
   const dailyNumber = await getNextDailyTicketNumber();
 
   const ticket = {
@@ -2287,6 +3527,13 @@ export async function resubmitTicket(ticketId, updatedPayload, actor) {
       };
     }
 
+    if (!updatedPayload.total || updatedPayload.total <= 0) {
+      return {
+        success: false,
+        reason: `This ticket's total (₦${updatedPayload.total || 0}) can't be resubmitted — check item pricing (e.g. after toggling retail/wholesale) before sending it back to the cashier.`
+      };
+    }
+
     const update = {
       items: updatedPayload.items,
       total: updatedPayload.total,
@@ -2383,6 +3630,13 @@ export async function clampNegativeStockToZero() {
 // with a link back to that sale.
 export async function approveTicket(ticket, paymentBreakdown, actor) {
   try {
+    if (!ticket.total || ticket.total <= 0) {
+      return {
+        success: false,
+        reason: `This ticket's total (₦${ticket.total || 0}) can't be approved — send it back to the attendant instead.`
+      };
+    }
+
     // Guard #1 (same device): if this device's own local copy already
     // moved on from PENDING_PAYMENT — a second click, or a stale queue
     // that hasn't re-rendered yet — stop here before touching stock.
