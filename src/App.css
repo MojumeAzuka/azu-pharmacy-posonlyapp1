@@ -3170,6 +3170,25 @@ select {
   }
 }
 
+.stock-warning-toast {
+  background: #fff3cd;
+  color: #7a5b00;
+  border: 1px solid #ffe08a;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-weight: 600;
+  font-size: 0.92rem;
+  animation: stock-warning-fade 3s ease forwards;
+}
+
+@keyframes stock-warning-fade {
+  0% { opacity: 0; transform: translateY(-4px); }
+  10% { opacity: 1; transform: translateY(0); }
+  85% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 /* ============================================================
    Drugs & Suppliers hub — catalog CRUD toolbar + purchase list table
    ============================================================ */
@@ -3224,4 +3243,36 @@ select {
     background: transparent;
     appearance: none;
   }
+}
+
+/* ============================================================
+   Live price recommendation hint (Drugs form + restock lines)
+   ============================================================ */
+.price-recommendation-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 2px 0 10px;
+}
+
+.price-rec-chip {
+  background: #eef6ff;
+  color: #1d5fae;
+  border: 1px solid #bcdcff;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.price-rec-chip:hover {
+  background: #dcecff;
+}
+
+.price-rec-source {
+  font-size: 0.78rem;
+  color: #6b7280;
+  font-style: italic;
 }

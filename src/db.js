@@ -270,6 +270,11 @@ export async function syncDrugsFromCloud() {
           minStockQty: drug.min_stock_qty ?? drug.minStockQty ?? null,
           recommendedPurchaseQty:
             drug.recommended_purchase_qty ?? drug.recommendedPurchaseQty ?? null,
+          // Past (costPrice, retailPrice, wholesalePrice) choices for this
+          // specific drug — feeds getPriceRecommendation() so the % profit
+          // suggested next time reflects what was actually chosen before,
+          // not just the generic default.
+          priceHistory: drug.price_history ?? drug.priceHistory ?? [],
           deletedAt: drug.deleted_at || drug.deletedAt || null,
           deletedBy: drug.deleted_by || drug.deletedBy || null,
           synced: 1
@@ -309,7 +314,8 @@ export async function syncPendingDrugsToCloud() {
           pack_qty: drug.packQty ?? null,
           pack_price: drug.packPrice ?? null,
           min_stock_qty: drug.minStockQty ?? null,
-          recommended_purchase_qty: drug.recommendedPurchaseQty ?? null
+          recommended_purchase_qty: drug.recommendedPurchaseQty ?? null,
+          price_history: drug.priceHistory ?? []
         }
       ]);
 
@@ -319,6 +325,149 @@ export async function syncPendingDrugsToCloud() {
     }
   } catch (err) {
     console.warn('Unable to sync pending drugs:', err.message);
+  }
+}
+
+// ============================================================
+// PRICE RECOMMENDATION ENGINE
+// ------------------------------------------------------------
+// Pure, synchronous — no db access, safe to call on every keystroke
+// for a live "as you type the cost price" suggestion.
+//
+// Below ₦10,000 cost, wholesale defaults to ~10% profit and retail to
+// ~30%, each independently rounded UP to a tidy price. Above ₦10,000,
+// wholesale and retail collapse into a single price in the 15%-35%
+// range (default 25%).
+//
+// Either side, if this specific drug has price history (past times
+// its cost/retail/wholesale were actually saved), the AVERAGE % profit
+// actually chosen for it is used instead of the generic default — the
+// software learning what this particular pharmacy tends to charge for
+// this particular drug, rather than applying one blanket rule to
+// everything.
+// ============================================================
+
+// Rounds a price UP to a tidy figure, with the rounding unit chosen
+// from the COST price's own size (not the computed sale price) — a
+// ₦50 drug rounds to the nearest ₦10, a ₦500 drug to the nearest
+// ₦100, anything ₦1,000 and up to the nearest ₦1,000.
+function roundSalePriceUp(rawPrice, costPrice) {
+  const unit = costPrice < 100 ? 10 : costPrice < 1000 ? 100 : 1000;
+  return Math.ceil(rawPrice / unit) * unit;
+}
+
+// Average % profit, (price - cost) / cost * 100, actually chosen in
+// the past — wholesale and retail tracked separately since a drug's
+// history may only have one or the other filled in on some entries.
+function averageLearnedPercents(priceHistory) {
+  if (!Array.isArray(priceHistory) || priceHistory.length === 0) {
+    return { wholesalePercent: null, retailPercent: null };
+  }
+  let wTotal = 0, wCount = 0, rTotal = 0, rCount = 0;
+  for (const entry of priceHistory) {
+    const cost = Number(entry.costPrice) || 0;
+    if (cost <= 0) continue;
+    const wholesale = Number(entry.wholesalePrice) || 0;
+    const retail = Number(entry.retailPrice) || 0;
+    if (wholesale > 0) {
+      wTotal += ((wholesale - cost) / cost) * 100;
+      wCount += 1;
+    }
+    if (retail > 0) {
+      rTotal += ((retail - cost) / cost) * 100;
+      rCount += 1;
+    }
+  }
+  return {
+    wholesalePercent: wCount > 0 ? wTotal / wCount : null,
+    retailPercent: rCount > 0 ? rTotal / rCount : null
+  };
+}
+
+// Returns null when the cost price isn't a usable positive number yet
+// (so the UI can simply not show a recommendation). Otherwise:
+// { wholesale, retail, wholesalePercent, retailPercent, sameForBoth, source }
+// `source` is 'learned' when at least one side came from this drug's
+// own history, 'default' when both sides used the generic rule.
+export function getPriceRecommendation(costPrice, priceHistory) {
+  const cost = Number(costPrice) || 0;
+  if (cost <= 0) return null;
+
+  const learned = averageLearnedPercents(priceHistory);
+  const hasLearned = learned.wholesalePercent != null || learned.retailPercent != null;
+
+  if (cost > 10000) {
+    // High-value drugs: one price serves both sale types, and the
+    // "normal" range widens to 15%-35% (default 25%) rather than the
+    // fixed 10%/30% used below ₦10,000.
+    const learnedPercent = learned.retailPercent ?? learned.wholesalePercent;
+    const percent = learnedPercent != null
+      ? Math.min(35, Math.max(15, learnedPercent))
+      : 25;
+    const rounded = roundSalePriceUp(cost * (1 + percent / 100), cost);
+    return {
+      wholesale: rounded,
+      retail: rounded,
+      wholesalePercent: percent,
+      retailPercent: percent,
+      sameForBoth: true,
+      source: learnedPercent != null ? 'learned' : 'default'
+    };
+  }
+
+  const wholesalePercent = learned.wholesalePercent ?? 10;
+  const retailPercent = learned.retailPercent ?? 30;
+
+  return {
+    wholesale: roundSalePriceUp(cost * (1 + wholesalePercent / 100), cost),
+    retail: roundSalePriceUp(cost * (1 + retailPercent / 100), cost),
+    wholesalePercent,
+    retailPercent,
+    sameForBoth: false,
+    source: hasLearned ? 'learned' : 'default'
+  };
+}
+
+// Called whenever a drug's cost/retail/wholesale prices are actually
+// saved (the Drugs CRUD form, or a restock line, new or existing drug)
+// — appends one entry to that drug's price history so future
+// recommendations for THIS drug can learn from what was really chosen,
+// not just the generic default percentages. Keeps only the most
+// recent 20 entries; that's plenty to average over.
+export async function recordDrugPriceChoice(drugId, costPrice, retailPrice, wholesalePrice) {
+  try {
+    const cost = Number(costPrice) || 0;
+    const retail = Number(retailPrice) || 0;
+    const wholesale = Number(wholesalePrice) || 0;
+    if (cost <= 0 || (retail <= 0 && wholesale <= 0)) return;
+
+    const drug = await db.drugs.get(drugId);
+    if (!drug) return;
+
+    const history = Array.isArray(drug.priceHistory) ? drug.priceHistory : [];
+    const entry = {
+      costPrice: cost,
+      retailPrice: retail,
+      wholesalePrice: wholesale,
+      recordedAt: new Date().toISOString()
+    };
+    const updatedHistory = [...history, entry].slice(-20);
+
+    await db.drugs.update(drugId, { priceHistory: updatedHistory, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('drugs')
+          .update({ price_history: updatedHistory })
+          .eq('id', drugId);
+        if (!error) await db.drugs.update(drugId, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud price-history update postponed:', err.message);
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to record price choice:', err.message);
   }
 }
 
@@ -599,6 +748,13 @@ export async function requestDrugEdit(drug, changes, actor) {
         }
       }
 
+      await recordDrugPriceChoice(
+        drug.id,
+        changes.costPrice,
+        changes.retailPrice,
+        changes.wholesalePrice
+      );
+
       await logAuditEvent({
         actorEmail: actor?.email,
         actorRole: actor?.role,
@@ -775,6 +931,13 @@ export async function approveDrugChangeRequest(request, actor) {
           console.warn('Cloud drug edit (approved) postponed:', err.message);
         }
       }
+
+      await recordDrugPriceChoice(
+        target.drugId,
+        target.proposedChanges.costPrice,
+        target.proposedChanges.retailPrice,
+        target.proposedChanges.wholesalePrice
+      );
     } else {
       await softDeleteDrug(target.drugId, actor);
     }
@@ -2021,6 +2184,11 @@ export async function syncPendingSupplierChangeRequestsToCloud() {
 // each line affected.
 async function applyStockEntryToDrugs(entry) {
   const resolvedItems = [];
+  // Collected here and recorded AFTER the transaction below commits —
+  // recordDrugPriceChoice does its own db.drugs.get/update, and keeping
+  // that outside the transaction avoids nesting a second read-modify
+  // cycle on the same table inside the one already in progress.
+  const priceChoicesToRecord = [];
 
   await db.transaction('rw', db.drugs, async () => {
     for (const item of entry.items) {
@@ -2053,6 +2221,12 @@ async function applyStockEntryToDrugs(entry) {
           });
         }
         resolvedItems.push({ ...item, drugId: newId });
+        priceChoicesToRecord.push({
+          drugId: newId,
+          costPrice: item.costPrice,
+          retailPrice: item.retailPrice,
+          wholesalePrice: item.wholesalePrice
+        });
       } else if (item.drugId) {
         const existingDrug =
           (await db.drugs.get(String(item.drugId))) ||
@@ -2077,6 +2251,12 @@ async function applyStockEntryToDrugs(entry) {
             updates.wholesalePrice = Number(item.wholesalePrice);
           }
           await db.drugs.update(existingDrug.id, updates);
+          priceChoicesToRecord.push({
+            drugId: existingDrug.id,
+            costPrice: updates.costPrice ?? existingDrug.costPrice,
+            retailPrice: updates.retailPrice ?? existingDrug.retailPrice,
+            wholesalePrice: updates.wholesalePrice ?? existingDrug.wholesalePrice
+          });
         }
         resolvedItems.push(item);
       } else {
@@ -2084,6 +2264,17 @@ async function applyStockEntryToDrugs(entry) {
       }
     }
   });
+
+  // Learn from every price that was actually set on this delivery, new
+  // drug or restock of an existing one alike.
+  for (const choice of priceChoicesToRecord) {
+    await recordDrugPriceChoice(
+      choice.drugId,
+      choice.costPrice,
+      choice.retailPrice,
+      choice.wholesalePrice
+    );
+  }
 
   // Push every drug this just touched (or created) up to the cloud. The
   // generic drug-sync retry already covers it if this fails or the
@@ -3854,6 +4045,7 @@ export async function fetchBankOptions() {
         id: String(b.id),
         name: b.name,
         active: b.active !== false,
+        color: b.color || null,
         synced: 1
       }));
 
@@ -3865,11 +4057,17 @@ export async function fetchBankOptions() {
   }
 }
 
-export async function addBankOption(name, actor) {
+// `color` is optional — an administrator can set it (or change it later
+// with updateBankOption) so a bank reads consistently everywhere it's
+// picked from (OPAY green, Moniepoint light blue, etc.), but nothing
+// forces a particular color; a bank with none just falls back to a
+// neutral default chip in the UI.
+export async function addBankOption(name, actor, color) {
   const bankOption = {
     id: generateId('BANK'),
     name: name.trim(),
     active: true,
+    color: color || null,
     synced: 0
   };
 
@@ -3878,7 +4076,7 @@ export async function addBankOption(name, actor) {
   if (navigator.onLine) {
     try {
       const { error } = await supabase.from('bank_options').insert([
-        { id: bankOption.id, name: bankOption.name, active: true }
+        { id: bankOption.id, name: bankOption.name, active: true, color: bankOption.color }
       ]);
       if (!error) await db.bankOptions.update(bankOption.id, { synced: 1 });
     } catch (err) {
@@ -3896,6 +4094,32 @@ export async function addBankOption(name, actor) {
   });
 
   return bankOption;
+}
+
+export async function updateBankOption(id, changes, actor) {
+  const payload = {};
+  if (changes.name !== undefined) payload.name = changes.name.trim();
+  if (changes.color !== undefined) payload.color = changes.color || null;
+
+  await db.bankOptions.update(id, { ...payload, synced: 0 });
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('bank_options').update(payload).eq('id', id);
+      if (!error) await db.bankOptions.update(id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud bank option update postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'bank_option_updated',
+    targetType: 'bank_option',
+    targetId: id,
+    details: payload
+  });
 }
 
 export async function removeBankOption(id, actor) {
@@ -3932,7 +4156,7 @@ export async function syncPendingBankOptionsToCloud() {
 
     for (const option of pending) {
       const { error } = await supabase.from('bank_options').upsert([
-        { id: option.id, name: option.name, active: option.active }
+        { id: option.id, name: option.name, active: option.active, color: option.color || null }
       ]);
       if (!error) {
         await db.bankOptions.update(option.id, { synced: 1 });

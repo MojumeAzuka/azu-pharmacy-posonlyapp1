@@ -33,6 +33,7 @@ import {
   fetchBankOptions,
   addBankOption,
   removeBankOption,
+  updateBankOption,
   syncPendingBankOptionsToCloud,
   logAuditEvent,
   fetchSuppliers,
@@ -72,11 +73,57 @@ import {
   approveDrugChangeRequest,
   rejectDrugChangeRequest,
   fetchCloudDrugChangeRequests,
-  syncPendingDrugChangeRequestsToCloud
+  syncPendingDrugChangeRequestsToCloud,
+  getPriceRecommendation,
+  recordDrugPriceChoice
 } from './db';
 import './App.css';
 
 const LAST_SEEN_AUDIT_KEY = 'azu_last_seen_manager_changes';
+
+// A small, self-contained "as you type the cost price" suggestion —
+// pure/stateless, driven entirely by props, so it can drop into any
+// cost-price field (the Drugs CRUD form, a restock line) without
+// knowing anything about where it's being used. Renders nothing when
+// the cost price isn't a usable number yet.
+function PriceRecommendationHint({ costPrice, priceHistory, onPickWholesale, onPickRetail }) {
+  const rec = getPriceRecommendation(costPrice, priceHistory);
+  if (!rec) return null;
+
+  const learnedNote = rec.source === 'learned' ? ' · based on your past prices for this drug' : '';
+
+  if (rec.sameForBoth) {
+    return (
+      <div className="price-recommendation-hint">
+        <button
+          type="button"
+          className="price-rec-chip"
+          onClick={() => {
+            onPickWholesale(rec.wholesale);
+            onPickRetail(rec.retail);
+          }}
+        >
+          💡 Suggested price: ₦{rec.wholesale.toLocaleString()} (
+          {rec.retailPercent.toFixed(0)}% profit){learnedNote}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="price-recommendation-hint">
+      <button type="button" className="price-rec-chip" onClick={() => onPickWholesale(rec.wholesale)}>
+        💡 Wholesale ₦{rec.wholesale.toLocaleString()} ({rec.wholesalePercent.toFixed(0)}%)
+      </button>
+      <button type="button" className="price-rec-chip" onClick={() => onPickRetail(rec.retail)}>
+        💡 Retail ₦{rec.retail.toLocaleString()} ({rec.retailPercent.toFixed(0)}%)
+      </button>
+      {rec.source === 'learned' && (
+        <span className="price-rec-source">based on your past prices for this drug</span>
+      )}
+    </div>
+  );
+}
 
 export default function App() {
   // ============================================================
@@ -258,6 +305,8 @@ export default function App() {
   // the per-customer draft carts.
   const [lastAddedItemId, setLastAddedItemId] = useState(null);
   const lastAddedTimeoutRef = useRef(null);
+  const [stockWarning, setStockWarning] = useState('');
+  const stockWarningTimeoutRef = useRef(null);
   const draftCartListRef = useRef(null);
 
   // Cashier-side: which PENDING_PAYMENT ticket is open in the
@@ -265,9 +314,17 @@ export default function App() {
   // chosen bank being entered for it.
   const [approvingTicket, setApprovingTicket] = useState(null);
   const [paymentCash, setPaymentCash] = useState('');
-  const [paymentBank, setPaymentBank] = useState('');
-  const [paymentCard, setPaymentCard] = useState('');
-  const [paymentBankOption, setPaymentBankOption] = useState('');
+  // The top-level choice the cashier makes first: Cash is the simple
+  // case (no bank involved). Card and Transfer are both "electronic"
+  // and each need a bank attached — a card payment still clears through
+  // a specific bank account, same as a transfer. Split is the general
+  // case: cash plus any number of card/transfer lines, each with its
+  // own bank and amount, so a transfer that was genuinely split across
+  // two different banks (or a transfer made twice — see the "sent back
+  // for one more item, customer transferred again" note below) is just
+  // two lines instead of something this form can't represent.
+  const [paymentMethod, setPaymentMethod] = useState('cash');
+  const [paymentElectronicLines, setPaymentElectronicLines] = useState([]);
   const [isApprovingTicket, setIsApprovingTicket] = useState(false);
 
   // Cashier-side: which PENDING_PAYMENT ticket is open in the "send
@@ -280,6 +337,7 @@ export default function App() {
 
   // Admin: new bank-option name being typed into the add box.
   const [newBankOptionName, setNewBankOptionName] = useState('');
+  const [newBankOptionColor, setNewBankOptionColor] = useState('#6b7280');
 
   // The just-submitted ticket shown in the printable "take this to the
   // cashier" slip modal (separate from the receipt modal, which is only
@@ -615,6 +673,8 @@ export default function App() {
           saleType: s.sale_type || s.saleType || 'retail',
           cashierId: s.cashier_id || s.cashierId,
           cashierEmail: s.cashier_email || s.cashierEmail,
+          attendantId: s.attendant_id || s.attendantId || null,
+          attendantEmail: s.attendant_email || s.attendantEmail || null,
           customerName:
             s.customer_name || s.customerName || 'Walk-in Customer',
           customerPhone: s.customer_phone || s.customerPhone || 'N/A',
@@ -1597,6 +1657,17 @@ export default function App() {
   };
 
   const addToDraft = (draftId, drug) => {
+    // A drug with zero stock on record can't actually be sold — rather
+    // than silently letting it onto a ticket (which a cashier would
+    // only discover was impossible to fulfil later), tell the
+    // salesperson right away with a brief, self-dismissing message.
+    if (Number(drug.stock || 0) <= 0) {
+      setStockWarning(`${drug.name} is out of stock — can't be sold right now.`);
+      if (stockWarningTimeoutRef.current) clearTimeout(stockWarningTimeoutRef.current);
+      stockWarningTimeoutRef.current = setTimeout(() => setStockWarning(''), 3000);
+      return;
+    }
+
     setLastAddedItemId(drug.id);
     if (lastAddedTimeoutRef.current) clearTimeout(lastAddedTimeoutRef.current);
     lastAddedTimeoutRef.current = setTimeout(() => setLastAddedItemId(null), 900);
@@ -1742,10 +1813,46 @@ export default function App() {
   // ============================================================
   const handleOpenApproveModal = (ticket) => {
     setApprovingTicket(ticket);
-    setPaymentCash('');
-    setPaymentBank('');
-    setPaymentCard('');
-    setPaymentBankOption(bankOptions?.[0]?.name || '');
+    setPaymentMethod('cash');
+    setPaymentCash(String(ticket.total || ''));
+    setPaymentElectronicLines([]);
+  };
+
+  // Switching the top-level method sets sensible defaults but never
+  // picks a bank for the cashier — that choice is always explicit, and
+  // handleConfirmApproval refuses to approve without it.
+  const handleSelectPaymentMethod = (method) => {
+    setPaymentMethod(method);
+    if (method === 'cash') {
+      setPaymentCash(String(approvingTicket?.total || ''));
+      setPaymentElectronicLines([]);
+    } else if (method === 'card' || method === 'transfer') {
+      setPaymentCash('');
+      setPaymentElectronicLines([
+        { id: `line-${Date.now()}`, type: method, bank: '', amount: String(approvingTicket?.total || '') }
+      ]);
+    } else {
+      // Split — start empty, cashier builds it up line by line.
+      setPaymentCash('');
+      setPaymentElectronicLines([]);
+    }
+  };
+
+  const handleAddElectronicLine = (type) => {
+    setPaymentElectronicLines((prev) => [
+      ...prev,
+      { id: `line-${Date.now()}-${Math.floor(Math.random() * 1000)}`, type, bank: '', amount: '' }
+    ]);
+  };
+
+  const handleUpdateElectronicLine = (id, changes) => {
+    setPaymentElectronicLines((prev) =>
+      prev.map((line) => (line.id === id ? { ...line, ...changes } : line))
+    );
+  };
+
+  const handleRemoveElectronicLine = (id) => {
+    setPaymentElectronicLines((prev) => prev.filter((line) => line.id !== id));
   };
 
   const handleConfirmApproval = async () => {
@@ -1763,9 +1870,29 @@ export default function App() {
     }
 
     const cash = Number(paymentCash) || 0;
-    const bank = Number(paymentBank) || 0;
-    const card = Number(paymentCard) || 0;
-    const sum = cash + bank + card;
+    const electronicLines = paymentElectronicLines.map((line) => ({
+      ...line,
+      amount: Number(line.amount) || 0
+    }));
+
+    // Every card/transfer line with money against it needs a bank —
+    // this is the actual fix for being able to approve (and print a
+    // receipt) without ever choosing one: previously the bank dropdown
+    // silently defaulted to the first bank in the list the moment the
+    // modal opened, so the check for "is a bank chosen" never failed.
+    // Now nothing is pre-selected, so a missing choice is really missing.
+    const lineMissingBank = electronicLines.find(
+      (line) => line.amount > 0 && !line.bank
+    );
+    if (lineMissingBank) {
+      alert(
+        `Select which bank the ${lineMissingBank.type === 'card' ? 'card' : 'transfer'} payment of ₦${lineMissingBank.amount.toLocaleString()} went through.`
+      );
+      return;
+    }
+
+    const electronicTotal = electronicLines.reduce((sum, line) => sum + line.amount, 0);
+    const sum = cash + electronicTotal;
 
     // Allow a 1-naira tolerance for rounding, not more — a payment
     // short or over the ticket total is exactly the kind of mistake
@@ -1773,13 +1900,8 @@ export default function App() {
     // till.
     if (Math.abs(sum - approvingTicket.total) > 1) {
       alert(
-        `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the cash/bank/card amounts so they add up exactly.`
+        `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the amounts so they add up exactly.`
       );
-      return;
-    }
-
-    if (bank > 0 && !paymentBankOption) {
-      alert('Select which bank the transfer was made to.');
       return;
     }
 
@@ -1787,10 +1909,11 @@ export default function App() {
 
     try {
       const paymentBreakdown = {
+        method: paymentMethod,
         cash,
-        bank,
-        bankOption: bank > 0 ? paymentBankOption : null,
-        card
+        electronic: electronicLines
+          .filter((line) => line.amount > 0)
+          .map((line) => ({ type: line.type, bank: line.bank, amount: line.amount }))
       };
 
       const result = await approveTicket(approvingTicket, paymentBreakdown, {
@@ -2656,12 +2779,14 @@ export default function App() {
     const name = newBankOptionName.trim();
     if (!name) return;
 
-    await addBankOption(name, {
-      email: session?.user?.email,
-      role: userRole
-    });
+    await addBankOption(
+      name,
+      { email: session?.user?.email, role: userRole },
+      newBankOptionColor
+    );
 
     setNewBankOptionName('');
+    setNewBankOptionColor('#6b7280');
   };
 
   const handleRemoveBankOption = async (option) => {
@@ -2671,6 +2796,14 @@ export default function App() {
       email: session?.user?.email,
       role: userRole
     });
+  };
+
+  const handleChangeBankOptionColor = async (option, color) => {
+    await updateBankOption(
+      option.id,
+      { color },
+      { email: session?.user?.email, role: userRole }
+    );
   };
 
   // ============================================================
@@ -3087,6 +3220,15 @@ export default function App() {
         await db.drugs.add(drugPayload);
       }
 
+      // Learn from this choice for next time's recommendation on this
+      // same drug — fire-and-forget, never blocks closing the form.
+      recordDrugPriceChoice(
+        drugId,
+        drugPayload.costPrice,
+        drugPayload.retailPrice,
+        drugPayload.wholesalePrice
+      ).catch((err) => console.warn('Price-history record failed:', err.message));
+
       // The local write is done — close the form immediately instead
       // of making the user wait on the network. This also removes the
       // Save button from the screen, so there's nothing left to
@@ -3443,6 +3585,10 @@ export default function App() {
       ======================================================== */}
       {activeTab === 'pos' && userRole !== 'cashier' && userRole !== 'administrator' && (
         <div className="tickets-screen no-print">
+
+          {stockWarning && (
+            <div className="stock-warning-toast">⚠️ {stockWarning}</div>
+          )}
 
           <section className="admin-section">
             <div className="admin-section-header">
@@ -3929,6 +4075,14 @@ export default function App() {
                       </strong>{' '}
                       {sale.customerPhone ||
                         'N/A'}
+                    </span>
+
+                    <span>
+                      🧑‍💼{' '}
+                      <strong>
+                        Salesperson:
+                      </strong>{' '}
+                      {sale.attendantEmail || '— (direct sale)'}
                     </span>
 
                     <span>
@@ -4527,6 +4681,17 @@ export default function App() {
                       </div>
                     </div>
 
+                    <PriceRecommendationHint
+                      costPrice={newDrugLine.costPrice}
+                      priceHistory={null}
+                      onPickRetail={(price) =>
+                        setNewDrugLine((prev) => ({ ...prev, retailPrice: String(price) }))
+                      }
+                      onPickWholesale={(price) =>
+                        setNewDrugLine((prev) => ({ ...prev, wholesalePrice: String(price) }))
+                      }
+                    />
+
                     <div className="form-row">
                       <div>
                         <label>Retail Price (₦):</label>
@@ -4716,6 +4881,22 @@ export default function App() {
                               }
                             />
                           </label>
+                          {!item.isNewDrug && (
+                            <PriceRecommendationHint
+                              costPrice={item.costPrice}
+                              priceHistory={
+                                (drugs || []).find(
+                                  (d) => String(d.id) === String(item.drugId)
+                                )?.priceHistory
+                              }
+                              onPickRetail={(price) =>
+                                updateRestockLine(idx, 'retailPrice', price)
+                              }
+                              onPickWholesale={(price) =>
+                                updateRestockLine(idx, 'wholesalePrice', price)
+                              }
+                            />
+                          )}
                           {item.isNewDrug && (
                             <>
                               <label>
@@ -5721,6 +5902,13 @@ export default function App() {
                 value={newBankOptionName}
                 onChange={(e) => setNewBankOptionName(e.target.value)}
               />
+              <input
+                type="color"
+                title="Bank color"
+                className="bank-color-input"
+                value={newBankOptionColor}
+                onChange={(e) => setNewBankOptionColor(e.target.value)}
+              />
               <button className="save-btn" onClick={handleAddBankOption}>
                 + Add Bank
               </button>
@@ -5731,9 +5919,20 @@ export default function App() {
                 {bankOptions.map((option) => (
                   <div key={option.id} className="deleted-drug-card">
                     <div className="deleted-drug-info">
+                      <span
+                        className="bank-color-dot"
+                        style={{ backgroundColor: option.color || '#6b7280' }}
+                      />
                       <strong>{option.name}</strong>
                     </div>
                     <div className="deleted-drug-actions">
+                      <input
+                        type="color"
+                        title="Change bank color"
+                        className="bank-color-input"
+                        value={option.color || '#6b7280'}
+                        onChange={(e) => handleChangeBankOptionColor(option, e.target.value)}
+                      />
                       <button
                         className="permanent-delete-btn"
                         onClick={() => handleRemoveBankOption(option)}
@@ -6076,59 +6275,127 @@ export default function App() {
             </ul>
 
             <p className="form-section-hint">
-              Total Due: ₦{approvingTicket.total.toLocaleString()}. Enter how
-              much was paid by each method — cash, bank and card amounts must
-              add up to the total exactly (splitting across methods is fine).
+              Total Due: ₦{approvingTicket.total.toLocaleString()}. Choose how
+              it was paid — card and transfer both need a bank, and Split
+              lets you combine cash with several card/transfer lines (handy
+              if a customer transferred more than once).
             </p>
 
-            <div className="form-row">
-              <div>
-                <label>Cash (₦):</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={paymentCash}
-                  onChange={(e) => setPaymentCash(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <label>Card (₦):</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={paymentCard}
-                  onChange={(e) => setPaymentCard(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div className="form-row">
-              <div>
-                <label>Bank Transfer (₦):</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={paymentBank}
-                  onChange={(e) => setPaymentBank(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <label>Bank:</label>
-                <select
-                  value={paymentBankOption}
-                  onChange={(e) => setPaymentBankOption(e.target.value)}
+            <div className="payment-method-selector">
+              {[
+                { key: 'cash', label: '💵 Cash' },
+                { key: 'card', label: '💳 Card' },
+                { key: 'transfer', label: '🏦 Transfer' },
+                { key: 'split', label: '🔀 Split' }
+              ].map((m) => (
+                <button
+                  key={m.key}
+                  type="button"
+                  className={paymentMethod === m.key ? 'active' : ''}
+                  onClick={() => handleSelectPaymentMethod(m.key)}
                 >
-                  <option value="">Select bank…</option>
-                  {(bankOptions || []).map((b) => (
-                    <option key={b.id} value={b.name}>
-                      {b.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
+                  {m.label}
+                </button>
+              ))}
             </div>
+
+            {(paymentMethod === 'cash' || paymentMethod === 'split') && (
+              <div className="form-row">
+                <div>
+                  <label>Cash (₦):</label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={paymentCash}
+                    onChange={(e) => setPaymentCash(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+
+            {(paymentMethod === 'card' ||
+              paymentMethod === 'transfer' ||
+              paymentMethod === 'split') && (
+              <div className="electronic-lines">
+                {paymentElectronicLines.map((line) => (
+                  <div key={line.id} className="form-row electronic-line">
+                    <div>
+                      <label>{line.type === 'card' ? 'Card (₦):' : 'Transfer (₦):'}</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={line.amount}
+                        onChange={(e) =>
+                          handleUpdateElectronicLine(line.id, { amount: e.target.value })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label>Bank:</label>
+                      <div className="bank-chip-picker">
+                        {(bankOptions || []).map((b) => (
+                          <button
+                            type="button"
+                            key={b.id}
+                            className={`bank-chip ${line.bank === b.name ? 'selected' : ''}`}
+                            style={{
+                              backgroundColor: line.bank === b.name ? (b.color || '#6b7280') : 'transparent',
+                              borderColor: b.color || '#6b7280',
+                              color: line.bank === b.name ? '#fff' : (b.color || '#6b7280')
+                            }}
+                            onClick={() => handleUpdateElectronicLine(line.id, { bank: b.name })}
+                          >
+                            {b.name}
+                          </button>
+                        ))}
+                        {(!bankOptions || bankOptions.length === 0) && (
+                          <span className="admin-section-sub">
+                            No banks set up yet — add one from Admin → Bank Options.
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {paymentMethod === 'split' && (
+                      <button
+                        type="button"
+                        className="permanent-delete-btn"
+                        onClick={() => handleRemoveElectronicLine(line.id)}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                ))}
+
+                {paymentMethod === 'split' && (
+                  <div className="deleted-drug-actions">
+                    <button
+                      type="button"
+                      className="send-back-btn"
+                      onClick={() => handleAddElectronicLine('card')}
+                    >
+                      + Card line
+                    </button>
+                    <button
+                      type="button"
+                      className="send-back-btn"
+                      onClick={() => handleAddElectronicLine('transfer')}
+                    >
+                      + Transfer line
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <p className="form-section-hint">
+              Entered so far: ₦
+              {(
+                (Number(paymentCash) || 0) +
+                paymentElectronicLines.reduce((s, l) => s + (Number(l.amount) || 0), 0)
+              ).toLocaleString()}{' '}
+              of ₦{approvingTicket.total.toLocaleString()}
+            </p>
 
             <div className="modal-actions">
               <button
@@ -6945,6 +7212,17 @@ export default function App() {
                   </div>
 
                 </div>
+
+                <PriceRecommendationHint
+                  costPrice={formData.costPrice}
+                  priceHistory={editingDrug?.priceHistory}
+                  onPickRetail={(price) =>
+                    setFormData((prev) => ({ ...prev, retailPrice: String(price) }))
+                  }
+                  onPickWholesale={(price) =>
+                    setFormData((prev) => ({ ...prev, wholesalePrice: String(price) }))
+                  }
+                />
 
                 <div className="form-row">
 
