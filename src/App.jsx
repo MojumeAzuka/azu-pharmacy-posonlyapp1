@@ -63,11 +63,6 @@ import {
   fetchCloudSupplierChangeRequests,
   syncPendingSupplierChangeRequestsToCloud,
   recordSupplierPayment,
-  generatePurchaseList,
-  fetchCloudPurchaseLists,
-  syncPendingPurchaseListsToCloud,
-  savePurchaseList,
-  deletePurchaseList,
   requestDrugEdit,
   requestDeleteDrug,
   approveDrugChangeRequest,
@@ -75,7 +70,23 @@ import {
   fetchCloudDrugChangeRequests,
   syncPendingDrugChangeRequestsToCloud,
   getPriceRecommendation,
-  recordDrugPriceChoice
+  recordDrugPriceChoice,
+  fetchCloudPurchasePlans,
+  syncPendingPurchasePlansToCloud,
+  savePurchasePlan,
+  fetchCustomers,
+  addCustomer,
+  syncPendingCustomersToCloud,
+  updateCustomer,
+  softDeleteCustomer,
+  requestDeleteCustomer,
+  restoreCustomer,
+  permanentlyDeleteCustomer,
+  approveCustomerChangeRequest,
+  rejectCustomerChangeRequest,
+  fetchCloudCustomerChangeRequests,
+  syncPendingCustomerChangeRequestsToCloud,
+  getMinimumWholesalePayment
 } from './db';
 import './App.css';
 
@@ -231,15 +242,34 @@ export default function App() {
     address: ''
   });
 
+  // --- Wholesale Customers CRUD ---
+  const [customerSearchTerm, setCustomerSearchTerm] = useState('');
+  const [isCustomerModalOpen, setIsCustomerModalOpen] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState(null);
+  const [isSavingCustomerCrud, setIsSavingCustomerCrud] = useState(false);
+  const [customerFormData, setCustomerFormData] = useState({
+    name: '',
+    phone: '',
+    email: '',
+    address: ''
+  });
+  // A per-draft "pick a wholesale customer" search box — keyed off
+  // which draft opened it, so two customers' drafts don't fight over
+  // one shared picker.
+  const [customerPickerForDraftId, setCustomerPickerForDraftId] = useState(null);
+  const [draftCustomerSearchTerm, setDraftCustomerSearchTerm] = useState('');
+
   // --- Drugs CRUD list (separate from the ticket-builder search) ---
   const [drugCrudSearchTerm, setDrugCrudSearchTerm] = useState('');
 
-  // --- Purchase List ---
-  const [draftPurchaseList, setDraftPurchaseList] = useState(null); // { id?, title, items: [...] }
-  const [isGeneratingPurchaseList, setIsGeneratingPurchaseList] = useState(false);
-  const [purchaseListAddDrugTerm, setPurchaseListAddDrugTerm] = useState('');
-  const [viewingSavedPurchaseListId, setViewingSavedPurchaseListId] = useState(null);
-  const [isSavingPurchaseList, setIsSavingPurchaseList] = useState(false);
+  // --- Purchase List — a live, continuously-saved per-drug plan, not a
+  // generated-then-saved snapshot. Editing a quantity or supplier writes
+  // straight to db.purchasePlans; nothing here needs its own "saving"
+  // state beyond per-row busy flags.
+  const [purchasePlanSearchTerm, setPurchasePlanSearchTerm] = useState('');
+  const [showNotToBuyList, setShowNotToBuyList] = useState(false);
+  const [supplierPickerForDrugId, setSupplierPickerForDrugId] = useState(null);
+  const [printingPurchasePlan, setPrintingPurchasePlan] = useState(null);
 
   // --- Stock History (separate from the "last 7 days" edit-window list
   // and the 10-item "My Recent Stock Entries" slice already in restock) ---
@@ -268,6 +298,10 @@ export default function App() {
   // ============================================================
   const [bulkDeleteStart, setBulkDeleteStart] = useState('');
   const [bulkDeleteEnd, setBulkDeleteEnd] = useState('');
+  // Dashboard's custom date-range profit search — left blank until the
+  // admin picks a range.
+  const [dashboardRangeStart, setDashboardRangeStart] = useState('');
+  const [dashboardRangeEnd, setDashboardRangeEnd] = useState('');
   const [lastSeenAuditAt, setLastSeenAuditAt] = useState(
     () => localStorage.getItem(LAST_SEEN_AUDIT_KEY) || null
   );
@@ -678,6 +712,10 @@ export default function App() {
           customerName:
             s.customer_name || s.customerName || 'Walk-in Customer',
           customerPhone: s.customer_phone || s.customerPhone || 'N/A',
+          customerId: s.customer_id || s.customerId || null,
+          amountPaid: s.amount_paid ?? s.amountPaid ?? null,
+          customerBalanceBefore: s.customer_balance_before ?? s.customerBalanceBefore ?? null,
+          customerBalanceAfter: s.customer_balance_after ?? s.customerBalanceAfter ?? null,
           createdAt: s.created_at || s.createdAt,
           items:
             typeof s.items === 'string'
@@ -743,8 +781,16 @@ export default function App() {
         fetchCloudDrugChangeRequests();
       });
 
-      syncPendingPurchaseListsToCloud().then(() => {
-        fetchCloudPurchaseLists();
+      syncPendingPurchasePlansToCloud().then(() => {
+        fetchCloudPurchasePlans();
+      });
+
+      syncPendingCustomersToCloud().then(() => {
+        fetchCustomers();
+      });
+
+      syncPendingCustomerChangeRequestsToCloud().then(() => {
+        fetchCloudCustomerChangeRequests();
       });
 
       expireStaleTickets();
@@ -970,6 +1016,31 @@ export default function App() {
     return allSupplierChangeRequests.filter((r) => r.status === 'PENDING');
   }, [allSupplierChangeRequests]);
 
+  // Wholesale customers — same active/deleted split as suppliers.
+  const customers = useLiveQuery(() => db.customers.toArray(), []);
+  const activeCustomers = React.useMemo(
+    () => (customers || []).filter((c) => !c.deletedAt),
+    [customers]
+  );
+  const deletedCustomers = React.useMemo(
+    () => (customers || []).filter((c) => !!c.deletedAt),
+    [customers]
+  );
+  const customersById = React.useMemo(() => {
+    const map = new Map();
+    (customers || []).forEach((c) => map.set(String(c.id), c));
+    return map;
+  }, [customers]);
+
+  const allCustomerChangeRequests = useLiveQuery(
+    () => db.customerChangeRequests.orderBy('createdAt').reverse().toArray(),
+    []
+  );
+  const pendingCustomerChangeRequests = React.useMemo(() => {
+    if (!allCustomerChangeRequests) return [];
+    return allCustomerChangeRequests.filter((r) => r.status === 'PENDING');
+  }, [allCustomerChangeRequests]);
+
   // Same shape, for a cashier's drug edit/delete requests.
   const allDrugChangeRequests = useLiveQuery(
     () => db.drugChangeRequests.orderBy('createdAt').reverse().toArray(),
@@ -980,30 +1051,121 @@ export default function App() {
     return allDrugChangeRequests.filter((r) => r.status === 'PENDING');
   }, [allDrugChangeRequests]);
 
-  // `updatedAt` isn't part of the Dexie index for this table (only id /
-  // createdByEmail / createdAt / synced are), so ordering has to happen
-  // in JS after the fetch rather than via .orderBy('updatedAt'), which
-  // would throw ("not indexed") the moment this table has rows.
-  const allPurchaseLists = useLiveQuery(async () => {
-    const all = await db.purchaseLists.toArray();
-    return all.sort(
-      (a, b) =>
-        new Date(b.updatedAt || b.createdAt) -
-        new Date(a.updatedAt || a.createdAt)
-    );
-  }, []);
-  const myPurchaseLists = React.useMemo(() => {
-    if (!allPurchaseLists || !session) return [];
-    if (hasRole(userRole, 'manager')) return allPurchaseLists;
-    return allPurchaseLists.filter(
-      (p) => p.createdByEmail === session.user.email
-    );
-  }, [allPurchaseLists, session, userRole]);
+  // One row per drug, live — see the schema v13 comment in db.js for
+  // why this replaced the old generate/save/reopen purchase lists.
+  const purchasePlans = useLiveQuery(() => db.purchasePlans.toArray(), []);
+  const purchasePlanByDrugId = React.useMemo(() => {
+    const map = new Map();
+    (purchasePlans || []).forEach((p) => map.set(String(p.drugId), p));
+    return map;
+  }, [purchasePlans]);
 
   const allStockEntries = useLiveQuery(
     () => db.stockEntries.orderBy('createdAt').reverse().toArray(),
     []
   );
+
+  // The supplier most recently delivered each drug from an APPLIED
+  // stock entry — the live default shown on the purchase list whenever
+  // a drug's plan has no manual supplier override.
+  const lastSupplierByDrugId = React.useMemo(() => {
+    const map = new Map();
+    (allStockEntries || [])
+      .filter((e) => e.status === 'APPLIED' && e.supplierId)
+      .forEach((entry) => {
+        (entry.items || []).forEach((item) => {
+          if (!item.drugId) return;
+          const key = String(item.drugId);
+          const existing = map.get(key);
+          if (!existing || new Date(entry.createdAt) > new Date(existing.lastSeenAt)) {
+            map.set(key, {
+              supplierId: entry.supplierId,
+              supplierName: entry.supplierName,
+              lastSeenAt: entry.createdAt
+            });
+          }
+        });
+      });
+    return map;
+  }, [allStockEntries]);
+
+  // Everything currently finished or below its minimum, minus whatever
+  // has been pushed to "Not to Buy" — enriched with each drug's plan
+  // (or sensible defaults when it doesn't have one yet). This is THE
+  // purchase list: always live, never a stale snapshot. A drug drops
+  // off the instant its stock is restored, and reappears — with
+  // whatever quantity/supplier was last set for it — the moment it
+  // finishes again.
+  const purchaseNeedsList = React.useMemo(() => {
+    return (drugs || [])
+      .filter((d) => {
+        const stock = Number(d.stock || 0);
+        const min = d.minStockQty != null ? Number(d.minStockQty) : null;
+        const needsRestock = stock <= 0 || (min !== null && stock < min);
+        if (!needsRestock) return false;
+        const plan = purchasePlanByDrugId.get(String(d.id));
+        return !plan?.excluded;
+      })
+      .map((d) => {
+        const plan = purchasePlanByDrugId.get(String(d.id));
+        const lastSupplier = lastSupplierByDrugId.get(String(d.id));
+        const min = d.minStockQty != null ? Number(d.minStockQty) : null;
+        const fallbackQty =
+          d.recommendedPurchaseQty ??
+          (min !== null ? Math.max(min * 2 - Number(d.stock || 0), min) : 10);
+        const usingManualSupplier = Boolean(plan?.supplierManual && plan?.supplierId);
+        return {
+          drugId: d.id,
+          drugName: d.name,
+          unitType: d.unitType,
+          currentStock: Number(d.stock || 0),
+          minStockQty: min,
+          quantity: plan?.quantity ?? Math.max(1, Math.round(Number(fallbackQty) || 10)),
+          unitCost: plan?.unitCost ?? Number(d.costPrice || 0),
+          supplierId: usingManualSupplier ? plan.supplierId : lastSupplier?.supplierId || null,
+          supplierName: usingManualSupplier
+            ? plan.supplierName
+            : lastSupplier?.supplierName || null,
+          supplierIsManual: usingManualSupplier
+        };
+      })
+      .sort((a, b) => a.drugName.localeCompare(b.drugName));
+  }, [drugs, purchasePlanByDrugId, lastSupplierByDrugId]);
+
+  const filteredPurchaseNeedsList = React.useMemo(() => {
+    const term = purchasePlanSearchTerm.trim().toLowerCase();
+    if (!term) return purchaseNeedsList;
+    return purchaseNeedsList.filter((item) =>
+      item.drugName.toLowerCase().includes(term)
+    );
+  }, [purchaseNeedsList, purchasePlanSearchTerm]);
+
+  // Drugs deliberately set aside — shown regardless of current stock
+  // level, since the point is "don't show me this until I say so".
+  const notToBuyList = React.useMemo(() => {
+    const excludedIds = new Set(
+      (purchasePlans || []).filter((p) => p.excluded).map((p) => String(p.drugId))
+    );
+    if (excludedIds.size === 0) return [];
+    return (drugs || [])
+      .filter((d) => excludedIds.has(String(d.id)))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [drugs, purchasePlans]);
+
+  // Grouped by supplier for printing/export — "Unspecified Supplier"
+  // catches anything with no known or chosen supplier at all.
+  const purchaseListGroupedBySupplier = React.useCallback((items) => {
+    const groups = new Map();
+    items.forEach((item) => {
+      const key = item.supplierId || '__unspecified__';
+      const label = item.supplierName || 'Unspecified Supplier';
+      if (!groups.has(key)) groups.set(key, { supplierName: label, items: [] });
+      groups.get(key).items.push(item);
+    });
+    return Array.from(groups.values()).sort((a, b) =>
+      a.supplierName.localeCompare(b.supplierName)
+    );
+  }, []);
 
   // Only cashiers and managers touch this feature at all — a manager's
   // own entry is applied the moment they submit it; a cashier's sits
@@ -1280,6 +1442,103 @@ export default function App() {
       (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
     );
   }, [localSales, cloudSales]);
+
+  // ============================================================
+  // ADMIN: FINANCIAL DASHBOARD
+  // Total stock value, amount owed to suppliers, today's sales/profit,
+  // and profit over any admin-chosen date range — all computed live
+  // from data already loaded elsewhere (drugs, stock entries, sales),
+  // nothing extra fetched or stored for this.
+  // ============================================================
+
+  // What every drug currently sitting in stock is worth, at cost.
+  const dashboardStockValue = React.useMemo(() => {
+    return (allActiveDrugsForCrud || []).reduce(
+      (sum, d) => sum + Number(d.stock || 0) * Number(d.costPrice || 0),
+      0
+    );
+  }, [allActiveDrugsForCrud]);
+
+  // What's still owed across every APPLIED stock entry — i.e. stock
+  // that's already in the pharmacy but hasn't been fully paid for yet.
+  const dashboardOwedToSuppliers = React.useMemo(() => {
+    return (allStockEntries || [])
+      .filter((e) => e.status === 'APPLIED')
+      .reduce((sum, e) => {
+        const owed = Number(e.totalCost || 0) - Number(e.amountPaid || 0);
+        return sum + (owed > 0 ? owed : 0);
+      }, 0);
+  }, [allStockEntries]);
+
+  // Quick drugId -> drug lookup, for sale line items old enough that
+  // they predate the costPrice snapshot on the item itself.
+  const dashboardDrugLookup = React.useMemo(() => {
+    const map = new Map();
+    (allActiveDrugsForCrud || []).forEach((d) => map.set(String(d.id), d));
+    return map;
+  }, [allActiveDrugsForCrud]);
+
+  // Profit on one sale: revenue minus what each line item actually
+  // cost. Prefers the costPrice snapshotted on the item at sale time;
+  // falls back to the drug's current cost price for older sales/items
+  // that predate that snapshot, and treats it as 0 cost (counts the
+  // full line as profit) only if the drug can no longer be found at
+  // all — better than silently dropping the sale from the figures.
+  const computeSaleProfit = React.useCallback(
+    (sale) => {
+      return (sale.items || []).reduce((sum, item) => {
+        const qty = Number(item.quantity || 0);
+        const lineTotal = Number(item.lineTotal || 0);
+        let costPrice = Number(item.costPrice || 0);
+        if (!costPrice) {
+          const drug = dashboardDrugLookup.get(String(item.id));
+          costPrice = Number(drug?.costPrice || 0);
+        }
+        return sum + (lineTotal - costPrice * qty);
+      }, 0);
+    },
+    [dashboardDrugLookup]
+  );
+
+  const dashboardTodaySales = React.useMemo(() => {
+    const now = new Date();
+    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return (allSalesForSearch || []).filter(
+      (s) => new Date(s.createdAt) >= startOfDay
+    );
+  }, [allSalesForSearch]);
+
+  const dashboardTodayTotals = React.useMemo(() => {
+    return dashboardTodaySales.reduce(
+      (acc, sale) => {
+        acc.revenue += Number(sale.total || 0);
+        acc.profit += computeSaleProfit(sale);
+        return acc;
+      },
+      { revenue: 0, profit: 0 }
+    );
+  }, [dashboardTodaySales, computeSaleProfit]);
+
+  // Profit over whatever date range the admin picks — blank until
+  // both ends are chosen.
+  const dashboardRangeTotals = React.useMemo(() => {
+    if (!dashboardRangeStart || !dashboardRangeEnd) return null;
+    const rangeStart = new Date(`${dashboardRangeStart}T00:00:00.000`);
+    const rangeEnd = new Date(`${dashboardRangeEnd}T23:59:59.999`);
+    const inRange = (allSalesForSearch || []).filter((s) => {
+      const t = new Date(s.createdAt);
+      return t >= rangeStart && t <= rangeEnd;
+    });
+    return inRange.reduce(
+      (acc, sale) => {
+        acc.revenue += Number(sale.total || 0);
+        acc.profit += computeSaleProfit(sale);
+        acc.count += 1;
+        return acc;
+      },
+      { revenue: 0, profit: 0, count: 0 }
+    );
+  }, [allSalesForSearch, dashboardRangeStart, dashboardRangeEnd, computeSaleProfit]);
 
   // ============================================================
   // ADMIN: DRUG SALE ACCOUNTABILITY SEARCH
@@ -1598,7 +1857,11 @@ export default function App() {
       // Snapshot the pack-discounted total at sale time, so a receipt or
       // history record still shows what was actually charged even if
       // the drug's pack pricing is edited later.
-      lineTotal: computePackPricing(item).total
+      lineTotal: computePackPricing(item).total,
+      // Snapshot the cost price too — the admin dashboard's profit
+      // figures need what this item actually cost AT THE TIME OF SALE,
+      // not whatever the drug's cost price has drifted to since.
+      costPrice: Number(item.costPrice ?? item.cost_price ?? 0)
     }));
 
   // ============================================================
@@ -1771,6 +2034,13 @@ export default function App() {
       return;
     }
 
+    // A wholesale sale always needs a real customer record attached —
+    // that's what carries their running balance across purchases.
+    if (draft.saleType === 'wholesale' && !draft.customerId) {
+      alert('Choose (or add) a wholesale customer before sending this ticket to the cashier.');
+      return;
+    }
+
     setIsSubmittingTicket(true);
 
     try {
@@ -1780,6 +2050,7 @@ export default function App() {
         saleType: draft.saleType,
         customerName: draft.customerName.trim() || 'Walk-in Customer',
         customerPhone: draft.customerPhone.trim() || 'N/A',
+        customerId: draft.saleType === 'wholesale' ? draft.customerId || null : null,
         attendantId: session?.user?.id,
         attendantEmail: session?.user?.email
       };
@@ -1894,15 +2165,33 @@ export default function App() {
     const electronicTotal = electronicLines.reduce((sum, line) => sum + line.amount, 0);
     const sum = cash + electronicTotal;
 
-    // Allow a 1-naira tolerance for rounding, not more — a payment
-    // short or over the ticket total is exactly the kind of mistake
-    // this split-role workflow exists to catch before it leaves the
-    // till.
-    if (Math.abs(sum - approvingTicket.total) > 1) {
-      alert(
-        `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the amounts so they add up exactly.`
-      );
-      return;
+    const isWholesaleWithCustomer =
+      approvingTicket.saleType === 'wholesale' && approvingTicket.customerId;
+
+    if (isWholesaleWithCustomer) {
+      // A wholesale customer is allowed to owe — that's the incentive
+      // to keep buying — but whatever they already owed coming in has
+      // to be cleared first. The new ticket's own total can go fully
+      // or partly unpaid; only the OLD balance is a hard floor.
+      const customer = customersById.get(String(approvingTicket.customerId));
+      const minimumRequired = getMinimumWholesalePayment(customer);
+      if (sum + 1 < minimumRequired) {
+        alert(
+          `${approvingTicket.customerName} still owes ₦${minimumRequired.toLocaleString()} from before — at least that much has to be paid before this sale can go through. Collect ₦${minimumRequired.toLocaleString()} or more, or send this ticket back to the salesperson.`
+        );
+        return;
+      }
+    } else {
+      // Allow a 1-naira tolerance for rounding, not more — a payment
+      // short or over the ticket total is exactly the kind of mistake
+      // this split-role workflow exists to catch before it leaves the
+      // till.
+      if (Math.abs(sum - approvingTicket.total) > 1) {
+        alert(
+          `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the amounts so they add up exactly.`
+        );
+        return;
+      }
     }
 
     setIsApprovingTicket(true);
@@ -1926,6 +2215,15 @@ export default function App() {
         setApprovingTicket(null);
         setSaleSuccessData(result.sale);
         setShowReceiptModal(true);
+      } else if (result.insufficientWholesalePayment) {
+        // Defense in depth — the same check already ran client-side
+        // above, but the server-side numbers are the ones that count if
+        // the customer's balance changed from another device in the
+        // meantime.
+        alert(
+          result.reason ||
+            `At least ₦${result.minimumRequired.toLocaleString()} has to be paid before this sale can go through.`
+        );
       } else {
         alert(result.reason || 'Unable to approve this ticket.');
       }
@@ -2047,6 +2345,11 @@ export default function App() {
         items: rehydratedItems,
         customerName: ticket.customerName || `Customer ${nextDraftLetter()}`,
         customerPhone: ticket.customerPhone || '',
+        // Carried over so a reopened wholesale ticket keeps its linked
+        // customer record (and their running balance) instead of
+        // silently losing it and getting blocked on resubmit for
+        // "no customer chosen" on a ticket that already had one.
+        customerId: ticket.customerId || null,
         saleType: ticket.saleType || 'retail',
         resubmitOf: ticket.id
       }
@@ -2171,141 +2474,151 @@ export default function App() {
   };
 
   // ============================================================
-  // AUTOMATED PURCHASE LIST (scans stock, flags what's finished or
-  // below minStockQty, recommends a supplier per drug based on
-  // purchase history). The generated list lives in `draftPurchaseList`
-  // as a working copy — nothing is saved until "Save List" is clicked.
-  // Each line carries its own `unitCost` (seeded from the drug's
-  // current cost price, editable) so a total can be shown without the
-  // saved list depending on the catalog never changing underneath it.
+  // WHOLESALE CUSTOMERS CRUD — same shape as suppliers above.
   // ============================================================
-  const handleGeneratePurchaseList = async () => {
-    setIsGeneratingPurchaseList(true);
-    try {
-      const { items } = await generatePurchaseList();
-      const enrichedItems = items.map((item) => {
-        const liveDrug = (drugs || []).find((d) => String(d.id) === String(item.drugId));
-        return {
-          ...item,
-          unitCost: Number(liveDrug?.costPrice ?? 0)
-        };
-      });
-      setDraftPurchaseList({
-        id: null,
-        title: `Purchase List — ${new Date().toLocaleDateString()}`,
-        items: enrichedItems,
-        createdById: null,
-        createdByEmail: null,
-        createdAt: null
-      });
-      setViewingSavedPurchaseListId(null);
-    } finally {
-      setIsGeneratingPurchaseList(false);
-    }
+  const handleOpenAddCustomerModal = () => {
+    setEditingCustomer(null);
+    setCustomerFormData({ name: '', phone: '', email: '', address: '' });
+    setIsCustomerModalOpen(true);
   };
 
-  const handleOpenSavedPurchaseList = (list) => {
-    setDraftPurchaseList({
-      id: list.id,
-      title: list.title,
-      items: (list.items || []).map((item) => ({ ...item })),
-      createdById: list.createdById,
-      createdByEmail: list.createdByEmail,
-      createdAt: list.createdAt
+  const handleOpenEditCustomerModal = (customer) => {
+    setEditingCustomer(customer);
+    setCustomerFormData({
+      name: customer.name || '',
+      phone: customer.phone || '',
+      email: customer.email || '',
+      address: customer.address || ''
     });
-    setViewingSavedPurchaseListId(list.id);
+    setIsCustomerModalOpen(true);
   };
 
-  const handleCloseDraftPurchaseList = () => {
-    setDraftPurchaseList(null);
-    setViewingSavedPurchaseListId(null);
-    setPurchaseListAddDrugTerm('');
-  };
-
-  // Any drug not already on the list can be added by hand — covers
-  // "other drugs that are not finished or not below the recommended
-  // minimum quantity should also be able to be added to the list."
-  const handleAddDrugToPurchaseList = (drug) => {
-    if (!draftPurchaseList) return;
-    const already = draftPurchaseList.items.some(
-      (item) => String(item.drugId) === String(drug.id)
-    );
-    if (already) {
-      setPurchaseListAddDrugTerm('');
+  const handleSaveCustomer = async (e) => {
+    e.preventDefault();
+    if (!customerFormData.name.trim()) {
+      alert("Enter the customer's name.");
       return;
     }
-    const newItem = {
-      drugId: drug.id,
-      drugName: drug.name,
-      unitType: drug.unitType,
-      currentStock: Number(drug.stock || 0),
-      minStockQty: drug.minStockQty ?? null,
-      quantity: Math.max(1, Math.round(Number(drug.recommendedPurchaseQty) || 10)),
-      supplierId: null,
-      supplierName: null,
-      unitCost: Number(drug.costPrice ?? 0)
-    };
-    setDraftPurchaseList({
-      ...draftPurchaseList,
-      items: [...draftPurchaseList.items, newItem]
-    });
-    setPurchaseListAddDrugTerm('');
-  };
-
-  const handleUpdatePurchaseListItem = (drugId, changes) => {
-    if (!draftPurchaseList) return;
-    setDraftPurchaseList({
-      ...draftPurchaseList,
-      items: draftPurchaseList.items.map((item) =>
-        String(item.drugId) === String(drugId) ? { ...item, ...changes } : item
-      )
-    });
-  };
-
-  const handleRemovePurchaseListItem = (drugId) => {
-    if (!draftPurchaseList) return;
-    setDraftPurchaseList({
-      ...draftPurchaseList,
-      items: draftPurchaseList.items.filter(
-        (item) => String(item.drugId) !== String(drugId)
-      )
-    });
-  };
-
-  const handleSaveDraftPurchaseList = async () => {
-    if (!draftPurchaseList) return;
-    setIsSavingPurchaseList(true);
+    setIsSavingCustomerCrud(true);
     try {
       const actor = { email: session?.user?.email, role: userRole };
-      const result = await savePurchaseList(draftPurchaseList, actor);
-      if (result.success) {
-        setDraftPurchaseList({
-          ...draftPurchaseList,
-          id: result.list.id,
-          createdById: result.list.createdById,
-          createdByEmail: result.list.createdByEmail,
-          createdAt: result.list.createdAt
-        });
-        setViewingSavedPurchaseListId(result.list.id);
+      if (editingCustomer) {
+        const result = await updateCustomer(editingCustomer, customerFormData, actor);
+        setIsCustomerModalOpen(false);
+        if (result && result.pending) {
+          alert(
+            `Your changes to "${customerFormData.name}" have been sent to a manager for approval.`
+          );
+        } else if (result && result.success === false) {
+          alert(result.reason || 'Unable to save this customer.');
+        }
       } else {
-        alert(result.reason || 'Unable to save this purchase list.');
+        const newCustomer = await addCustomer(customerFormData, actor);
+        setIsCustomerModalOpen(false);
+        // If this customer was being added from a wholesale draft's
+        // "+ New Customer" shortcut, attach them to that draft right
+        // away instead of making the attendant search for them again.
+        if (customerPickerForDraftId) {
+          handlePickDraftCustomer(customerPickerForDraftId, newCustomer);
+        }
       }
     } finally {
-      setIsSavingPurchaseList(false);
+      setIsSavingCustomerCrud(false);
     }
   };
 
-  const handleDeleteSavedPurchaseList = async (list) => {
-    if (!window.confirm(`Delete "${list.title}"? This can't be undone.`)) return;
+  const handleConfirmDeleteCustomer = async (customer) => {
     const actor = { email: session?.user?.email, role: userRole };
-    await deletePurchaseList(list.id, actor);
-    if (viewingSavedPurchaseListId === list.id) {
-      handleCloseDraftPurchaseList();
+    const result = await requestDeleteCustomer(customer, actor);
+    if (result && result.success === false) {
+      alert(result.reason || 'Unable to delete this customer.');
+      return;
+    }
+    if (result && result.pending) {
+      alert(
+        `"${customer.name}" won't be deleted until a manager approves it — it's been sent to them for review.`
+      );
     }
   };
 
-  const handlePrintPurchaseList = () => {
-    window.print();
+  // Attaches a real customer record to a wholesale draft — the search
+  // box and "+ New Customer" shortcut in the ticket builder both funnel
+  // through here.
+  const handlePickDraftCustomer = (draftId, customer) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) =>
+        d.id === draftId
+          ? {
+              ...d,
+              customerId: customer.id,
+              customerName: customer.name,
+              customerPhone: customer.phone || ''
+            }
+          : d
+      )
+    );
+    setCustomerPickerForDraftId(null);
+    setDraftCustomerSearchTerm('');
+  };
+
+  const handleClearDraftCustomer = (draftId) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) =>
+        d.id === draftId ? { ...d, customerId: null, customerName: '', customerPhone: '' } : d
+      )
+    );
+  };
+
+  // ============================================================
+  // PURCHASE LIST — every change here writes straight to that drug's
+  // purchasePlans row. There's no draft/save step: the list on screen
+  // IS the current plan.
+  // ============================================================
+  const handleUpdatePlanQuantity = (drugId, quantity) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(drugId, { quantity: Math.max(1, Number(quantity) || 1) }, actor);
+  };
+
+  const handleUpdatePlanUnitCost = (drugId, unitCost) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(drugId, { unitCost: Math.max(0, Number(unitCost) || 0) }, actor);
+  };
+
+  // A manual pick is sticky — it stops tracking "last supplier bought
+  // from" until explicitly cleared, per "should only be a change if I
+  // click on the option to choose the supplier."
+  const handlePickPlanSupplier = (drugId, supplier) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(
+      drugId,
+      { supplierId: supplier.id, supplierName: supplier.name, supplierManual: true },
+      actor
+    );
+    setSupplierPickerForDrugId(null);
+  };
+
+  const handleClearPlanSupplierOverride = (drugId) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(
+      drugId,
+      { supplierId: null, supplierName: null, supplierManual: false },
+      actor
+    );
+    setSupplierPickerForDrugId(null);
+  };
+
+  const handleExcludeFromPurchaseList = (drugId) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(drugId, { excluded: true }, actor);
+  };
+
+  const handleReturnToPurchaseList = (drugId) => {
+    const actor = { email: session?.user?.email, role: userRole };
+    savePurchasePlan(drugId, { excluded: false }, actor);
+  };
+
+  const handleOpenPrintPurchasePlan = () => {
+    setPrintingPurchasePlan(purchaseListGroupedBySupplier(purchaseNeedsList));
   };
 
   // Adding a drug already in the catalog to the restock cart — cost
@@ -2733,6 +3046,8 @@ export default function App() {
       const result =
         kind === 'drug'
           ? await approveDrugChangeRequest(request, actor)
+          : kind === 'customer'
+          ? await approveCustomerChangeRequest(request, actor)
           : await approveSupplierChangeRequest(request, actor);
       if (!result.success) {
         alert(result.reason || 'Unable to approve this request.');
@@ -2760,6 +3075,8 @@ export default function App() {
       const result =
         kind === 'drug'
           ? await rejectDrugChangeRequest(request, changeRequestRejectReason, actor)
+          : kind === 'customer'
+          ? await rejectCustomerChangeRequest(request, changeRequestRejectReason, actor)
           : await rejectSupplierChangeRequest(request, changeRequestRejectReason, actor);
       if (result.success) {
         setRejectingChangeRequest(null);
@@ -3280,6 +3597,46 @@ export default function App() {
     }
   };
 
+  const handleRestoreCustomer = async (id) => {
+    await restoreCustomer(id, {
+      email: session?.user?.email,
+      role: userRole
+    });
+  };
+
+  const handlePermanentDeleteCustomer = async (id, name) => {
+    if (
+      window.confirm(
+        `Permanently delete "${name}"? This cannot be undone.`
+      )
+    ) {
+      await permanentlyDeleteCustomer(id, {
+        email: session?.user?.email,
+        role: userRole
+      });
+    }
+  };
+
+  const handleRestoreSupplier = async (id) => {
+    await restoreSupplier(id, {
+      email: session?.user?.email,
+      role: userRole
+    });
+  };
+
+  const handlePermanentDeleteSupplier = async (id, name) => {
+    if (
+      window.confirm(
+        `Permanently delete "${name}"? This cannot be undone.`
+      )
+    ) {
+      await permanentlyDeleteSupplier(id, {
+        email: session?.user?.email,
+        role: userRole
+      });
+    }
+  };
+
   const handleBulkDeleteSales = async () => {
     if (!bulkDeleteStart || !bulkDeleteEnd) {
       alert('Choose a start and end date first.');
@@ -3577,6 +3934,19 @@ export default function App() {
                 </span>
               )}
           </button>
+          <button
+            className={`bottom-bar-btn ${activeTab === 'customers' ? 'active-tab' : ''}`}
+            onClick={() => setActiveTab('customers')}
+          >
+            👥 Customers
+            {canApproveStockEntries && pendingCustomerChangeRequests.length > 0 && (
+              <span className="nav-badge">
+                {pendingCustomerChangeRequests.length > 9
+                  ? '9+'
+                  : pendingCustomerChangeRequests.length}
+              </span>
+            )}
+          </button>
         </div>
       )}
 
@@ -3752,24 +4122,136 @@ export default function App() {
                 </div>
 
                 <div className="ticket-builder-cart">
-                  <div className="customer-input-row">
-                    <input
-                      type="text"
-                      placeholder="Customer Name"
-                      value={activeDraft.customerName}
-                      onChange={(e) =>
-                        setDraftField(activeDraft.id, 'customerName', e.target.value)
-                      }
-                    />
-                    <input
-                      type="text"
-                      placeholder="Customer Phone"
-                      value={activeDraft.customerPhone}
-                      onChange={(e) =>
-                        setDraftField(activeDraft.id, 'customerPhone', e.target.value)
-                      }
-                    />
-                  </div>
+                  {activeDraft.saleType === 'wholesale' ? (
+                    <div className="customer-input-row wholesale-customer-picker">
+                      {activeDraft.customerId ? (
+                        <div className="wholesale-customer-chosen">
+                          <div>
+                            <strong>{activeDraft.customerName}</strong>
+                            {activeDraft.customerPhone && (
+                              <span> · {activeDraft.customerPhone}</span>
+                            )}
+                            {(() => {
+                              const c = customersById.get(String(activeDraft.customerId));
+                              const balance = Number(c?.balance || 0);
+                              if (balance > 0) {
+                                return (
+                                  <div className="sent-back-reason">
+                                    Currently owes ₦{balance.toLocaleString()}
+                                  </div>
+                                );
+                              }
+                              if (balance < 0) {
+                                return (
+                                  <div className="sent-back-reason">
+                                    Pharmacy owes them ₦{Math.abs(balance).toLocaleString()}
+                                  </div>
+                                );
+                              }
+                              return null;
+                            })()}
+                          </div>
+                          <button
+                            type="button"
+                            className="price-rec-chip"
+                            onClick={() => handleClearDraftCustomer(activeDraft.id)}
+                          >
+                            Change
+                          </button>
+                        </div>
+                      ) : customerPickerForDraftId === activeDraft.id ? (
+                        <div className="wholesale-customer-search">
+                          <input
+                            type="text"
+                            className="search-input"
+                            autoFocus
+                            placeholder="Search customer by name or phone..."
+                            value={draftCustomerSearchTerm}
+                            onChange={(e) => setDraftCustomerSearchTerm(e.target.value)}
+                          />
+                          <div className="ticket-list">
+                            {activeCustomers
+                              .filter((c) => {
+                                const term = draftCustomerSearchTerm.trim().toLowerCase();
+                                if (!term) return true;
+                                return (
+                                  c.name.toLowerCase().includes(term) ||
+                                  (c.phone || '').includes(term)
+                                );
+                              })
+                              .slice(0, 8)
+                              .map((c) => (
+                                <div
+                                  key={c.id}
+                                  className="ticket-row"
+                                  style={{ cursor: 'pointer' }}
+                                  onClick={() => handlePickDraftCustomer(activeDraft.id, c)}
+                                >
+                                  {c.name}
+                                  {c.phone && ` · ${c.phone}`}
+                                  {Number(c.balance || 0) > 0 &&
+                                    ` (owes ₦${Number(c.balance).toLocaleString()})`}
+                                </div>
+                              ))}
+                            {activeCustomers.length === 0 && (
+                              <p className="admin-section-sub">
+                                No wholesale customers yet — add one below.
+                              </p>
+                            )}
+                          </div>
+                          <div className="deleted-drug-actions">
+                            <button
+                              type="button"
+                              className="restore-btn"
+                              onClick={() => {
+                                setCustomerPickerForDraftId(activeDraft.id);
+                                handleOpenAddCustomerModal();
+                              }}
+                            >
+                              + New Customer
+                            </button>
+                            <button
+                              type="button"
+                              className="permanent-delete-btn"
+                              onClick={() => setCustomerPickerForDraftId(null)}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          onClick={() => {
+                            setCustomerPickerForDraftId(activeDraft.id);
+                            setDraftCustomerSearchTerm('');
+                          }}
+                        >
+                          👤 Choose Wholesale Customer
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="customer-input-row">
+                      <input
+                        type="text"
+                        placeholder="Customer Name"
+                        value={activeDraft.customerName}
+                        onChange={(e) =>
+                          setDraftField(activeDraft.id, 'customerName', e.target.value)
+                        }
+                      />
+                      <input
+                        type="text"
+                        placeholder="Customer Phone"
+                        value={activeDraft.customerPhone}
+                        onChange={(e) =>
+                          setDraftField(activeDraft.id, 'customerPhone', e.target.value)
+                        }
+                      />
+                    </div>
+                  )}
 
                   <div className="draft-price-toggle">
                     <button
@@ -4136,6 +4618,26 @@ export default function App() {
                       )}
 
                   </div>
+
+                  {sale.customerId &&
+                    sale.customerBalanceAfter !== null &&
+                    sale.customerBalanceAfter !== undefined && (
+                      <div className="sale-customer-details">
+                        <span>
+                          Owed before: ₦
+                          {Number(sale.customerBalanceBefore || 0).toLocaleString()}
+                        </span>
+                        <span>
+                          Paid now: ₦{Number(sale.amountPaid || 0).toLocaleString()}
+                        </span>
+                        <span>
+                          {Number(sale.customerBalanceAfter) >= 0
+                            ? 'Still owes'
+                            : 'Pharmacy owes them'}
+                          : ₦{Math.abs(Number(sale.customerBalanceAfter)).toLocaleString()}
+                        </span>
+                      </div>
+                    )}
 
                   <div className="sale-card-footer">
 
@@ -5425,216 +5927,202 @@ export default function App() {
       {activeTab === 'catalog' && canUseRestock && catalogSection === 'purchaselist' && (
         <div className="tickets-screen no-print">
 
-          {!draftPurchaseList && (
-            <>
-              <section className="admin-section">
-                <div className="admin-section-header">
-                  <h3>Automated Purchase List</h3>
-                  <span className="admin-section-sub">
-                    Scans your stock for anything finished or below its
-                    minimum quantity, and suggests a supplier based on
-                    who you usually buy each drug from.
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  className="restore-btn"
-                  disabled={isGeneratingPurchaseList}
-                  onClick={handleGeneratePurchaseList}
-                >
-                  {isGeneratingPurchaseList ? 'Scanning stock…' : '🔄 Generate Purchase List'}
-                </button>
-              </section>
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Purchase List</h3>
+              <span className="admin-section-sub">
+                Every drug currently finished or below its minimum —
+                always live, nothing to generate or save. A drug drops
+                off the moment its stock is topped up, and comes back
+                — with whatever quantity and supplier you last set —
+                the moment it runs out again.
+              </span>
+            </div>
 
-              {myPurchaseLists && myPurchaseLists.length > 0 && (
-                <section className="admin-section">
-                  <div className="admin-section-header">
-                    <h3>Saved Purchase Lists</h3>
-                  </div>
-                  <div className="ticket-list">
-                    {myPurchaseLists.map((list) => (
-                      <div key={list.id} className="ticket-row ticket-row-detailed">
-                        <div className="ticket-row-header">
-                          <strong>{list.title}</strong>
-                          <div className="deleted-drug-meta">
-                            {(list.items || []).length} item(s) · by {list.createdByEmail} ·{' '}
-                            {new Date(list.createdAt).toLocaleDateString()}
-                          </div>
-                        </div>
-                        <div className="deleted-drug-actions">
-                          <button
-                            type="button"
-                            className="send-back-btn"
-                            onClick={() => handleOpenSavedPurchaseList(list)}
-                          >
-                            Open
-                          </button>
-                          <button
-                            type="button"
-                            className="permanent-delete-btn"
-                            onClick={() => handleDeleteSavedPurchaseList(list)}
-                          >
-                            🗑 Delete
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-              )}
-            </>
-          )}
-
-          {draftPurchaseList && (
-            <section className="admin-section">
-              <div className="admin-section-header">
-                <h3>{draftPurchaseList.title}</h3>
-                <span className="admin-section-sub">
-                  Quantities, suppliers and costs are all editable. Add
-                  any other drug by searching below.
-                </span>
-              </div>
-
+            <div className="catalog-crud-toolbar">
               <input
                 type="text"
                 className="search-input"
-                placeholder="Add a drug to this list..."
-                value={purchaseListAddDrugTerm}
-                onChange={(e) => setPurchaseListAddDrugTerm(e.target.value)}
+                placeholder="Search this list..."
+                value={purchasePlanSearchTerm}
+                onChange={(e) => setPurchasePlanSearchTerm(e.target.value)}
               />
-              {purchaseListAddDrugTerm.trim() && (
-                <div className="ticket-list">
-                  {(drugs || [])
-                    .filter(
-                      (d) =>
-                        d.name.toLowerCase().includes(purchaseListAddDrugTerm.trim().toLowerCase()) &&
-                        !draftPurchaseList.items.some((i) => String(i.drugId) === String(d.id))
-                    )
-                    .slice(0, 6)
-                    .map((d) => (
-                      <div
-                        key={d.id}
-                        className="ticket-row"
-                        onClick={() => handleAddDrugToPurchaseList(d)}
-                        style={{ cursor: 'pointer' }}
-                      >
-                        + {d.name}
-                      </div>
-                    ))}
-                </div>
-              )}
+              <button
+                type="button"
+                className="restore-btn"
+                disabled={purchaseNeedsList.length === 0}
+                onClick={handleOpenPrintPurchasePlan}
+              >
+                🖨 Print / Export
+              </button>
+            </div>
 
-              <table className="purchase-list-table">
-                <thead>
-                  <tr>
-                    <th>Drug</th>
-                    <th>Stock</th>
-                    <th>Qty</th>
-                    <th>Supplier</th>
-                    <th>Unit Cost (₦)</th>
-                    <th>Line Total (₦)</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {draftPurchaseList.items.map((item) => (
-                    <tr key={item.drugId}>
-                      <td>{item.drugName}</td>
-                      <td>
-                        {item.currentStock}
-                        {item.minStockQty != null && ` / min ${item.minStockQty}`}
-                      </td>
-                      <td>
-                        <input
-                          type="number"
-                          min="1"
-                          value={item.quantity}
-                          onChange={(e) =>
-                            handleUpdatePurchaseListItem(item.drugId, {
-                              quantity: Number(e.target.value) || 0
-                            })
-                          }
-                        />
-                      </td>
-                      <td>
-                        <select
-                          value={item.supplierId || ''}
-                          onChange={(e) => {
-                            const s = (suppliers || []).find((x) => x.id === e.target.value);
-                            handleUpdatePurchaseListItem(item.drugId, {
-                              supplierId: e.target.value || null,
-                              supplierName: s ? s.name : null
-                            });
-                          }}
-                        >
-                          <option value="">— choose —</option>
+            <table className="purchase-list-table">
+              <thead>
+                <tr>
+                  <th>Drug</th>
+                  <th>Stock</th>
+                  <th>Qty</th>
+                  <th>Supplier</th>
+                  <th>Unit Cost (₦)</th>
+                  <th>Line Total (₦)</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredPurchaseNeedsList.map((item) => (
+                  <tr key={item.drugId}>
+                    <td>{item.drugName}</td>
+                    <td>
+                      {item.currentStock}
+                      {item.minStockQty != null && ` / min ${item.minStockQty}`}
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        min="1"
+                        value={item.quantity}
+                        onChange={(e) =>
+                          handleUpdatePlanQuantity(item.drugId, e.target.value)
+                        }
+                      />
+                    </td>
+                    <td>
+                      {supplierPickerForDrugId === item.drugId ? (
+                        <div className="bank-chip-picker">
                           {(suppliers || [])
                             .filter((s) => !s.deletedAt)
                             .map((s) => (
-                              <option key={s.id} value={s.id}>
+                              <button
+                                type="button"
+                                key={s.id}
+                                className="bank-chip"
+                                onClick={() => handlePickPlanSupplier(item.drugId, s)}
+                              >
                                 {s.name}
-                              </option>
+                              </button>
                             ))}
-                        </select>
-                      </td>
-                      <td>
-                        <input
-                          type="number"
-                          min="0"
-                          value={item.unitCost}
-                          onChange={(e) =>
-                            handleUpdatePurchaseListItem(item.drugId, {
-                              unitCost: Number(e.target.value) || 0
-                            })
-                          }
-                        />
-                      </td>
-                      <td>
-                        ₦{(Number(item.quantity) * Number(item.unitCost)).toLocaleString()}
-                      </td>
-                      <td>
-                        <button
-                          type="button"
-                          className="permanent-delete-btn"
-                          onClick={() => handleRemovePurchaseListItem(item.drugId)}
-                        >
-                          ✕
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                          <button
+                            type="button"
+                            className="bank-chip"
+                            onClick={() => setSupplierPickerForDrugId(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="purchase-plan-supplier">
+                          <span
+                            onClick={() => setSupplierPickerForDrugId(item.drugId)}
+                            style={{ cursor: 'pointer' }}
+                            title="Click to choose a supplier"
+                          >
+                            {item.supplierName || 'Unspecified'}
+                          </span>
+                          {!item.supplierIsManual && item.supplierName && (
+                            <span className="price-rec-source"> (last bought from)</span>
+                          )}
+                          {item.supplierIsManual && (
+                            <button
+                              type="button"
+                              className="price-rec-chip"
+                              onClick={() => handleClearPlanSupplierOverride(item.drugId)}
+                              title="Go back to auto (last supplier bought from)"
+                            >
+                              ↺
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        min="0"
+                        value={item.unitCost}
+                        onChange={(e) =>
+                          handleUpdatePlanUnitCost(item.drugId, e.target.value)
+                        }
+                      />
+                    </td>
+                    <td>
+                      ₦{(Number(item.quantity) * Number(item.unitCost)).toLocaleString()}
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="permanent-delete-btn"
+                        onClick={() => handleExcludeFromPurchaseList(item.drugId)}
+                        title="Not buying this right now"
+                      >
+                        🚫
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
 
+            {filteredPurchaseNeedsList.length === 0 && (
+              <p className="admin-section-sub">
+                {purchasePlanSearchTerm.trim()
+                  ? 'No match in the current purchase list.'
+                  : "Nothing needs restocking right now — you're all stocked up."}
+              </p>
+            )}
+
+            {purchaseNeedsList.length > 0 && (
               <div className="purchase-list-total">
                 Total: ₦
-                {draftPurchaseList.items
+                {purchaseNeedsList
                   .reduce((sum, i) => sum + Number(i.quantity) * Number(i.unitCost), 0)
                   .toLocaleString()}
               </div>
+            )}
+          </section>
 
-              <div className="deleted-drug-actions">
-                <button
-                  type="button"
-                  className="restore-btn"
-                  disabled={isSavingPurchaseList}
-                  onClick={handleSaveDraftPurchaseList}
-                >
-                  {isSavingPurchaseList ? 'Saving…' : '💾 Save List'}
-                </button>
-                <button type="button" className="send-back-btn" onClick={handlePrintPurchaseList}>
-                  🖨 Print
-                </button>
-                <button
-                  type="button"
-                  className="permanent-delete-btn"
-                  onClick={handleCloseDraftPurchaseList}
-                >
-                  Close
-                </button>
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3
+                onClick={() => setShowNotToBuyList((v) => !v)}
+                style={{ cursor: 'pointer' }}
+              >
+                {showNotToBuyList ? '▾' : '▸'} Not To Buy ({notToBuyList.length})
+              </h3>
+              <span className="admin-section-sub">
+                Drugs you've set aside — they won't show on the
+                purchase list above even while finished, until you
+                bring them back.
+              </span>
+            </div>
+
+            {showNotToBuyList && (
+              <div className="ticket-list">
+                {notToBuyList.map((drug) => (
+                  <div key={drug.id} className="ticket-row ticket-row-detailed">
+                    <div className="ticket-row-header">
+                      <strong>{drug.name}</strong>
+                      <div className="deleted-drug-meta">
+                        Stock {drug.stock ?? 0} {drug.unitType}
+                      </div>
+                    </div>
+                    <div className="deleted-drug-actions">
+                      <button
+                        type="button"
+                        className="restore-btn"
+                        onClick={() => handleReturnToPurchaseList(drug.id)}
+                      >
+                        ↩ Return to Purchase List
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {notToBuyList.length === 0 && (
+                  <p className="admin-section-sub">Nothing set aside.</p>
+                )}
               </div>
-            </section>
-          )}
+            )}
+          </section>
 
         </div>
       )}
@@ -5703,12 +6191,168 @@ export default function App() {
       )}
 
       {/* ========================================================
+          CUSTOMERS SCREEN — wholesale customers, their own place just
+          like Drugs & Suppliers. Cashier/manager only.
+      ======================================================== */}
+      {activeTab === 'customers' && canUseRestock && (
+        <div className="tickets-screen no-print">
+
+          {canApproveStockEntries && pendingCustomerChangeRequests.length > 0 && (
+            <section className="admin-section">
+              <div className="admin-section-header">
+                <h3>Customer Changes Awaiting Approval</h3>
+                <span className="admin-section-sub">
+                  Requested by a cashier — nothing changes until you
+                  approve or reject each one.
+                </span>
+              </div>
+              <div className="ticket-list">
+                {pendingCustomerChangeRequests.map((request) => {
+                  const liveCustomer = (customers || []).find(
+                    (c) => String(c.id) === String(request.customerId)
+                  );
+                  return (
+                    <div key={request.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>
+                          {request.type === 'DELETE' ? 'Delete' : 'Edit'}:{' '}
+                          {request.proposedChanges?.name || liveCustomer?.name || 'Unknown customer'}
+                        </strong>
+                        <div className="deleted-drug-meta">
+                          Requested by {request.requestedByEmail}
+                        </div>
+                      </div>
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          disabled={isApprovingChangeRequestId === request.id}
+                          onClick={() => handleApproveChangeRequest('customer', request)}
+                        >
+                          {isApprovingChangeRequestId === request.id ? 'Approving…' : '✓ Approve'}
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => handleOpenRejectChangeRequest('customer', request)}
+                        >
+                          ✕ Reject
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Wholesale Customers</h3>
+              <span className="admin-section-sub">
+                Create, edit or delete wholesale customers here. Balances
+                only change through a sale.
+              </span>
+            </div>
+
+            <div className="catalog-crud-toolbar">
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search customers by name or phone..."
+                value={customerSearchTerm}
+                onChange={(e) => setCustomerSearchTerm(e.target.value)}
+              />
+              <button
+                type="button"
+                className="restore-btn"
+                onClick={handleOpenAddCustomerModal}
+              >
+                + New Customer
+              </button>
+            </div>
+
+            <div className="ticket-list">
+              {activeCustomers
+                .filter((c) => {
+                  const term = customerSearchTerm.trim().toLowerCase();
+                  if (!term) return true;
+                  return (
+                    c.name.toLowerCase().includes(term) ||
+                    (c.phone || '').includes(term)
+                  );
+                })
+                .map((customer) => {
+                  const pendingReq = pendingCustomerChangeRequests.find(
+                    (r) => String(r.customerId) === String(customer.id)
+                  );
+                  const balance = Number(customer.balance || 0);
+                  return (
+                    <div key={customer.id} className="ticket-row ticket-row-detailed">
+                      <div className="ticket-row-header">
+                        <strong>{customer.name}</strong>
+                        <div className="deleted-drug-meta">
+                          {[customer.phone, customer.email]
+                            .filter(Boolean)
+                            .join(' · ') || 'No contact details on file'}
+                          {balance !== 0 && (
+                            <>
+                              {' '}
+                              ·{' '}
+                              {balance > 0
+                                ? `owes ₦${balance.toLocaleString()}`
+                                : `owed ₦${Math.abs(balance).toLocaleString()}`}
+                            </>
+                          )}
+                        </div>
+                        {pendingReq && (
+                          <div className="sent-back-reason">
+                            A {pendingReq.type === 'DELETE' ? 'deletion' : 'change'} is
+                            awaiting manager approval.
+                          </div>
+                        )}
+                      </div>
+                      <div className="deleted-drug-actions">
+                        <button
+                          type="button"
+                          className="send-back-btn"
+                          onClick={() => handleOpenEditCustomerModal(customer)}
+                        >
+                          ✎ Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={() => setDeletingTarget({ kind: 'customer', item: customer })}
+                        >
+                          🗑 Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              {activeCustomers.length === 0 && (
+                <p className="admin-section-sub">No wholesale customers yet.</p>
+              )}
+            </div>
+          </section>
+
+        </div>
+      )}
+
+      {/* ========================================================
           ADMINISTRATOR SCREEN
       ======================================================== */}
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
         <div className="admin-screen no-print">
 
           <div className="admin-section-nav">
+            <button
+              className={adminSection === 'dashboard' ? 'active' : ''}
+              onClick={() => setAdminSection('dashboard')}
+            >
+              📊 Dashboard
+            </button>
             <button
               className={adminSection === 'audit' ? 'active' : ''}
               onClick={() => setAdminSection('audit')}
@@ -5848,6 +6492,100 @@ export default function App() {
           </section>
           )}
 
+          {adminSection === 'deleted' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Recently Deleted Customers</h3>
+              <span className="admin-section-sub">
+                Restore or permanently remove customers managers have deleted
+              </span>
+            </div>
+
+            {deletedCustomers && deletedCustomers.length > 0 ? (
+              <div className="deleted-drug-list">
+                {deletedCustomers.map((customer) => (
+                  <div key={customer.id} className="deleted-drug-card">
+                    <div className="deleted-drug-info">
+                      <strong>{customer.name}</strong>
+                      <span className="deleted-drug-meta">
+                        Deleted by {customer.deletedBy || 'unknown'} on{' '}
+                        {new Date(customer.deletedAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleRestoreCustomer(customer.id)}
+                      >
+                        ♻️ Restore
+                      </button>
+
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() =>
+                          handlePermanentDeleteCustomer(customer.id, customer.name)
+                        }
+                      >
+                        🗑️ Delete Permanently
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No deleted customers to recover.</div>
+            )}
+          </section>
+          )}
+
+          {adminSection === 'deleted' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Recently Deleted Suppliers</h3>
+              <span className="admin-section-sub">
+                Restore or permanently remove suppliers managers have deleted
+              </span>
+            </div>
+
+            {deletedSuppliers && deletedSuppliers.length > 0 ? (
+              <div className="deleted-drug-list">
+                {deletedSuppliers.map((supplier) => (
+                  <div key={supplier.id} className="deleted-drug-card">
+                    <div className="deleted-drug-info">
+                      <strong>{supplier.name}</strong>
+                      <span className="deleted-drug-meta">
+                        Deleted by {supplier.deletedBy || 'unknown'} on{' '}
+                        {new Date(supplier.deletedAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    <div className="deleted-drug-actions">
+                      <button
+                        className="restore-btn"
+                        onClick={() => handleRestoreSupplier(supplier.id)}
+                      >
+                        ♻️ Restore
+                      </button>
+
+                      <button
+                        className="permanent-delete-btn"
+                        onClick={() =>
+                          handlePermanentDeleteSupplier(supplier.id, supplier.name)
+                        }
+                      >
+                        🗑️ Delete Permanently
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No deleted suppliers to recover.</div>
+            )}
+          </section>
+          )}
+
           {adminSection === 'bulk' && (
           <section className="admin-section">
             <div className="admin-section-header">
@@ -5948,6 +6686,98 @@ export default function App() {
                 No bank options yet — add one above.
               </div>
             )}
+          </section>
+          )}
+
+          {adminSection === 'dashboard' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Dashboard</h3>
+              <span className="admin-section-sub">
+                A snapshot of where the pharmacy stands right now
+              </span>
+            </div>
+
+            <div className="dashboard-stat-grid">
+              <div className="dashboard-stat-card">
+                <span className="dashboard-stat-label">Total Stock Value</span>
+                <span className="dashboard-stat-value">
+                  ₦{dashboardStockValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+                <span className="dashboard-stat-hint">At cost, across all drugs in stock</span>
+              </div>
+
+              <div className="dashboard-stat-card">
+                <span className="dashboard-stat-label">Owed to Suppliers</span>
+                <span className="dashboard-stat-value">
+                  ₦{dashboardOwedToSuppliers.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+                <span className="dashboard-stat-hint">Unpaid balance on applied stock entries</span>
+              </div>
+
+              <div className="dashboard-stat-card">
+                <span className="dashboard-stat-label">Today's Sales</span>
+                <span className="dashboard-stat-value">
+                  ₦{dashboardTodayTotals.revenue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+                <span className="dashboard-stat-hint">
+                  {dashboardTodaySales.length} sale{dashboardTodaySales.length === 1 ? '' : 's'} so far today
+                </span>
+              </div>
+
+              <div className="dashboard-stat-card">
+                <span className="dashboard-stat-label">Today's Profit</span>
+                <span className="dashboard-stat-value">
+                  ₦{dashboardTodayTotals.profit.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+                <span className="dashboard-stat-hint">Revenue minus cost, so far today</span>
+              </div>
+            </div>
+
+            <div className="dashboard-range-panel">
+              <h4>Profit for a Specific Period</h4>
+              <div className="bulk-delete-row">
+                <div>
+                  <label>From:</label>
+                  <input
+                    type="date"
+                    value={dashboardRangeStart}
+                    onChange={(e) => setDashboardRangeStart(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label>To:</label>
+                  <input
+                    type="date"
+                    value={dashboardRangeEnd}
+                    onChange={(e) => setDashboardRangeEnd(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {dashboardRangeTotals ? (
+                <div className="dashboard-range-result">
+                  <div>
+                    <span className="dashboard-stat-label">Sales</span>
+                    <span className="dashboard-stat-value">
+                      ₦{dashboardRangeTotals.revenue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="dashboard-stat-label">Profit</span>
+                    <span className="dashboard-stat-value">
+                      ₦{dashboardRangeTotals.profit.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="dashboard-stat-label"># of Sales</span>
+                    <span className="dashboard-stat-value">{dashboardRangeTotals.count}</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="empty-state">Pick a start and end date to see profit for that period.</div>
+              )}
+            </div>
           </section>
           )}
 
@@ -6126,7 +6956,7 @@ export default function App() {
               <div className="receipt-total">
 
                 <strong>
-                  TOTAL PAID:
+                  PURCHASE TOTAL:
                 </strong>
 
                 <strong>
@@ -6135,6 +6965,35 @@ export default function App() {
                 </strong>
 
               </div>
+
+              {saleSuccessData.customerId &&
+                saleSuccessData.customerBalanceAfter !== null &&
+                saleSuccessData.customerBalanceAfter !== undefined && (
+                  <>
+                    <div className="receipt-total">
+                      <span>Amount Paid Now:</span>
+                      <span>₦{Number(saleSuccessData.amountPaid || 0).toLocaleString()}</span>
+                    </div>
+                    <hr />
+                    <div className="receipt-total">
+                      <span>Owed Before This Sale:</span>
+                      <span>
+                        ₦{Number(saleSuccessData.customerBalanceBefore || 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="receipt-total">
+                      <strong>
+                        {Number(saleSuccessData.customerBalanceAfter) >= 0
+                          ? 'Still Owes:'
+                          : 'Pharmacy Owes Customer:'}
+                      </strong>
+                      <strong>
+                        ₦
+                        {Math.abs(Number(saleSuccessData.customerBalanceAfter)).toLocaleString()}
+                      </strong>
+                    </div>
+                  </>
+                )}
 
               <p className="receipt-footer">
                 Thank you for your
@@ -6236,6 +7095,69 @@ export default function App() {
       )}
 
       {/* ========================================================
+          PURCHASE LIST PRINT VIEW — a dedicated printable block,
+          NOT inside a .no-print wrapper (only its own action buttons
+          are), so printing it actually produces a page instead of a
+          blank one.
+      ======================================================== */}
+      {printingPurchasePlan && (
+        <div className="receipt-container">
+          <div className="receipt-card purchase-print-card">
+
+            <div className="receipt-header">
+              <h2>Alimosho Pharmacy</h2>
+              <p>Purchase List — {new Date().toLocaleDateString()}</p>
+            </div>
+
+            {printingPurchasePlan.map((group) => (
+              <div key={group.supplierName} className="purchase-print-group">
+                <h3>{group.supplierName}</h3>
+                <div className="receipt-items">
+                  {group.items.map((item) => (
+                    <div key={item.drugId} className="receipt-item-row">
+                      <span>
+                        {item.drugName} x{item.quantity}
+                      </span>
+                      <span>
+                        ₦{(Number(item.quantity) * Number(item.unitCost)).toLocaleString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="purchase-print-group-total">
+                  Subtotal: ₦
+                  {group.items
+                    .reduce((sum, i) => sum + Number(i.quantity) * Number(i.unitCost), 0)
+                    .toLocaleString()}
+                </div>
+              </div>
+            ))}
+
+            <div className="receipt-total">
+              Grand Total: ₦
+              {printingPurchasePlan
+                .flatMap((g) => g.items)
+                .reduce((sum, i) => sum + Number(i.quantity) * Number(i.unitCost), 0)
+                .toLocaleString()}
+            </div>
+
+            <div className="receipt-actions no-print">
+              <button className="print-btn" onClick={() => window.print()}>
+                🖨️ Print
+              </button>
+              <button
+                className="close-btn"
+                onClick={() => setPrintingPurchasePlan(null)}
+              >
+                Close
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
           CASHIER: APPROVE PAYMENT MODAL
       ======================================================== */}
       {approvingTicket && (
@@ -6273,6 +7195,38 @@ export default function App() {
                 </li>
               ))}
             </ul>
+
+            {approvingTicket.saleType === 'wholesale' && approvingTicket.customerId && (() => {
+              const customer = customersById.get(String(approvingTicket.customerId));
+              const balanceBefore = Number(customer?.balance || 0);
+              const minimumRequired = Math.max(0, balanceBefore);
+              const paidSoFar =
+                (Number(paymentCash) || 0) +
+                paymentElectronicLines.reduce((s, l) => s + (Number(l.amount) || 0), 0);
+              const balanceAfter = balanceBefore + approvingTicket.total - paidSoFar;
+              return (
+                <div className="wholesale-balance-panel">
+                  <div>
+                    <small>Owed before this sale</small>
+                    <strong>₦{balanceBefore.toLocaleString()}</strong>
+                  </div>
+                  <div>
+                    <small>Paying now</small>
+                    <strong>₦{paidSoFar.toLocaleString()}</strong>
+                  </div>
+                  <div>
+                    <small>{balanceAfter >= 0 ? 'Will still owe' : 'Pharmacy will owe them'}</small>
+                    <strong>₦{Math.abs(balanceAfter).toLocaleString()}</strong>
+                  </div>
+                  {minimumRequired > 0 && (
+                    <p className="sent-back-reason">
+                      Minimum required to proceed: ₦{minimumRequired.toLocaleString()}{' '}
+                      (clears what was owed before this ticket).
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
 
             <p className="form-section-hint">
               Total Due: ₦{approvingTicket.total.toLocaleString()}. Choose how
@@ -6414,6 +7368,20 @@ export default function App() {
               >
                 Cancel
               </button>
+
+              {approvingTicket.saleType === 'wholesale' && approvingTicket.customerId && (
+                <button
+                  type="button"
+                  className="permanent-delete-btn"
+                  onClick={() => {
+                    const ticketToSendBack = approvingTicket;
+                    setApprovingTicket(null);
+                    handleOpenSendBackModal(ticketToSendBack);
+                  }}
+                >
+                  ↩ Send Back to Salesperson
+                </button>
+              )}
             </div>
 
           </div>
@@ -6753,7 +7721,13 @@ export default function App() {
           <div className="modal-card">
 
             <h3>
-              Delete {deletingTarget.kind === 'drug' ? 'Drug' : 'Supplier'}?
+              Delete{' '}
+              {deletingTarget.kind === 'drug'
+                ? 'Drug'
+                : deletingTarget.kind === 'customer'
+                ? 'Customer'
+                : 'Supplier'}
+              ?
             </h3>
 
             <p className="form-section-hint">
@@ -6773,6 +7747,21 @@ export default function App() {
               {deletingTarget.kind === 'supplier' && deletingTarget.item?.contactPerson && (
                 <> — {deletingTarget.item.contactPerson}</>
               )}
+              {deletingTarget.kind === 'customer' && (
+                <>
+                  {' '}
+                  — {deletingTarget.item?.phone || 'no phone on file'}
+                  {Number(deletingTarget.item?.balance || 0) !== 0 && (
+                    <>
+                      {' '}
+                      ·{' '}
+                      {Number(deletingTarget.item.balance) > 0
+                        ? `owes ₦${Number(deletingTarget.item.balance).toLocaleString()}`
+                        : `owed ₦${Math.abs(Number(deletingTarget.item.balance)).toLocaleString()}`}
+                    </>
+                  )}
+                </>
+              )}
             </p>
 
             <div className="modal-actions">
@@ -6785,6 +7774,8 @@ export default function App() {
                   try {
                     if (deletingTarget.kind === 'drug') {
                       await handleConfirmDeleteDrug(deletingTarget.item);
+                    } else if (deletingTarget.kind === 'customer') {
+                      await handleConfirmDeleteCustomer(deletingTarget.item);
                     } else {
                       await handleConfirmDeleteSupplier(deletingTarget.item);
                     }
@@ -6893,6 +7884,90 @@ export default function App() {
       )}
 
       {/* ========================================================
+          WHOLESALE CUSTOMER ADD/EDIT MODAL
+      ======================================================== */}
+      {isCustomerModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-card">
+            <form onSubmit={handleSaveCustomer}>
+              <h3>{editingCustomer ? 'Edit Customer' : 'New Wholesale Customer'}</h3>
+
+              <label>
+                Name:
+                <input
+                  type="text"
+                  required
+                  value={customerFormData.name}
+                  onChange={(e) =>
+                    setCustomerFormData({ ...customerFormData, name: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Phone:
+                <input
+                  type="text"
+                  value={customerFormData.phone}
+                  onChange={(e) =>
+                    setCustomerFormData({ ...customerFormData, phone: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Email:
+                <input
+                  type="email"
+                  value={customerFormData.email}
+                  onChange={(e) =>
+                    setCustomerFormData({ ...customerFormData, email: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Address:
+                <textarea
+                  rows={2}
+                  value={customerFormData.address}
+                  onChange={(e) =>
+                    setCustomerFormData({ ...customerFormData, address: e.target.value })
+                  }
+                />
+              </label>
+
+              {editingCustomer && Number(editingCustomer.balance || 0) !== 0 && (
+                <p className="form-section-hint">
+                  Current balance:{' '}
+                  {Number(editingCustomer.balance) > 0
+                    ? `owes ₦${Number(editingCustomer.balance).toLocaleString()}`
+                    : `pharmacy owes them ₦${Math.abs(Number(editingCustomer.balance)).toLocaleString()}`}
+                  {' '}— balance only changes through a sale, not this form.
+                </p>
+              )}
+
+              <div className="modal-actions">
+                <button type="submit" className="save-btn" disabled={isSavingCustomerCrud}>
+                  {isSavingCustomerCrud ? 'Saving…' : 'Save Customer'}
+                </button>
+                <button
+                  type="button"
+                  className="cancel-btn"
+                  onClick={() => {
+                    setIsCustomerModalOpen(false);
+                    setCustomerPickerForDraftId(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================
           MANAGER: REJECT STOCK ENTRY CORRECTION MODAL
       ======================================================== */}
       {rejectingStockEdit && (
@@ -6948,7 +8023,12 @@ export default function App() {
           <div className="modal-card">
 
             <h3>
-              Reject {rejectingChangeRequest.kind === 'drug' ? 'Drug' : 'Supplier'}{' '}
+              Reject{' '}
+              {rejectingChangeRequest.kind === 'drug'
+                ? 'Drug'
+                : rejectingChangeRequest.kind === 'customer'
+                ? 'Customer'
+                : 'Supplier'}{' '}
               {rejectingChangeRequest.request.type === 'DELETE' ? 'Deletion' : 'Edit'}
             </h3>
 

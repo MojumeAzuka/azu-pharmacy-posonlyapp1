@@ -163,6 +163,57 @@ db.version(12).stores({
   drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced'
 });
 
+// Schema Version 13: `purchasePlans` — replaces the old "generate a
+// snapshot, save it, reopen it" purchase list with one persistent row
+// per drug (keyed by drugId itself, not a generated id). A drug's
+// desired purchase quantity, chosen supplier and "not to buy right
+// now" flag are stored continuously and edited in place — searchable,
+// always reflecting the current plan, with no separate save step.
+// `purchaseLists` (the old snapshot table) is left in place for
+// backward compatibility with anything already saved there, but the
+// UI no longer writes new ones.
+db.version(13).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced',
+  drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced',
+  purchasePlans: 'drugId, excluded, synced'
+});
+
+// Schema Version 14: wholesale customers — a real record (not just
+// free-text name/phone on a ticket), CRUD'd the same cashier-approval
+// way as drugs and suppliers, carrying a running `balance` (positive =
+// they owe the pharmacy, negative = the pharmacy owes them credit).
+// `customerId` is now indexed on both tickets and sales so a
+// customer's purchase/payment history can be looked up directly.
+db.version(14).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, customerId, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, customerId, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced',
+  drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced',
+  purchasePlans: 'drugId, excluded, synced',
+  customers: 'id, name, synced',
+  customerChangeRequests: 'id, status, customerId, requestedByEmail, createdAt, synced'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -2170,6 +2221,630 @@ export async function syncPendingSupplierChangeRequestsToCloud() {
   }
 }
 
+// ============================================================
+// WHOLESALE CUSTOMERS — a real record (not just free-text name/phone
+// on a ticket), CRUD'd the exact same cashier-needs-approval way as
+// suppliers and drugs above: a manager/administrator's edit or delete
+// applies immediately, a cashier's is queued in `customerChangeRequests`
+// until a manager approves it. Deletion is a SOFT delete, same pattern —
+// an administrator still has to restore or permanently delete it from
+// Recently Deleted.
+//
+// `balance` is deliberately NOT part of this CRUD surface — it only
+// ever changes through the payment flow in recordWholesalePayment()
+// below, never through an edit form. Positive = the customer owes the
+// pharmacy; negative = the pharmacy owes the customer (an overpayment).
+// ============================================================
+
+export async function fetchCustomers() {
+  try {
+    const { data, error } = await supabase.from('customers').select('*');
+    if (error) throw error;
+    if (!data) return;
+
+    const pendingIds = new Set(
+      (await db.customers.where('synced').equals(0).toArray()).map((c) =>
+        String(c.id)
+      )
+    );
+
+    const mapped = data
+      .filter((c) => !pendingIds.has(String(c.id)))
+      .map((c) => ({
+        id: String(c.id),
+        name: c.name,
+        phone: c.phone || '',
+        email: c.email || '',
+        address: c.address || '',
+        balance: Number(c.balance || 0),
+        deletedAt: c.deleted_at || null,
+        deletedBy: c.deleted_by || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.customers.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch customers:', err.message);
+  }
+}
+
+export async function addCustomer(payload, actor) {
+  const customer = {
+    id: generateId('CUSTOMER'),
+    name: (payload.name || '').trim(),
+    phone: (payload.phone || '').trim(),
+    email: (payload.email || '').trim(),
+    address: (payload.address || '').trim(),
+    balance: 0,
+    synced: 0
+  };
+
+  await db.customers.add(customer);
+
+  if (navigator.onLine) {
+    try {
+      const { error } = await supabase.from('customers').insert([
+        {
+          id: customer.id,
+          name: customer.name,
+          phone: customer.phone,
+          email: customer.email,
+          address: customer.address,
+          balance: 0
+        }
+      ]);
+      if (!error) await db.customers.update(customer.id, { synced: 1 });
+    } catch (err) {
+      console.warn('Cloud customer create postponed:', err.message);
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'customer_added',
+    targetType: 'customer',
+    targetId: customer.id,
+    details: { name: customer.name }
+  });
+
+  return customer;
+}
+
+export async function syncPendingCustomersToCloud() {
+  try {
+    const pending = await db.customers.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const customer of pending) {
+      const { error } = await supabase.from('customers').upsert([
+        {
+          id: customer.id,
+          name: customer.name,
+          phone: customer.phone,
+          email: customer.email,
+          address: customer.address,
+          balance: customer.balance,
+          deleted_at: customer.deletedAt || null,
+          deleted_by: customer.deletedBy || null
+        }
+      ]);
+      if (!error) await db.customers.update(customer.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending customers:', err.message);
+  }
+}
+
+export async function updateCustomer(customer, changes, actor) {
+  try {
+    const role = actor?.role;
+    const isManager = role === 'manager' || role === 'administrator';
+
+    const cleaned = {
+      name: (changes.name ?? customer.name ?? '').trim(),
+      phone: (changes.phone ?? customer.phone ?? '').trim(),
+      email: (changes.email ?? customer.email ?? '').trim(),
+      address: (changes.address ?? customer.address ?? '').trim()
+    };
+
+    if (isManager) {
+      await db.customers.update(customer.id, { ...cleaned, synced: 0 });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('customers')
+            .update({
+              name: cleaned.name,
+              phone: cleaned.phone,
+              email: cleaned.email,
+              address: cleaned.address
+            })
+            .eq('id', customer.id);
+          if (!error) await db.customers.update(customer.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud customer update postponed:', err.message);
+        }
+      }
+
+      await logAuditEvent({
+        actorEmail: actor?.email,
+        actorRole: actor?.role,
+        action: 'customer_updated',
+        targetType: 'customer',
+        targetId: customer.id,
+        details: { name: cleaned.name }
+      });
+
+      return { success: true, applied: true };
+    }
+
+    // Cashier — queue it instead of touching the customer directly.
+    const request = {
+      id: generateId('CUSTCHG'),
+      customerId: customer.id,
+      type: 'EDIT',
+      proposedChanges: cleaned,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.customerChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('customer_change_requests').insert([
+          {
+            id: request.id,
+            customer_id: request.customerId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.customerChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer edit request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_edit_requested',
+      targetType: 'customer',
+      targetId: customer.id,
+      details: { proposedName: cleaned.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to update customer:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function softDeleteCustomer(id, actor) {
+  try {
+    const existing = await db.customers.get(id);
+    if (!existing) return { success: false, reason: 'Customer not found.' };
+
+    const deletedAt = new Date().toISOString();
+    const deletedBy = actor?.email || 'unknown';
+
+    await db.customers.update(id, { deletedAt, deletedBy, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customers')
+          .update({ deleted_at: deletedAt, deleted_by: deletedBy })
+          .eq('id', id);
+        if (!error) await db.customers.update(id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer soft-delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_deleted',
+      targetType: 'customer',
+      targetId: id,
+      details: { name: existing.name }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to delete customer:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function requestDeleteCustomer(customer, actor) {
+  const role = actor?.role;
+  const isManager = role === 'manager' || role === 'administrator';
+
+  if (isManager) {
+    return softDeleteCustomer(customer.id, actor);
+  }
+
+  try {
+    const request = {
+      id: generateId('CUSTCHG'),
+      customerId: customer.id,
+      type: 'DELETE',
+      proposedChanges: null,
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
+
+    await db.customerChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('customer_change_requests').insert([
+          {
+            id: request.id,
+            customer_id: request.customerId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.customerChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer delete request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_delete_requested',
+      targetType: 'customer',
+      targetId: customer.id,
+      details: { name: customer.name }
+    });
+
+    return { success: true, applied: false, pending: true };
+  } catch (err) {
+    console.warn('Unable to request customer deletion:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function restoreCustomer(id, actor) {
+  try {
+    const existing = await db.customers.get(id);
+    if (!existing) return;
+
+    await db.customers.update(id, { deletedAt: null, deletedBy: null, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customers')
+          .update({ deleted_at: null, deleted_by: null })
+          .eq('id', id);
+        if (!error) await db.customers.update(id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer restore postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_restored',
+      targetType: 'customer',
+      targetId: id,
+      details: { name: existing.name }
+    });
+  } catch (err) {
+    console.warn('Unable to restore customer:', err.message);
+  }
+}
+
+export async function permanentlyDeleteCustomer(id, actor) {
+  try {
+    const existing = await db.customers.get(id);
+
+    await db.customers.delete(id);
+
+    if (navigator.onLine) {
+      try {
+        await supabase.from('customers').delete().eq('id', id);
+      } catch (err) {
+        console.warn('Cloud customer permanent delete postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_permanently_deleted',
+      targetType: 'customer',
+      targetId: id,
+      details: { name: existing?.name || 'unknown' }
+    });
+  } catch (err) {
+    console.warn('Unable to permanently delete customer:', err.message);
+  }
+}
+
+export async function approveCustomerChangeRequest(request, actor) {
+  try {
+    const freshLocal = await db.customerChangeRequests.get(request.id);
+    if (freshLocal && freshLocal.status !== 'PENDING') {
+      return { success: false, reason: 'This request has already been handled.' };
+    }
+    const target = freshLocal || request;
+
+    if (target.type === 'EDIT') {
+      await db.customers.update(target.customerId, {
+        ...target.proposedChanges,
+        synced: 0
+      });
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from('customers')
+            .update({
+              name: target.proposedChanges.name,
+              phone: target.proposedChanges.phone,
+              email: target.proposedChanges.email,
+              address: target.proposedChanges.address
+            })
+            .eq('id', target.customerId);
+          if (!error) await db.customers.update(target.customerId, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud customer edit (approved) postponed:', err.message);
+        }
+      }
+    } else {
+      await softDeleteCustomer(target.customerId, actor);
+    }
+
+    const decidedAt = new Date().toISOString();
+    await db.customerChangeRequests.update(target.id, {
+      status: 'APPROVED',
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customer_change_requests')
+          .update({
+            status: 'APPROVED',
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', target.id);
+        if (!error) await db.customerChangeRequests.update(target.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer change approval postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_change_approved',
+      targetType: 'customer',
+      targetId: target.customerId,
+      details: { type: target.type }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to approve customer change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function rejectCustomerChangeRequest(request, reason, actor) {
+  try {
+    const decidedAt = new Date().toISOString();
+    const trimmedReason = (reason || '').trim();
+
+    await db.customerChangeRequests.update(request.id, {
+      status: 'REJECTED',
+      rejectionReason: trimmedReason,
+      decidedByEmail: actor?.email || 'unknown',
+      decidedAt,
+      synced: 0
+    });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customer_change_requests')
+          .update({
+            status: 'REJECTED',
+            rejection_reason: trimmedReason,
+            decided_by_email: actor?.email || 'unknown',
+            decided_at: decidedAt
+          })
+          .eq('id', request.id);
+        if (!error) await db.customerChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer change rejection postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_change_rejected',
+      targetType: 'customer',
+      targetId: request.customerId,
+      details: { reason: trimmedReason }
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.warn('Unable to reject customer change:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchCloudCustomerChangeRequests() {
+  try {
+    const { data, error } = await supabase
+      .from('customer_change_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.customerChangeRequests.where('synced').equals(0).toArray()).map((r) =>
+        String(r.id)
+      )
+    );
+
+    const mapped = data
+      .filter((r) => !pendingIds.has(String(r.id)))
+      .map((r) => ({
+        id: String(r.id),
+        customerId: r.customer_id,
+        type: r.type,
+        proposedChanges: r.proposed_changes || null,
+        status: r.status,
+        requestedById: r.requested_by || null,
+        requestedByEmail: r.requested_by_email || 'unknown',
+        requestedByRole: r.requested_by_role || 'unknown',
+        createdAt: r.created_at,
+        decidedByEmail: r.decided_by_email || null,
+        decidedAt: r.decided_at || null,
+        rejectionReason: r.rejection_reason || null,
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.customerChangeRequests.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch customer change requests:', err.message);
+  }
+}
+
+export async function syncPendingCustomerChangeRequestsToCloud() {
+  try {
+    const pending = await db.customerChangeRequests.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const request of pending) {
+      const { error } = await supabase.from('customer_change_requests').upsert([
+        {
+          id: request.id,
+          customer_id: request.customerId,
+          type: request.type,
+          proposed_changes: request.proposedChanges,
+          status: request.status,
+          requested_by: request.requestedById,
+          requested_by_email: request.requestedByEmail,
+          requested_by_role: request.requestedByRole,
+          created_at: request.createdAt,
+          decided_by_email: request.decidedByEmail,
+          decided_at: request.decidedAt,
+          rejection_reason: request.rejectionReason
+        }
+      ]);
+      if (!error) await db.customerChangeRequests.update(request.id, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending customer change requests:', err.message);
+  }
+}
+
+// Returns the minimum a wholesale customer must pay on a new ticket
+// before it can be approved: whatever they already owed coming in.
+// They're allowed to let the NEW purchase itself add to their balance
+// (that's the point — owing is an incentive to buy more) but the OLD
+// balance has to be cleared first.
+export function getMinimumWholesalePayment(customer) {
+  return Math.max(0, Number(customer?.balance || 0));
+}
+
+// Called once a wholesale ticket's payment has been confirmed as
+// sufficient (see approveTicket below, which calls this instead of
+// doing the arithmetic inline). Moves the customer's balance forward
+// by (ticketTotal - amountPaid) — positive if they still owe something
+// after this purchase, negative if they overpaid and the pharmacy now
+// owes THEM. Returns the before/after snapshot so it can be stamped
+// onto the sale record for the receipt and sales history.
+export async function recordWholesalePayment(customerId, ticketTotal, amountPaid, actor) {
+  const customer = await db.customers.get(customerId);
+  const balanceBefore = Number(customer?.balance || 0);
+  const balanceAfter = balanceBefore + Number(ticketTotal || 0) - Number(amountPaid || 0);
+
+  if (customer) {
+    await db.customers.update(customerId, { balance: balanceAfter, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customers')
+          .update({ balance: balanceAfter })
+          .eq('id', customerId);
+        if (!error) await db.customers.update(customerId, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer balance update postponed:', err.message);
+      }
+    }
+  }
+
+  await logAuditEvent({
+    actorEmail: actor?.email,
+    actorRole: actor?.role,
+    action: 'customer_balance_updated',
+    targetType: 'customer',
+    targetId: customerId,
+    details: { balanceBefore, balanceAfter, ticketTotal, amountPaid }
+  });
+
+  return { balanceBefore, balanceAfter };
+}
+
 // Actually moves the stock: for each line item, either tops up an
 // existing drug (stock += quantity, cost price updated to what this
 // supplier charged) or creates the new drug the line describes, with
@@ -3289,6 +3964,164 @@ export async function deletePurchaseList(id, actor) {
 }
 
 // ============================================================
+// PURCHASE PLANS — one persistent row per drug, replacing the old
+// "generate a snapshot, save it, reopen it" flow. A drug's desired
+// purchase quantity, chosen supplier override and "not to buy right
+// now" flag live here continuously; there is no separate save step —
+// every change (a quantity edit, picking a supplier, excluding a
+// drug) is written straight to this table as it happens. No approval
+// chain either, same as the old purchase lists — it's a planning tool,
+// not something that changes stock or money on its own.
+// ============================================================
+
+export async function fetchCloudPurchasePlans() {
+  try {
+    const { data, error } = await supabase.from('purchase_plans').select('*');
+    if (error) throw error;
+    if (!data || data.length === 0) return;
+
+    const pendingIds = new Set(
+      (await db.purchasePlans.where('synced').equals(0).toArray()).map((p) =>
+        String(p.drugId)
+      )
+    );
+
+    const mapped = data
+      .filter((p) => !pendingIds.has(String(p.drug_id)))
+      .map((p) => ({
+        drugId: String(p.drug_id),
+        quantity: p.quantity ?? null,
+        unitCost: p.unit_cost ?? null,
+        supplierId: p.supplier_id || null,
+        supplierName: p.supplier_name || null,
+        supplierManual: Boolean(p.supplier_manual),
+        excluded: Boolean(p.excluded),
+        updatedAt: p.updated_at,
+        updatedByEmail: p.updated_by_email || 'unknown',
+        synced: 1
+      }));
+
+    if (mapped.length > 0) {
+      await db.purchasePlans.bulkPut(mapped);
+    }
+  } catch (err) {
+    console.warn('Unable to fetch purchase plans from cloud:', err.message);
+  }
+}
+
+export async function syncPendingPurchasePlansToCloud() {
+  try {
+    const pending = await db.purchasePlans.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+
+    for (const plan of pending) {
+      const { error } = await supabase.from('purchase_plans').upsert([
+        {
+          drug_id: plan.drugId,
+          quantity: plan.quantity,
+          unit_cost: plan.unitCost,
+          supplier_id: plan.supplierId,
+          supplier_name: plan.supplierName,
+          supplier_manual: plan.supplierManual,
+          excluded: plan.excluded,
+          updated_at: plan.updatedAt,
+          updated_by_email: plan.updatedByEmail
+        }
+      ]);
+      if (!error) await db.purchasePlans.update(plan.drugId, { synced: 1 });
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending purchase plans:', err.message);
+  }
+}
+
+// Merges `changes` into this drug's plan row (creating it if this is
+// the first time the drug's purchase plan has been touched). Pass
+// `supplierManual: true` whenever the change came from the person
+// explicitly picking a supplier — that's what makes the choice sticky
+// instead of silently drifting back to "last supplier bought from" as
+// soon as a new delivery arrives.
+export async function savePurchasePlan(drugId, changes, actor) {
+  try {
+    const existing = await db.purchasePlans.get(drugId);
+    const record = {
+      drugId,
+      quantity: existing?.quantity ?? null,
+      unitCost: existing?.unitCost ?? null,
+      supplierId: existing?.supplierId ?? null,
+      supplierName: existing?.supplierName ?? null,
+      supplierManual: existing?.supplierManual ?? false,
+      excluded: existing?.excluded ?? false,
+      ...changes,
+      updatedAt: new Date().toISOString(),
+      updatedByEmail: actor?.email || 'unknown',
+      synced: 0
+    };
+
+    await db.purchasePlans.put(record);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('purchase_plans').upsert([
+          {
+            drug_id: record.drugId,
+            quantity: record.quantity,
+            unit_cost: record.unitCost,
+            supplier_id: record.supplierId,
+            supplier_name: record.supplierName,
+            supplier_manual: record.supplierManual,
+            excluded: record.excluded,
+            updated_at: record.updatedAt,
+            updated_by_email: record.updatedByEmail
+          }
+        ]);
+        if (!error) await db.purchasePlans.update(record.drugId, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud purchase plan save postponed:', err.message);
+      }
+    }
+
+    return { success: true, plan: record };
+  } catch (err) {
+    console.warn('Unable to save purchase plan:', err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+// Works out which supplier a drug was most recently bought from, by
+// scanning APPLIED stock entries — the same "last/most frequent
+// supplier" signal the old generatePurchaseList used, now exposed on
+// its own so the UI can show it as the live default any time a drug
+// has no manual supplier override on its plan.
+export async function getLastSupplierForDrug(drugId) {
+  try {
+    const entries = await db.stockEntries
+      .where('status')
+      .equals('APPLIED')
+      .toArray();
+
+    let best = null;
+    for (const entry of entries) {
+      if (!entry.supplierId) continue;
+      for (const item of entry.items || []) {
+        if (String(item.drugId) !== String(drugId)) continue;
+        if (!best || new Date(entry.createdAt) > new Date(best.lastSeenAt)) {
+          best = {
+            supplierId: entry.supplierId,
+            supplierName: entry.supplierName,
+            lastSeenAt: entry.createdAt
+          };
+        }
+      }
+    }
+    return best;
+  } catch (err) {
+    console.warn('Unable to look up last supplier for drug:', err.message);
+    return null;
+  }
+}
+
+// ============================================================
 // RESTOCK DRAFT (per-account, local-only, not synced to the cloud)
 // ------------------------------------------------------------
 // The restock screen's in-progress work — which supplier, which drugs
@@ -3399,6 +4232,16 @@ export async function createTicket(ticketPayload, actor) {
     };
   }
 
+  // A wholesale sale has to be tied to a real customer record — that's
+  // what carries the running balance (how much they owe, or are owed)
+  // across purchases. A retail "walk-in" ticket doesn't need one.
+  if (ticketPayload.saleType === 'wholesale' && !ticketPayload.customerId) {
+    return {
+      success: false,
+      reason: 'Choose a wholesale customer before sending this ticket to the cashier.'
+    };
+  }
+
   const dailyNumber = await getNextDailyTicketNumber();
 
   const ticket = {
@@ -3428,6 +4271,7 @@ export async function createTicket(ticketPayload, actor) {
           sale_type: ticket.saleType,
           customer_name: ticket.customerName,
           customer_phone: ticket.customerPhone,
+          customer_id: ticket.customerId || null,
           attendant_id: ticket.attendantId,
           attendant_email: ticket.attendantEmail,
           daily_number: ticket.dailyNumber,
@@ -3492,6 +4336,7 @@ export async function fetchCloudTickets() {
         saleType: t.sale_type || 'retail',
         customerName: t.customer_name || '',
         customerPhone: t.customer_phone || '',
+        customerId: t.customer_id || null,
         dailyNumber: t.daily_number ?? null,
         adjustmentReason: t.adjustment_reason || null,
         sentBackAt: t.sent_back_at || null,
@@ -3725,12 +4570,23 @@ export async function resubmitTicket(ticketId, updatedPayload, actor) {
       };
     }
 
+    // A wholesale resubmission still needs a real customer attached —
+    // e.g. the attendant switched a ticket from retail to wholesale
+    // while fixing it up, without picking anyone.
+    if (updatedPayload.saleType === 'wholesale' && !updatedPayload.customerId) {
+      return {
+        success: false,
+        reason: 'Choose a wholesale customer before resubmitting this ticket.'
+      };
+    }
+
     const update = {
       items: updatedPayload.items,
       total: updatedPayload.total,
       saleType: updatedPayload.saleType,
       customerName: updatedPayload.customerName,
       customerPhone: updatedPayload.customerPhone,
+      customerId: updatedPayload.customerId || null,
       status: 'PENDING_PAYMENT',
       adjustmentReason: null,
       sentBackAt: null,
@@ -3749,6 +4605,7 @@ export async function resubmitTicket(ticketId, updatedPayload, actor) {
             sale_type: update.saleType,
             customer_name: update.customerName,
             customer_phone: update.customerPhone,
+            customer_id: update.customerId,
             status: 'PENDING_PAYMENT',
             adjustment_reason: null,
             sent_back_at: null
@@ -3828,6 +4685,37 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       };
     }
 
+    const amountPaid =
+      Number(paymentBreakdown?.cash || 0) +
+      (paymentBreakdown?.electronic || []).reduce(
+        (sum, line) => sum + Number(line.amount || 0),
+        0
+      );
+
+    // Wholesale customers are allowed to owe (it's an incentive to buy
+    // more) but whatever they already owed coming in has to be cleared
+    // before a NEW purchase is let through — the new ticket's own total
+    // can still go fully or partly unpaid. Checked before any stock or
+    // ticket state changes so a short payment never gets halfway in.
+    let customerBalanceBefore = null;
+    let customerBalanceAfter = null;
+    if (ticket.saleType === 'wholesale' && ticket.customerId) {
+      const customer = await db.customers.get(ticket.customerId);
+      const balanceBefore = Number(customer?.balance || 0);
+      const minimumRequired = Math.max(0, balanceBefore);
+      if (amountPaid + 1 < minimumRequired) {
+        return {
+          success: false,
+          insufficientWholesalePayment: true,
+          minimumRequired,
+          balanceBefore,
+          reason: `${customer?.name || 'This customer'} still owes ₦${minimumRequired.toLocaleString()} from before — at least that much has to be paid before this sale can go through.`
+        };
+      }
+      customerBalanceBefore = balanceBefore;
+      customerBalanceAfter = balanceBefore + ticket.total - amountPaid;
+    }
+
     // Guard #1 (same device): if this device's own local copy already
     // moved on from PENDING_PAYMENT — a second click, or a stale queue
     // that hasn't re-rendered yet — stop here before touching stock.
@@ -3896,6 +4784,10 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       attendantEmail: ticket.attendantEmail,
       customerName: ticket.customerName,
       customerPhone: ticket.customerPhone,
+      customerId: ticket.customerId || null,
+      amountPaid,
+      customerBalanceBefore,
+      customerBalanceAfter,
       items: ticket.items,
       paymentMethod: paymentBreakdown,
       ticketId: ticket.id,
@@ -3903,7 +4795,7 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       synced: 0
     };
 
-    await db.transaction('rw', db.drugs, db.sales, db.tickets, async () => {
+    await db.transaction('rw', db.drugs, db.sales, db.tickets, db.customers, async () => {
       // Re-check one more time inside the transaction, in case a
       // fetchCloudTickets() triggered by something else slipped this
       // ticket's status out from under us between the checks above and
@@ -3941,7 +4833,26 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
         paidAt,
         synced: 0
       });
+
+      if (ticket.saleType === 'wholesale' && ticket.customerId) {
+        await db.customers.update(ticket.customerId, {
+          balance: customerBalanceAfter,
+          synced: 0
+        });
+      }
     });
+
+    if (ticket.saleType === 'wholesale' && ticket.customerId && navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('customers')
+          .update({ balance: customerBalanceAfter })
+          .eq('id', ticket.customerId);
+        if (!error) await db.customers.update(ticket.customerId, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer balance update postponed:', err.message);
+      }
+    }
 
     if (navigator.onLine) {
       // Push the stock changes, the new sale, and the ticket update to
@@ -3978,6 +4889,10 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
             attendant_email: saleData.attendantEmail,
             customer_name: saleData.customerName,
             customer_phone: saleData.customerPhone,
+            customer_id: saleData.customerId,
+            amount_paid: saleData.amountPaid,
+            customer_balance_before: saleData.customerBalanceBefore,
+            customer_balance_after: saleData.customerBalanceAfter,
             items: saleData.items,
             payment_method: saleData.paymentMethod,
             ticket_id: saleData.ticketId,

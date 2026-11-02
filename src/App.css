@@ -3276,3 +3276,164 @@ select {
   color: #6b7280;
   font-style: italic;
 }
+
+/* ============================================================
+   Purchase list: supplier picker cell + dedicated print view
+   ============================================================ */
+.purchase-plan-supplier {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.purchase-print-card {
+  max-width: 640px;
+}
+
+.purchase-print-group {
+  margin-bottom: 14px;
+}
+
+.purchase-print-group h3 {
+  margin: 10px 0 4px;
+  font-size: 1rem;
+  border-bottom: 1px solid #e2e2e2;
+  padding-bottom: 4px;
+}
+
+.purchase-print-group-total {
+  text-align: right;
+  font-weight: 600;
+  font-size: 0.88rem;
+  margin-top: 4px;
+}
+
+@media print {
+  .purchase-print-card {
+    max-width: 100%;
+  }
+}
+
+/* ============================================================
+   Wholesale customer picker (ticket builder) + balance panel
+   (cashier approval modal)
+   ============================================================ */
+.wholesale-customer-picker {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.wholesale-customer-chosen {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  background: #f7f9fc;
+  border: 1px solid #dde4ee;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.wholesale-customer-search {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wholesale-balance-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  background: #f7f9fc;
+  border: 1px solid #dde4ee;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 10px 0;
+}
+
+.wholesale-balance-panel > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wholesale-balance-panel small {
+  color: #6b7280;
+  font-size: 0.78rem;
+}
+
+.wholesale-balance-panel strong {
+  font-size: 1rem;
+}
+
+/* ============================================================
+   ADMIN FINANCIAL DASHBOARD
+   ============================================================ */
+
+.dashboard-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.dashboard-stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.dashboard-stat-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: #64748b;
+}
+
+.dashboard-stat-value {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.dashboard-stat-hint {
+  font-size: 0.72rem;
+  color: #94a3b8;
+}
+
+.dashboard-range-panel {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 16px;
+}
+
+.dashboard-range-panel h4 {
+  margin: 0 0 10px;
+  font-size: 0.9rem;
+  color: #334155;
+}
+
+.dashboard-range-result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 14px;
+
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 12px 16px;
+}
+
+.dashboard-range-result > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
