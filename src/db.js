@@ -214,6 +214,58 @@ db.version(14).stores({
   customerChangeRequests: 'id, status, customerId, requestedByEmail, createdAt, synced'
 });
 
+// Schema Version 15: `settings` — a small generic key/value store for
+// admin-editable app-wide settings, starting with the pricing
+// recommendation percentages (see PRICE RECOMMENDATION below). One row
+// per setting, keyed by a short string id ('pricing' for now), so more
+// settings can be added later without another schema bump.
+db.version(15).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, customerId, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, customerId, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced',
+  drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced',
+  purchasePlans: 'drugId, excluded, synced',
+  customers: 'id, name, synced',
+  customerChangeRequests: 'id, status, customerId, requestedByEmail, createdAt, synced',
+  settings: 'key, synced'
+});
+
+// v16 — cartDrafts: a customer cart a salesperson has set aside to
+// continue later (not yet sent to the cashier). Purely local/offline —
+// never pushed to Supabase, same as the in-memory drafts this replaces
+// persistence for — so a device restart, accidental tab close, or the
+// end of a shift doesn't lose a half-built cart. Scoped per attendant
+// (attendantEmail) so one salesperson doesn't see another's saved carts.
+db.version(16).stores({
+  drugs: 'id, name, unitType, costPrice, retailPrice, wholesalePrice, stock, barcode, synced',
+  sales: 'id, total, saleType, cashierId, cashierEmail, customerName, customerPhone, customerId, createdAt, synced, reversalPending',
+  auditLog: 'id, createdAt, synced',
+  tickets: 'id, status, attendantId, attendantEmail, cashierId, cashierEmail, customerId, createdAt, synced',
+  bankOptions: 'id, name, active, synced',
+  reversalRequests: 'id, saleId, status, requestedByEmail, createdAt, synced',
+  suppliers: 'id, name, synced',
+  stockEntries: 'id, status, supplierId, enteredByEmail, createdAt, synced',
+  stockEntryEdits: 'id, stockEntryId, status, requestedByEmail, createdAt, synced',
+  restockDrafts: 'id',
+  supplierChangeRequests: 'id, status, supplierId, requestedByEmail, createdAt, synced',
+  purchaseLists: 'id, createdByEmail, createdAt, synced',
+  drugChangeRequests: 'id, status, drugId, requestedByEmail, createdAt, synced',
+  purchasePlans: 'drugId, excluded, synced',
+  customers: 'id, name, synced',
+  customerChangeRequests: 'id, status, customerId, requestedByEmail, createdAt, synced',
+  settings: 'key, synced',
+  cartDrafts: 'id, attendantEmail, savedAt'
+});
+
 // ============================================================
 // ROLE HIERARCHY
 // administrator > manager > cashier > salesperson. A higher role can
@@ -380,6 +432,180 @@ export async function syncPendingDrugsToCloud() {
 }
 
 // ============================================================
+// CSV / EXCEL DRUG IMPORT
+// ------------------------------------------------------------
+// Bulk create/update drugs from a parsed spreadsheet (App.jsx does the
+// actual file reading with the `xlsx` library and hands this plain
+// row objects — this function never touches File/ArrayBuffer stuff).
+// Manager/administrator only — this bypasses the cashier-needs-
+// approval queue entirely, the same way the rest of the app only lets
+// a manager/administrator's own drug edits apply immediately.
+//
+// A row matches an existing drug by barcode first (if the row has a
+// non-blank barcode and it matches one on file), then by exact
+// (case-insensitive) name. Any field left blank in the row is simply
+// not touched on an existing drug; a brand-new drug needs at least a
+// name to be created at all.
+// ============================================================
+
+const DRUG_IMPORT_HEADER_ALIASES = {
+  name: ['name', 'drugname', 'drug'],
+  unitType: ['unittype', 'unit', 'type'],
+  costPrice: ['costprice', 'cost'],
+  retailPrice: ['retailprice', 'retail'],
+  wholesalePrice: ['wholesaleprice', 'wholesale'],
+  stock: ['stock', 'quantity', 'qty'],
+  barcode: ['barcode', 'code'],
+  minStockQty: ['minstockqty', 'minstock', 'minimumstock'],
+  recommendedPurchaseQty: ['recommendedpurchaseqty', 'recommendedqty', 'purchaseqty'],
+  halfPackQty: ['halfpackqty', 'halfpack'],
+  halfPackPrice: ['halfpackprice'],
+  packQty: ['packqty', 'pack'],
+  packPrice: ['packprice']
+};
+
+function normalizeHeaderKey(key) {
+  return String(key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Maps one raw spreadsheet row (arbitrary header casing/spacing) onto
+// our internal field names, ignoring any column it doesn't recognize.
+function normalizeImportRow(row) {
+  const out = {};
+  const rowKeys = Object.keys(row || {});
+  for (const [field, aliases] of Object.entries(DRUG_IMPORT_HEADER_ALIASES)) {
+    const matchKey = rowKeys.find((k) => aliases.includes(normalizeHeaderKey(k)));
+    if (matchKey !== undefined && String(row[matchKey]).trim() !== '') {
+      out[field] = row[matchKey];
+    }
+  }
+  return out;
+}
+
+export async function bulkImportDrugs(rows, actor) {
+  const role = actor?.role;
+  if (!(role === 'manager' || role === 'administrator')) {
+    return { success: false, reason: 'Only managers and administrators can import drugs.' };
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { success: false, reason: 'Nothing to import — the file had no usable rows.' };
+  }
+
+  try {
+    const existingDrugs = await db.drugs.toArray();
+    const byBarcode = new Map();
+    const byName = new Map();
+    existingDrugs.forEach((d) => {
+      if (d.deletedAt) return;
+      if (d.barcode) byBarcode.set(String(d.barcode).trim(), d);
+      byName.set(String(d.name).trim().toLowerCase(), d);
+    });
+
+    let created = 0;
+    let updated = 0;
+    const skipped = [];
+    const toPut = [];
+    const priceChoices = [];
+
+    rows.forEach((raw, index) => {
+      const row = normalizeImportRow(raw);
+      const barcode = row.barcode ? String(row.barcode).trim() : '';
+      const name = row.name ? String(row.name).trim() : '';
+
+      const existing = (barcode && byBarcode.get(barcode)) ||
+        (name && byName.get(name.toLowerCase())) ||
+        null;
+
+      const optionalNumber = (value) =>
+        value === undefined || value === '' ? undefined : Number(value);
+
+      if (existing) {
+        const changes = { synced: 0 };
+        [
+          'name', 'unitType', 'costPrice', 'retailPrice', 'wholesalePrice',
+          'stock', 'barcode'
+        ].forEach((field) => {
+          if (row[field] !== undefined) {
+            changes[field] = field === 'name' || field === 'unitType' || field === 'barcode'
+              ? String(row[field]).trim()
+              : Number(row[field]);
+          }
+        });
+        [
+          'minStockQty', 'recommendedPurchaseQty',
+          'halfPackQty', 'halfPackPrice', 'packQty', 'packPrice'
+        ].forEach((field) => {
+          const n = optionalNumber(row[field]);
+          if (n !== undefined) changes[field] = n;
+        });
+        const merged = { ...existing, ...changes };
+        toPut.push(merged);
+        if (merged.costPrice > 0 && (merged.retailPrice > 0 || merged.wholesalePrice > 0)) {
+          priceChoices.push(merged);
+        }
+        updated += 1;
+      } else if (name) {
+        const costPrice = Number(row.costPrice) || 0;
+        const retailPrice = Number(row.retailPrice) || 0;
+        const wholesalePrice = Number(row.wholesalePrice) || 0;
+        const newDrug = {
+          id: generateId('DRUG'),
+          name,
+          unitType: row.unitType ? String(row.unitType).trim() : 'Unit',
+          costPrice,
+          retailPrice,
+          wholesalePrice,
+          stock: Math.max(0, Number(row.stock) || 0),
+          barcode,
+          halfPackQty: optionalNumber(row.halfPackQty) ?? null,
+          halfPackPrice: optionalNumber(row.halfPackPrice) ?? null,
+          packQty: optionalNumber(row.packQty) ?? null,
+          packPrice: optionalNumber(row.packPrice) ?? null,
+          minStockQty: optionalNumber(row.minStockQty) ?? null,
+          recommendedPurchaseQty: optionalNumber(row.recommendedPurchaseQty) ?? null,
+          priceHistory: [],
+          synced: 0
+        };
+        toPut.push(newDrug);
+        if (costPrice > 0 && (retailPrice > 0 || wholesalePrice > 0)) {
+          priceChoices.push(newDrug);
+        }
+        byName.set(name.toLowerCase(), newDrug);
+        if (barcode) byBarcode.set(barcode, newDrug);
+        created += 1;
+      } else {
+        skipped.push({ row: index + 1, reason: 'No name and no matching existing drug (by barcode or name).' });
+      }
+    });
+
+    if (toPut.length > 0) {
+      await db.drugs.bulkPut(toPut);
+    }
+
+    for (const d of priceChoices) {
+      recordDrugPriceChoice(d.id, d.costPrice, d.retailPrice, d.wholesalePrice).catch(() => {});
+    }
+
+    if (navigator.onLine) {
+      syncPendingDrugsToCloud().catch((err) =>
+        console.warn('Background import cloud sync failed:', err.message)
+      );
+    }
+
+    await logAuditEvent({
+      action: 'drugs_bulk_imported',
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      details: { created, updated, skippedCount: skipped.length }
+    });
+
+    return { success: true, created, updated, skipped };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
 // PRICE RECOMMENDATION ENGINE
 // ------------------------------------------------------------
 // Pure, synchronous — no db access, safe to call on every keystroke
@@ -435,26 +661,49 @@ function averageLearnedPercents(priceHistory) {
   };
 }
 
+// The generic defaults used when there's no admin-saved pricing
+// setting yet (brand-new install) and no per-drug learned history —
+// exactly the percentages the pharmacy was already using by hand: 10%
+// wholesale / 30% retail under ₦10,000, and a single 15%-35% (default
+// 25%) price at or above it.
+export const DEFAULT_PRICING_SETTINGS = {
+  wholesalePercent: 10,
+  retailPercent: 30,
+  highValueThreshold: 10000,
+  highValuePercent: 25,
+  highValueMinPercent: 15,
+  highValueMaxPercent: 35
+};
+
 // Returns null when the cost price isn't a usable positive number yet
 // (so the UI can simply not show a recommendation). Otherwise:
 // { wholesale, retail, wholesalePercent, retailPercent, sameForBoth, source }
 // `source` is 'learned' when at least one side came from this drug's
 // own history, 'default' when both sides used the generic rule.
-export function getPriceRecommendation(costPrice, priceHistory) {
+//
+// `settings` is the admin-editable general recommendation (see
+// fetchPricingSettings/savePricingSettings below) — pass the live
+// settings row so an admin's change to "general recommended profit %"
+// takes effect everywhere immediately. Falls back to
+// DEFAULT_PRICING_SETTINGS when not supplied (keeps every existing
+// call site working without a settings object).
+export function getPriceRecommendation(costPrice, priceHistory, settings) {
   const cost = Number(costPrice) || 0;
   if (cost <= 0) return null;
+
+  const s = { ...DEFAULT_PRICING_SETTINGS, ...(settings || {}) };
 
   const learned = averageLearnedPercents(priceHistory);
   const hasLearned = learned.wholesalePercent != null || learned.retailPercent != null;
 
-  if (cost > 10000) {
+  if (cost > s.highValueThreshold) {
     // High-value drugs: one price serves both sale types, and the
-    // "normal" range widens to 15%-35% (default 25%) rather than the
-    // fixed 10%/30% used below ₦10,000.
+    // "normal" range widens (default 15%-35%, 25% default) rather than
+    // the fixed wholesale/retail split used below the threshold.
     const learnedPercent = learned.retailPercent ?? learned.wholesalePercent;
     const percent = learnedPercent != null
-      ? Math.min(35, Math.max(15, learnedPercent))
-      : 25;
+      ? Math.min(s.highValueMaxPercent, Math.max(s.highValueMinPercent, learnedPercent))
+      : s.highValuePercent;
     const rounded = roundSalePriceUp(cost * (1 + percent / 100), cost);
     return {
       wholesale: rounded,
@@ -466,8 +715,8 @@ export function getPriceRecommendation(costPrice, priceHistory) {
     };
   }
 
-  const wholesalePercent = learned.wholesalePercent ?? 10;
-  const retailPercent = learned.retailPercent ?? 30;
+  const wholesalePercent = learned.wholesalePercent ?? s.wholesalePercent;
+  const retailPercent = learned.retailPercent ?? s.retailPercent;
 
   return {
     wholesale: roundSalePriceUp(cost * (1 + wholesalePercent / 100), cost),
@@ -519,6 +768,155 @@ export async function recordDrugPriceChoice(drugId, costPrice, retailPrice, whol
     }
   } catch (err) {
     console.warn('Unable to record price choice:', err.message);
+  }
+}
+
+// ============================================================
+// APP SETTINGS
+// A small generic key/value store (schema v15's `settings` table and
+// the Supabase `app_settings` table) — currently holds just the
+// pricing-recommendation percentages, admin-editable from the
+// Dashboard's Pricing Settings panel and picked up everywhere
+// getPriceRecommendation is called.
+// ============================================================
+
+export async function fetchPricingSettings() {
+  try {
+    const row = await db.settings.get('pricing');
+    if (navigator.onLine) {
+      try {
+        const { data, error } = await supabase
+          .from('app_settings')
+          .select('*')
+          .eq('key', 'pricing')
+          .maybeSingle();
+        if (!error && data) {
+          const merged = { ...DEFAULT_PRICING_SETTINGS, ...(data.value || {}) };
+          await db.settings.put({ key: 'pricing', ...merged, synced: 1 });
+          return merged;
+        }
+      } catch (err) {
+        console.warn('Cloud pricing-settings fetch failed, using local copy:', err.message);
+      }
+    }
+    if (row) {
+      const { key, synced, ...values } = row;
+      return { ...DEFAULT_PRICING_SETTINGS, ...values };
+    }
+    return { ...DEFAULT_PRICING_SETTINGS };
+  } catch (err) {
+    console.warn('Unable to fetch pricing settings, using defaults:', err.message);
+    return { ...DEFAULT_PRICING_SETTINGS };
+  }
+}
+
+export async function savePricingSettings(settings, actor) {
+  try {
+    const merged = { ...DEFAULT_PRICING_SETTINGS, ...settings };
+    await db.settings.put({ key: 'pricing', ...merged, synced: 0 });
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('app_settings').upsert([
+          {
+            key: 'pricing',
+            value: merged,
+            updated_at: new Date().toISOString(),
+            updated_by_email: actor?.email || null
+          }
+        ]);
+        if (!error) await db.settings.update('pricing', { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud pricing-settings save postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      action: 'pricing_settings_updated',
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      details: merged
+    });
+
+    return { success: true, settings: merged };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function syncPendingSettingsToCloud() {
+  try {
+    const pending = await db.settings.where('synced').equals(0).toArray();
+    if (pending.length === 0) return;
+    for (const row of pending) {
+      const { key, synced, ...values } = row;
+      try {
+        const { error } = await supabase.from('app_settings').upsert([
+          { key, value: values, updated_at: new Date().toISOString() }
+        ]);
+        if (!error) await db.settings.update(key, { synced: 1 });
+      } catch (err) {
+        console.warn(`Cloud settings sync postponed for "${key}":`, err.message);
+      }
+    }
+  } catch (err) {
+    console.warn('Unable to sync pending settings:', err.message);
+  }
+}
+
+// ============================================================
+// ROLE MANAGEMENT
+// ------------------------------------------------------------
+// Online-only (acting on other people's live accounts isn't something
+// that makes sense to queue offline) — lists every Supabase `profiles`
+// row and lets an administrator change one's role directly from the
+// UI instead of needing to open Supabase. Like every other table in
+// this app, `profiles` trusts the client's own role check rather than
+// enforcing it in RLS, so this is gated to administrator-only in the
+// UI (App.jsx) as well as here.
+// ============================================================
+
+export async function fetchAllProfiles() {
+  try {
+    const { data, error } = await supabase.from('profiles').select('*');
+    if (error) throw error;
+    const profiles = (data || []).slice().sort((a, b) => {
+      const aLabel = (a.email || a.id || '').toLowerCase();
+      const bLabel = (b.email || b.id || '').toLowerCase();
+      return aLabel.localeCompare(bLabel);
+    });
+    return { success: true, profiles };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function updateUserRole(profileId, newRole, actor) {
+  if (actor?.role !== 'administrator') {
+    return { success: false, reason: 'Only an administrator can change account roles.' };
+  }
+  if (!ROLE_RANK.hasOwnProperty(newRole)) {
+    return { success: false, reason: `"${newRole}" isn't a recognized role.` };
+  }
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ role: newRole })
+      .eq('id', profileId);
+    if (error) throw error;
+
+    await logAuditEvent({
+      action: 'user_role_changed',
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      targetType: 'profile',
+      targetId: profileId,
+      details: { newRole }
+    });
+
+    return { success: true };
+  } catch (err) {
+    return { success: false, reason: err.message };
   }
 }
 
@@ -2250,17 +2648,23 @@ export async function fetchCustomers() {
 
     const mapped = data
       .filter((c) => !pendingIds.has(String(c.id)))
-      .map((c) => ({
-        id: String(c.id),
-        name: c.name,
-        phone: c.phone || '',
-        email: c.email || '',
-        address: c.address || '',
-        balance: Number(c.balance || 0),
-        deletedAt: c.deleted_at || null,
-        deletedBy: c.deleted_by || null,
-        synced: 1
-      }));
+      .map((c) => {
+        const phones = Array.isArray(c.phones) && c.phones.length > 0
+          ? c.phones
+          : (c.phone ? [c.phone] : []);
+        return {
+          id: String(c.id),
+          name: c.name,
+          phones,
+          phone: phones[0] || '',
+          email: c.email || '',
+          address: c.address || '',
+          balance: Number(c.balance || 0),
+          deletedAt: c.deleted_at || null,
+          deletedBy: c.deleted_by || null,
+          synced: 1
+        };
+      });
 
     if (mapped.length > 0) {
       await db.customers.bulkPut(mapped);
@@ -2270,47 +2674,144 @@ export async function fetchCustomers() {
   }
 }
 
+// Normalizes whatever shape of phone numbers a form hands over (a
+// single `phone` string, or an array of several) into a clean array
+// with no blanks, plus a `phone` convenience field holding the first
+// one — kept so every existing read site (ticket snapshots, receipts,
+// search) that only knows about a single `phone` keeps working.
+function normalizeCustomerPhones(payload) {
+  const raw = Array.isArray(payload.phones)
+    ? payload.phones
+    : payload.phone
+      ? [payload.phone]
+      : [];
+  const phones = raw.map((p) => String(p || '').trim()).filter(Boolean);
+  return { phones, phone: phones[0] || '' };
+}
+
+// A brand-new wholesale customer can't owe anything until a manager
+// has approved them (see the PRICE... no, see the WHOLESALE CUSTOMER
+// DYNAMIC note at approveTicket below) — so unlike every other field
+// on a customer, *creating* one isn't something a cashier can do
+// outright. A manager/administrator creates one directly, same as
+// always. A cashier instead submits a CREATE request, exactly like an
+// EDIT or DELETE request: nothing usable exists yet until a manager
+// approves it.
 export async function addCustomer(payload, actor) {
-  const customer = {
-    id: generateId('CUSTOMER'),
-    name: (payload.name || '').trim(),
-    phone: (payload.phone || '').trim(),
-    email: (payload.email || '').trim(),
-    address: (payload.address || '').trim(),
-    balance: 0,
-    synced: 0
-  };
+  const role = actor?.role;
+  const isManager = role === 'manager' || role === 'administrator';
+  const { phones, phone } = normalizeCustomerPhones(payload);
+  const name = (payload.name || '').trim();
+  const email = (payload.email || '').trim();
+  const address = (payload.address || '').trim();
 
-  await db.customers.add(customer);
+  if (isManager) {
+    const customer = {
+      id: generateId('CUSTOMER'),
+      name,
+      phones,
+      phone,
+      email,
+      address,
+      balance: 0,
+      synced: 0
+    };
 
-  if (navigator.onLine) {
-    try {
-      const { error } = await supabase.from('customers').insert([
-        {
-          id: customer.id,
-          name: customer.name,
-          phone: customer.phone,
-          email: customer.email,
-          address: customer.address,
-          balance: 0
-        }
-      ]);
-      if (!error) await db.customers.update(customer.id, { synced: 1 });
-    } catch (err) {
-      console.warn('Cloud customer create postponed:', err.message);
+    await db.customers.add(customer);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('customers').insert([
+          {
+            id: customer.id,
+            name: customer.name,
+            phones: customer.phones,
+            phone: customer.phone,
+            email: customer.email,
+            address: customer.address,
+            balance: 0
+          }
+        ]);
+        if (!error) await db.customers.update(customer.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer create postponed:', err.message);
+      }
     }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_added',
+      targetType: 'customer',
+      targetId: customer.id,
+      details: { name: customer.name }
+    });
+
+    return { success: true, applied: true, customer };
   }
 
-  await logAuditEvent({
-    actorEmail: actor?.email,
-    actorRole: actor?.role,
-    action: 'customer_added',
-    targetType: 'customer',
-    targetId: customer.id,
-    details: { name: customer.name }
-  });
+  // Cashier — queue a CREATE request instead. The id is generated now
+  // (not on approval) so it's stable from the moment the request is
+  // raised, but the row in `customers` itself doesn't exist until a
+  // manager approves it.
+  try {
+    const customerId = generateId('CUSTOMER');
+    const request = {
+      id: generateId('CUSTCHG'),
+      customerId,
+      type: 'CREATE',
+      proposedChanges: { name, phones, phone, email, address },
+      status: 'PENDING',
+      requestedById: actor?.id || null,
+      requestedByEmail: actor?.email || 'unknown',
+      requestedByRole: role || 'unknown',
+      createdAt: new Date().toISOString(),
+      decidedByEmail: null,
+      decidedAt: null,
+      rejectionReason: null,
+      synced: 0
+    };
 
-  return customer;
+    await db.customerChangeRequests.add(request);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase.from('customer_change_requests').insert([
+          {
+            id: request.id,
+            customer_id: request.customerId,
+            type: request.type,
+            proposed_changes: request.proposedChanges,
+            status: request.status,
+            requested_by: request.requestedById,
+            requested_by_email: request.requestedByEmail,
+            requested_by_role: request.requestedByRole,
+            created_at: request.createdAt,
+            decided_by_email: request.decidedByEmail,
+            decided_at: request.decidedAt,
+            rejection_reason: request.rejectionReason
+          }
+        ]);
+        if (!error) await db.customerChangeRequests.update(request.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud customer create request postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customer_create_requested',
+      targetType: 'customer',
+      targetId: customerId,
+      details: { name }
+    });
+
+    return { success: true, applied: false, pending: true, requestId: request.id, customerId };
+  } catch (err) {
+    console.warn('Unable to request new customer:', err.message);
+    return { success: false, reason: err.message };
+  }
 }
 
 export async function syncPendingCustomersToCloud() {
@@ -2323,6 +2824,7 @@ export async function syncPendingCustomersToCloud() {
         {
           id: customer.id,
           name: customer.name,
+          phones: customer.phones || (customer.phone ? [customer.phone] : []),
           phone: customer.phone,
           email: customer.email,
           address: customer.address,
@@ -2343,9 +2845,16 @@ export async function updateCustomer(customer, changes, actor) {
     const role = actor?.role;
     const isManager = role === 'manager' || role === 'administrator';
 
+    const phonesChanged = normalizeCustomerPhones(
+      changes.phones !== undefined || changes.phone !== undefined
+        ? changes
+        : customer
+    );
+
     const cleaned = {
       name: (changes.name ?? customer.name ?? '').trim(),
-      phone: (changes.phone ?? customer.phone ?? '').trim(),
+      phones: phonesChanged.phones,
+      phone: phonesChanged.phone,
       email: (changes.email ?? customer.email ?? '').trim(),
       address: (changes.address ?? customer.address ?? '').trim()
     };
@@ -2359,6 +2868,7 @@ export async function updateCustomer(customer, changes, actor) {
             .from('customers')
             .update({
               name: cleaned.name,
+              phones: cleaned.phones,
               phone: cleaned.phone,
               email: cleaned.email,
               address: cleaned.address
@@ -2613,7 +3123,43 @@ export async function approveCustomerChangeRequest(request, actor) {
     }
     const target = freshLocal || request;
 
-    if (target.type === 'EDIT') {
+    if (target.type === 'CREATE') {
+      // Nothing exists in `customers` yet for this one — this is the
+      // moment it actually gets created, now that a manager has signed
+      // off on it. Only from here on can this customer be linked to a
+      // ticket and allowed to owe.
+      const p = target.proposedChanges || {};
+      const customer = {
+        id: target.customerId,
+        name: p.name || '',
+        phones: p.phones || (p.phone ? [p.phone] : []),
+        phone: p.phone || (p.phones && p.phones[0]) || '',
+        email: p.email || '',
+        address: p.address || '',
+        balance: 0,
+        synced: 0
+      };
+      await db.customers.add(customer);
+
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase.from('customers').insert([
+            {
+              id: customer.id,
+              name: customer.name,
+              phones: customer.phones,
+              phone: customer.phone,
+              email: customer.email,
+              address: customer.address,
+              balance: 0
+            }
+          ]);
+          if (!error) await db.customers.update(customer.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Cloud customer create (approved) postponed:', err.message);
+        }
+      }
+    } else if (target.type === 'EDIT') {
       await db.customers.update(target.customerId, {
         ...target.proposedChanges,
         synced: 0
@@ -2625,6 +3171,7 @@ export async function approveCustomerChangeRequest(request, actor) {
             .from('customers')
             .update({
               name: target.proposedChanges.name,
+              phones: target.proposedChanges.phones || (target.proposedChanges.phone ? [target.proposedChanges.phone] : []),
               phone: target.proposedChanges.phone,
               email: target.proposedChanges.email,
               address: target.proposedChanges.address
@@ -4166,6 +4713,59 @@ export async function clearRestockDraft(email) {
 }
 
 // ============================================================
+// SAVED CART DRAFTS
+// ------------------------------------------------------------
+// A draft an attendant is actively juggling lives only in React state
+// (see ticketDrafts in App.jsx) — still true, and still never synced.
+// But a draft the attendant wants to set aside and come back to later
+// (after closing the tab, the end of a shift, tomorrow) gets written
+// here instead, purely local (never pushed to Supabase — a half-built
+// cart isn't something other devices need to see). Scoped to whichever
+// attendant saved it.
+// ============================================================
+
+export async function saveCartDraft(draft, actor) {
+  try {
+    const record = {
+      id: draft.id || generateId('CARTDRAFT'),
+      attendantEmail: actor?.email || '',
+      label: draft.customerName || 'Saved cart',
+      customerName: draft.customerName || '',
+      customerPhone: draft.customerPhone || '',
+      saleType: draft.saleType || 'retail',
+      items: draft.items || [],
+      savedAt: new Date().toISOString()
+    };
+    await db.cartDrafts.put(record);
+    return { success: true, draft: record };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function fetchSavedCartDrafts(attendantEmail) {
+  try {
+    const all = await db.cartDrafts
+      .where('attendantEmail')
+      .equals(attendantEmail || '')
+      .toArray();
+    return all.sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt));
+  } catch (err) {
+    console.warn('Unable to fetch saved cart drafts:', err.message);
+    return [];
+  }
+}
+
+export async function deleteCartDraft(id) {
+  try {
+    await db.cartDrafts.delete(id);
+    return { success: true };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+// ============================================================
 // ATTENDANT / CASHIER TICKET WORKFLOW
 // ------------------------------------------------------------
 // DRAFT tickets (an attendant still building a customer's cart) live
@@ -4232,15 +4832,11 @@ export async function createTicket(ticketPayload, actor) {
     };
   }
 
-  // A wholesale sale has to be tied to a real customer record — that's
-  // what carries the running balance (how much they owe, or are owed)
-  // across purchases. A retail "walk-in" ticket doesn't need one.
-  if (ticketPayload.saleType === 'wholesale' && !ticketPayload.customerId) {
-    return {
-      success: false,
-      reason: 'Choose a wholesale customer before sending this ticket to the cashier.'
-    };
-  }
+  // A wholesale sale no longer needs a registered customer just to be
+  // sent to the cashier — wholesale pricing and owing are separate
+  // things now. A customer record only matters if this person wants to
+  // owe and pay later; that gets attached (if at all) at the cashier's
+  // approval stage via linkCustomerToTicket, not here.
 
   const dailyNumber = await getNextDailyTicketNumber();
 
@@ -4374,6 +4970,13 @@ export async function syncPendingTicketsToCloud() {
           sale_type: ticket.saleType,
           customer_name: ticket.customerName,
           customer_phone: ticket.customerPhone,
+          // This was missing before — any ticket that went through this
+          // retry path (rather than the direct insert in createTicket)
+          // silently lost its linked wholesale customer in the cloud,
+          // which is exactly what made a reloaded queue treat an owing
+          // wholesale sale like an anonymous walk-in that had to be
+          // paid in full.
+          customer_id: ticket.customerId || null,
           daily_number: ticket.dailyNumber ?? null,
           adjustment_reason: ticket.adjustmentReason ?? null,
           sent_back_at: ticket.sentBackAt ?? null,
@@ -4570,15 +5173,9 @@ export async function resubmitTicket(ticketId, updatedPayload, actor) {
       };
     }
 
-    // A wholesale resubmission still needs a real customer attached —
-    // e.g. the attendant switched a ticket from retail to wholesale
-    // while fixing it up, without picking anyone.
-    if (updatedPayload.saleType === 'wholesale' && !updatedPayload.customerId) {
-      return {
-        success: false,
-        reason: 'Choose a wholesale customer before resubmitting this ticket.'
-      };
-    }
+    // No customer requirement here either, same reasoning as
+    // createTicket above — resubmitting a wholesale ticket doesn't need
+    // anyone picked.
 
     const update = {
       items: updatedPayload.items,
@@ -4666,6 +5263,76 @@ export async function clampNegativeStockToZero() {
     }
   } catch (err) {
     console.warn('Unable to clamp negative stock:', err.message);
+  }
+}
+
+// ============================================================
+// WHOLESALE CUSTOMER DYNAMIC
+// ------------------------------------------------------------
+// A wholesale ticket no longer needs a registered customer just to be
+// built and sent to the cashier (see createTicket/resubmitTicket
+// above) — a customer record is only needed when the person actually
+// wants to owe and pay later. That decision happens at the cashier's
+// end, during approval, which is what this function is for: it
+// attaches an EXISTING, already-approved customer to a ticket that was
+// submitted without one, right before approveTicket is called. Once
+// linked, approveTicket's own owed-balance logic (further down)
+// applies exactly as it already did.
+//
+// A customer created moments ago by a cashier's own CREATE request
+// (see addCustomer) can't be linked here — they don't exist in
+// `customers` at all yet, only as a PENDING customerChangeRequests row,
+// precisely because a brand-new customer isn't allowed to owe until a
+// manager approves them. That sale just has to be paid in full, same
+// as a walk-in.
+// ============================================================
+export async function linkCustomerToTicket(ticket, customerId, actor) {
+  try {
+    const customer = await db.customers.get(customerId);
+    if (!customer) {
+      return { success: false, reason: 'Customer not found.' };
+    }
+    if (customer.deletedAt) {
+      return { success: false, reason: 'This customer has been deleted.' };
+    }
+
+    const changes = {
+      customerId: customer.id,
+      customerName: customer.name,
+      customerPhone: customer.phone || ticket.customerPhone || '',
+      synced: 0
+    };
+
+    await db.tickets.update(ticket.id, changes);
+
+    if (navigator.onLine) {
+      try {
+        const { error } = await supabase
+          .from('tickets')
+          .update({
+            customer_id: changes.customerId,
+            customer_name: changes.customerName,
+            customer_phone: changes.customerPhone
+          })
+          .eq('id', ticket.id);
+        if (!error) await db.tickets.update(ticket.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Cloud ticket-customer link postponed:', err.message);
+      }
+    }
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'ticket_customer_linked',
+      targetType: 'ticket',
+      targetId: ticket.id,
+      details: { customerId: customer.id, customerName: customer.name }
+    });
+
+    return { success: true, ticket: { ...ticket, ...changes } };
+  } catch (err) {
+    return { success: false, reason: err.message };
   }
 }
 

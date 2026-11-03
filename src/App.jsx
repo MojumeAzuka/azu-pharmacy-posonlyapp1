@@ -86,7 +86,17 @@ import {
   rejectCustomerChangeRequest,
   fetchCloudCustomerChangeRequests,
   syncPendingCustomerChangeRequestsToCloud,
-  getMinimumWholesalePayment
+  getMinimumWholesalePayment,
+  DEFAULT_PRICING_SETTINGS,
+  fetchPricingSettings,
+  savePricingSettings,
+  bulkImportDrugs,
+  fetchAllProfiles,
+  updateUserRole,
+  saveCartDraft,
+  fetchSavedCartDrafts,
+  deleteCartDraft,
+  linkCustomerToTicket
 } from './db';
 import './App.css';
 
@@ -97,8 +107,8 @@ const LAST_SEEN_AUDIT_KEY = 'azu_last_seen_manager_changes';
 // cost-price field (the Drugs CRUD form, a restock line) without
 // knowing anything about where it's being used. Renders nothing when
 // the cost price isn't a usable number yet.
-function PriceRecommendationHint({ costPrice, priceHistory, onPickWholesale, onPickRetail }) {
-  const rec = getPriceRecommendation(costPrice, priceHistory);
+function PriceRecommendationHint({ costPrice, priceHistory, settings, onPickWholesale, onPickRetail }) {
+  const rec = getPriceRecommendation(costPrice, priceHistory, settings);
   if (!rec) return null;
 
   const learnedNote = rec.source === 'learned' ? ' · based on your past prices for this drug' : '';
@@ -171,6 +181,10 @@ export default function App() {
   // NETWORK STATE
   // ============================================================
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  // Holds the latest runAllSync function (defined inside the sync
+  // useEffect below) so the separate connectivity-check interval can
+  // call it without needing to be in that same effect.
+  const runAllSyncRef = useRef(() => {});
 
   // ============================================================
   // CART LIST REF
@@ -249,15 +263,22 @@ export default function App() {
   const [isSavingCustomerCrud, setIsSavingCustomerCrud] = useState(false);
   const [customerFormData, setCustomerFormData] = useState({
     name: '',
-    phone: '',
+    phones: [''],
     email: '',
     address: ''
   });
-  // A per-draft "pick a wholesale customer" search box — keyed off
-  // which draft opened it, so two customers' drafts don't fight over
-  // one shared picker.
-  const [customerPickerForDraftId, setCustomerPickerForDraftId] = useState(null);
-  const [draftCustomerSearchTerm, setDraftCustomerSearchTerm] = useState('');
+  // Set when the "+ New Customer" shortcut was opened from the
+  // cashier's approval modal (rather than the standalone Customers
+  // screen) — tells handleSaveCustomer to link the result onto
+  // approvingTicket once it's actually usable (i.e. a manager/admin
+  // created it directly; a cashier's request has to wait for approval
+  // first and isn't linked to anything yet).
+  const [customerPickerForApproval, setCustomerPickerForApproval] = useState(false);
+  // The cashier's "this wholesale customer wants to owe" search box in
+  // the approval modal — only relevant for a ticket with no customer
+  // linked yet.
+  const [isLinkingCustomerForApproval, setIsLinkingCustomerForApproval] = useState(false);
+  const [approvalCustomerSearchTerm, setApprovalCustomerSearchTerm] = useState('');
 
   // --- Drugs CRUD list (separate from the ticket-builder search) ---
   const [drugCrudSearchTerm, setDrugCrudSearchTerm] = useState('');
@@ -302,6 +323,29 @@ export default function App() {
   // admin picks a range.
   const [dashboardRangeStart, setDashboardRangeStart] = useState('');
   const [dashboardRangeEnd, setDashboardRangeEnd] = useState('');
+
+  // Admin-editable "general recommended profit %" used by the price
+  // recommendation hints everywhere a cost price is entered — starts
+  // at the same defaults the pharmacy was already using by hand, and
+  // is overwritten as soon as the real saved setting loads.
+  const [pricingSettings, setPricingSettings] = useState(DEFAULT_PRICING_SETTINGS);
+  const [pricingSettingsForm, setPricingSettingsForm] = useState(DEFAULT_PRICING_SETTINGS);
+  const [isSavingPricingSettings, setIsSavingPricingSettings] = useState(false);
+
+  // CSV/Excel drug import — tracks what's about to be imported (a
+  // preview) and the result summary after it runs.
+  const [importPreviewRows, setImportPreviewRows] = useState(null);
+  const [importFileName, setImportFileName] = useState('');
+  const [isImportingDrugs, setIsImportingDrugs] = useState(false);
+  const [importResultSummary, setImportResultSummary] = useState(null);
+
+  // Role management — the list of Supabase auth accounts/profiles,
+  // fetched fresh (online-only feature) whenever the admin opens that
+  // panel, plus which row is mid-save.
+  const [allProfiles, setAllProfiles] = useState(null);
+  const [isLoadingProfiles, setIsLoadingProfiles] = useState(false);
+  const [savingProfileId, setSavingProfileId] = useState(null);
+
   const [lastSeenAuditAt, setLastSeenAuditAt] = useState(
     () => localStorage.getItem(LAST_SEEN_AUDIT_KEY) || null
   );
@@ -332,6 +376,13 @@ export default function App() {
   const [ticketDrafts, setTicketDrafts] = useState([]);
   const [activeDraftId, setActiveDraftId] = useState(null);
   const [isSubmittingTicket, setIsSubmittingTicket] = useState(false);
+
+  // Carts set aside to continue later — persisted locally (see
+  // cartDrafts in db.js), loaded fresh whenever the Saved Carts panel
+  // is opened and whenever one is saved/resumed/discarded.
+  const [savedCartDrafts, setSavedCartDrafts] = useState([]);
+  const [isSavedCartsPanelOpen, setIsSavedCartsPanelOpen] = useState(false);
+  const [isSavingCartDraft, setIsSavingCartDraft] = useState(false);
 
   // Briefly highlights whichever item was just tapped into the active
   // draft's cart, and the list auto-scrolls to it — same "see what you
@@ -805,12 +856,22 @@ export default function App() {
       clampNegativeStockToZero();
     };
 
+    runAllSyncRef.current = runAllSync;
+
     const handleOnline = () => {
-      setIsOnline(true);
-      runAllSync();
+      // The browser's own "online" event only means a network adapter
+      // came up — it doesn't mean the internet (or Supabase) is actually
+      // reachable. Confirm with a real request before flipping the badge
+      // and kicking off a sync that would just fail anyway.
+      checkRealConnectivity().then((reallyOnline) => {
+        setIsOnline(reallyOnline);
+        if (reallyOnline) runAllSync();
+      });
     };
 
     const handleOffline = () => {
+      // No network adapter at all — this one IS reliable, no need to
+      // double-check it.
       setIsOnline(false);
     };
 
@@ -826,6 +887,57 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, [session, userRole]);
+
+  // ============================================================
+  // REAL CONNECTIVITY CHECK
+  // ------------------------------------------------------------
+  // navigator.onLine (and the browser's online/offline events) only
+  // reflect whether the device has a network interface up — connected
+  // to Wi-Fi with no actual internet behind it still reads "online".
+  // This instead tries an actual, tiny Supabase request so the "Online"
+  // / "Offline" badge reflects whether the app can really reach the
+  // server, not just whether a cable is plugged in. A single blip
+  // doesn't flip the badge — two consecutive failed checks are needed
+  // before it switches to "Offline", so one slow response doesn't make
+  // it flicker; any single success switches it right back to "Online".
+  // ============================================================
+  const connectivityFailureCountRef = useRef(0);
+
+  async function checkRealConnectivity() {
+    if (!navigator.onLine) return false;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const { error } = await supabase
+        .from('app_settings')
+        .select('key')
+        .limit(1)
+        .abortSignal(controller.signal);
+      clearTimeout(timeout);
+      if (error) throw error;
+      connectivityFailureCountRef.current = 0;
+      return true;
+    } catch {
+      connectivityFailureCountRef.current += 1;
+      return connectivityFailureCountRef.current < 2;
+    }
+  }
+
+  useEffect(() => {
+    if (!session) return;
+    const interval = setInterval(async () => {
+      const reallyOnline = await checkRealConnectivity();
+      setIsOnline((prev) => {
+        if (reallyOnline !== prev && reallyOnline) {
+          // Coming back from a real outage (not just a flipped badge) —
+          // catch up on anything that piled up while unreachable.
+          setTimeout(() => runAllSyncRef.current?.(), 0);
+        }
+        return reallyOnline;
+      });
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [session]);
 
   // A pure cashier account has no POS tab (see the nav above) — if their
   // role loads in after the default 'pos' tab is already selected (or
@@ -847,6 +959,23 @@ export default function App() {
       setActiveTab('admin');
     }
   }, [userRole, activeTab]);
+
+  // Load the admin-saved pricing-recommendation percentages once a
+  // session exists — everyone needs this (it drives the price hint
+  // shown to anyone entering a cost price), not just the admin editing
+  // it, so this isn't gated on activeTab/adminSection.
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    fetchPricingSettings().then((settings) => {
+      if (cancelled) return;
+      setPricingSettings(settings);
+      setPricingSettingsForm(settings);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
 
   useEffect(() => {
     if (activeTab === 'history' && isOnline) {
@@ -1919,6 +2048,74 @@ export default function App() {
     });
   };
 
+  // ============================================================
+  // SAVED CART DRAFTS (set a cart aside, continue with it later)
+  // ============================================================
+  const handleLoadSavedCartDrafts = async () => {
+    const list = await fetchSavedCartDrafts(session?.user?.email);
+    setSavedCartDrafts(list);
+  };
+
+  const handleOpenSavedCartsPanel = () => {
+    setIsSavedCartsPanelOpen(true);
+    handleLoadSavedCartDrafts();
+  };
+
+  // Writes the draft to local storage and removes it from the open
+  // tabs — same "set it aside" action whether the cart is empty or
+  // full, since the point is freeing up a tab, not validating content.
+  const handleSaveDraftForLater = async (draftId) => {
+    const draft = ticketDrafts.find((d) => d.id === draftId);
+    if (!draft) return;
+    if (draft.items.length === 0) {
+      alert("This cart is empty — add something first, or just close it with the × instead of saving it.");
+      return;
+    }
+    setIsSavingCartDraft(true);
+    try {
+      const result = await saveCartDraft(draft, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      if (result.success) {
+        closeDraft(draftId);
+        if (isSavedCartsPanelOpen) handleLoadSavedCartDrafts();
+      } else {
+        alert(result.reason || 'Unable to save this cart.');
+      }
+    } finally {
+      setIsSavingCartDraft(false);
+    }
+  };
+
+  // Brings a saved cart back as a live, editable draft tab — reusing
+  // the same ticketDrafts array a freshly-built cart would use — and
+  // removes it from saved storage so it isn't sitting in both places.
+  const handleResumeSavedCartDraft = async (saved) => {
+    setTicketDrafts((prev) => [
+      ...prev,
+      {
+        id: saved.id,
+        items: saved.items || [],
+        customerName: saved.customerName || 'Saved cart',
+        customerPhone: saved.customerPhone || '',
+        saleType: saved.saleType || 'retail'
+      }
+    ]);
+    setActiveDraftId(saved.id);
+    setIsSavedCartsPanelOpen(false);
+    await deleteCartDraft(saved.id);
+    setSavedCartDrafts((prev) => prev.filter((d) => d.id !== saved.id));
+  };
+
+  const handleDiscardSavedCartDraft = async (saved) => {
+    if (!window.confirm(`Discard the saved cart for "${saved.label || saved.customerName}"? This cannot be undone.`)) {
+      return;
+    }
+    await deleteCartDraft(saved.id);
+    setSavedCartDrafts((prev) => prev.filter((d) => d.id !== saved.id));
+  };
+
   const addToDraft = (draftId, drug) => {
     // A drug with zero stock on record can't actually be sold — rather
     // than silently letting it onto a ticket (which a cashier would
@@ -2034,13 +2231,10 @@ export default function App() {
       return;
     }
 
-    // A wholesale sale always needs a real customer record attached —
-    // that's what carries their running balance across purchases.
-    if (draft.saleType === 'wholesale' && !draft.customerId) {
-      alert('Choose (or add) a wholesale customer before sending this ticket to the cashier.');
-      return;
-    }
-
+    // Wholesale pricing and owing are separate things now — a cart at
+    // wholesale prices can go straight to the cashier with no customer
+    // record at all. A customer only gets attached (by the cashier, at
+    // approval time) if this person wants to owe and pay later.
     setIsSubmittingTicket(true);
 
     try {
@@ -2087,6 +2281,9 @@ export default function App() {
     setPaymentMethod('cash');
     setPaymentCash(String(ticket.total || ''));
     setPaymentElectronicLines([]);
+    setIsLinkingCustomerForApproval(false);
+    setApprovalCustomerSearchTerm('');
+    setCustomerPickerForApproval(false);
   };
 
   // Switching the top-level method sets sensible defaults but never
@@ -2478,7 +2675,7 @@ export default function App() {
   // ============================================================
   const handleOpenAddCustomerModal = () => {
     setEditingCustomer(null);
-    setCustomerFormData({ name: '', phone: '', email: '', address: '' });
+    setCustomerFormData({ name: '', phones: [''], email: '', address: '' });
     setIsCustomerModalOpen(true);
   };
 
@@ -2486,7 +2683,12 @@ export default function App() {
     setEditingCustomer(customer);
     setCustomerFormData({
       name: customer.name || '',
-      phone: customer.phone || '',
+      phones:
+        Array.isArray(customer.phones) && customer.phones.length > 0
+          ? customer.phones
+          : customer.phone
+            ? [customer.phone]
+            : [''],
       email: customer.email || '',
       address: customer.address || ''
     });
@@ -2502,24 +2704,41 @@ export default function App() {
     setIsSavingCustomerCrud(true);
     try {
       const actor = { email: session?.user?.email, role: userRole };
+      const payload = {
+        ...customerFormData,
+        phones: (customerFormData.phones || []).map((p) => p.trim()).filter(Boolean)
+      };
       if (editingCustomer) {
-        const result = await updateCustomer(editingCustomer, customerFormData, actor);
+        const result = await updateCustomer(editingCustomer, payload, actor);
         setIsCustomerModalOpen(false);
         if (result && result.pending) {
           alert(
-            `Your changes to "${customerFormData.name}" have been sent to a manager for approval.`
+            `Your changes to "${payload.name}" have been sent to a manager for approval.`
           );
         } else if (result && result.success === false) {
           alert(result.reason || 'Unable to save this customer.');
         }
       } else {
-        const newCustomer = await addCustomer(customerFormData, actor);
+        const result = await addCustomer(payload, actor);
         setIsCustomerModalOpen(false);
-        // If this customer was being added from a wholesale draft's
-        // "+ New Customer" shortcut, attach them to that draft right
-        // away instead of making the attendant search for them again.
-        if (customerPickerForDraftId) {
-          handlePickDraftCustomer(customerPickerForDraftId, newCustomer);
+        if (result.success === false) {
+          alert(result.reason || 'Unable to save this customer.');
+        } else if (result.pending) {
+          // Cashier-submitted — nothing exists yet for this person to
+          // owe against. A manager has to sign off first.
+          alert(
+            `"${payload.name}" has been sent to a manager for approval. They can't owe anything until that's approved — if this was for a sale in progress, it still needs to be paid in full for now.`
+          );
+          setCustomerPickerForApproval(false);
+        } else if (result.applied && result.customer) {
+          // Manager/administrator created it directly — it's usable
+          // right away. If this was opened from the approval modal's
+          // "+ New Customer" shortcut, link it onto that ticket now
+          // instead of making the cashier search for it again.
+          if (customerPickerForApproval) {
+            await handleLinkExistingCustomerForApproval(result.customer);
+          }
+          setCustomerPickerForApproval(false);
         }
       }
     } finally {
@@ -2541,32 +2760,24 @@ export default function App() {
     }
   };
 
-  // Attaches a real customer record to a wholesale draft — the search
-  // box and "+ New Customer" shortcut in the ticket builder both funnel
-  // through here.
-  const handlePickDraftCustomer = (draftId, customer) => {
-    setTicketDrafts((prev) =>
-      prev.map((d) =>
-        d.id === draftId
-          ? {
-              ...d,
-              customerId: customer.id,
-              customerName: customer.name,
-              customerPhone: customer.phone || ''
-            }
-          : d
-      )
-    );
-    setCustomerPickerForDraftId(null);
-    setDraftCustomerSearchTerm('');
-  };
-
-  const handleClearDraftCustomer = (draftId) => {
-    setTicketDrafts((prev) =>
-      prev.map((d) =>
-        d.id === draftId ? { ...d, customerId: null, customerName: '', customerPhone: '' } : d
-      )
-    );
+  // The cashier approval modal's counterpart to picking a drug — links
+  // an already-approved customer record onto the ticket being paid
+  // for, which is what unlocks owing. A brand-new/unapproved customer
+  // (see addCustomer above) never reaches here — only one that already
+  // exists in `customers` can be linked.
+  const handleLinkExistingCustomerForApproval = async (customer) => {
+    if (!approvingTicket) return;
+    const result = await linkCustomerToTicket(approvingTicket, customer.id, {
+      email: session?.user?.email,
+      role: userRole
+    });
+    if (result.success) {
+      setApprovingTicket(result.ticket);
+      setIsLinkingCustomerForApproval(false);
+      setApprovalCustomerSearchTerm('');
+    } else {
+      alert(result.reason || 'Unable to link this customer.');
+    }
   };
 
   // ============================================================
@@ -3092,6 +3303,157 @@ export default function App() {
   // ============================================================
   // ADMIN: BANK OPTIONS
   // ============================================================
+  // ============================================================
+  // PRICING SETTINGS (admin-editable general recommended profit %)
+  // ============================================================
+  const handleSavePricingSettings = async () => {
+    setIsSavingPricingSettings(true);
+    try {
+      const parsed = {
+        wholesalePercent: Number(pricingSettingsForm.wholesalePercent),
+        retailPercent: Number(pricingSettingsForm.retailPercent),
+        highValueThreshold: Number(pricingSettingsForm.highValueThreshold),
+        highValuePercent: Number(pricingSettingsForm.highValuePercent),
+        highValueMinPercent: Number(pricingSettingsForm.highValueMinPercent),
+        highValueMaxPercent: Number(pricingSettingsForm.highValueMaxPercent)
+      };
+      if (Object.values(parsed).some((n) => !Number.isFinite(n) || n < 0)) {
+        alert('Every field needs a valid, non-negative number.');
+        return;
+      }
+      if (parsed.highValueMinPercent > parsed.highValueMaxPercent) {
+        alert('The high-value minimum % can\'t be more than the maximum %.');
+        return;
+      }
+      const result = await savePricingSettings(parsed, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      if (result.success) {
+        setPricingSettings(result.settings);
+        setPricingSettingsForm(result.settings);
+      } else {
+        alert(`Couldn't save pricing settings: ${result.reason}`);
+      }
+    } finally {
+      setIsSavingPricingSettings(false);
+    }
+  };
+
+  // ============================================================
+  // CSV / EXCEL DRUG IMPORT & EXPORT
+  // ============================================================
+  const DRUG_EXPORT_COLUMNS = [
+    'name', 'unitType', 'costPrice', 'retailPrice', 'wholesalePrice',
+    'stock', 'barcode', 'minStockQty', 'recommendedPurchaseQty',
+    'halfPackQty', 'halfPackPrice', 'packQty', 'packPrice'
+  ];
+
+  const handleExportDrugs = async (format) => {
+    const XLSX = await import('xlsx');
+    const rows = (allActiveDrugsForCrud || []).map((d) => {
+      const row = {};
+      DRUG_EXPORT_COLUMNS.forEach((col) => {
+        row[col] = d[col] ?? '';
+      });
+      return row;
+    });
+    const worksheet = XLSX.utils.json_to_sheet(rows, { header: DRUG_EXPORT_COLUMNS });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Drugs');
+    const stamp = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(workbook, `azu-drugs-${stamp}.${format === 'csv' ? 'csv' : 'xlsx'}`, {
+      bookType: format === 'csv' ? 'csv' : 'xlsx'
+    });
+  };
+
+  const handleDrugImportFileChosen = async (file) => {
+    if (!file) return;
+    setImportFileName(file.name);
+    setImportResultSummary(null);
+    try {
+      const XLSX = await import('xlsx');
+      const data = await file.arrayBuffer();
+      const workbook = XLSX.read(data, { type: 'array' });
+      const firstSheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[firstSheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      setImportPreviewRows(rows);
+    } catch (err) {
+      alert(`Couldn't read that file: ${err.message}`);
+      setImportPreviewRows(null);
+      setImportFileName('');
+    }
+  };
+
+  const handleConfirmDrugImport = async () => {
+    if (!importPreviewRows || importPreviewRows.length === 0) return;
+    setIsImportingDrugs(true);
+    try {
+      const result = await bulkImportDrugs(importPreviewRows, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      setImportResultSummary(result);
+      if (result.success) {
+        setImportPreviewRows(null);
+        setImportFileName('');
+      }
+    } finally {
+      setIsImportingDrugs(false);
+    }
+  };
+
+  const handleCancelDrugImport = () => {
+    setImportPreviewRows(null);
+    setImportFileName('');
+    setImportResultSummary(null);
+  };
+
+  // ============================================================
+  // ROLE MANAGEMENT (administrator-only)
+  // ============================================================
+  const handleLoadProfiles = async () => {
+    setIsLoadingProfiles(true);
+    try {
+      const result = await fetchAllProfiles();
+      if (result.success) {
+        setAllProfiles(result.profiles);
+      } else {
+        alert(`Couldn't load accounts: ${result.reason}`);
+      }
+    } finally {
+      setIsLoadingProfiles(false);
+    }
+  };
+
+  const handleChangeUserRole = async (profile, newRole) => {
+    if (newRole === profile.role) return;
+    if (
+      !window.confirm(
+        `Change ${profile.email || profile.id}'s role from "${profile.role}" to "${newRole}"?`
+      )
+    ) {
+      return;
+    }
+    setSavingProfileId(profile.id);
+    try {
+      const result = await updateUserRole(profile.id, newRole, {
+        email: session?.user?.email,
+        role: userRole
+      });
+      if (result.success) {
+        setAllProfiles((prev) =>
+          (prev || []).map((p) => (p.id === profile.id ? { ...p, role: newRole } : p))
+        );
+      } else {
+        alert(`Couldn't change that role: ${result.reason}`);
+      }
+    } finally {
+      setSavingProfileId(null);
+    }
+  };
+
   const handleAddBankOption = async () => {
     const name = newBankOptionName.trim();
     if (!name) return;
@@ -3778,7 +4140,11 @@ export default function App() {
         </div>
 
         <div className="header-title-row">
-          <h1>
+          <h1
+            className="app-reload-title"
+            title="Click to reload the app"
+            onClick={() => window.location.reload()}
+          >
             AZU PHARMACY POS
           </h1>
 
@@ -3914,38 +4280,28 @@ export default function App() {
             className={`bottom-bar-btn ${activeTab === 'catalog' ? 'active-tab' : ''}`}
             onClick={() => setActiveTab('catalog')}
           >
-            📦 Drugs &amp; Suppliers
+            📦 Drugs, Suppliers &amp; Customers
             {canApproveStockEntries &&
               (pendingStockEntries.length > 0 ||
                 pendingStockEntryEdits.length > 0 ||
                 pendingSupplierChangeRequests.length > 0 ||
-                pendingDrugChangeRequests.length > 0) && (
+                pendingDrugChangeRequests.length > 0 ||
+                pendingCustomerChangeRequests.length > 0) && (
                 <span className="nav-badge">
                   {pendingStockEntries.length +
                     pendingStockEntryEdits.length +
                     pendingSupplierChangeRequests.length +
-                    pendingDrugChangeRequests.length >
+                    pendingDrugChangeRequests.length +
+                    pendingCustomerChangeRequests.length >
                   9
                     ? '9+'
                     : pendingStockEntries.length +
                       pendingStockEntryEdits.length +
                       pendingSupplierChangeRequests.length +
-                      pendingDrugChangeRequests.length}
+                      pendingDrugChangeRequests.length +
+                      pendingCustomerChangeRequests.length}
                 </span>
               )}
-          </button>
-          <button
-            className={`bottom-bar-btn ${activeTab === 'customers' ? 'active-tab' : ''}`}
-            onClick={() => setActiveTab('customers')}
-          >
-            👥 Customers
-            {canApproveStockEntries && pendingCustomerChangeRequests.length > 0 && (
-              <span className="nav-badge">
-                {pendingCustomerChangeRequests.length > 9
-                  ? '9+'
-                  : pendingCustomerChangeRequests.length}
-              </span>
-            )}
           </button>
         </div>
       )}
@@ -4026,6 +4382,18 @@ export default function App() {
                   onClick={() => setActiveDraftId(d.id)}
                 >
                   {d.customerName || 'New Customer'} ({d.items.length})
+                  {!d.resubmitOf && (
+                    <span
+                      className="ticket-draft-save"
+                      title="Save this cart for later"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSaveDraftForLater(d.id);
+                      }}
+                    >
+                      💾
+                    </span>
+                  )}
                   <span
                     className="ticket-draft-close"
                     onClick={(e) => {
@@ -4045,7 +4413,69 @@ export default function App() {
               >
                 + New Ticket
               </button>
+
+              <button
+                type="button"
+                className="ticket-draft-tab saved-carts-btn"
+                onClick={handleOpenSavedCartsPanel}
+              >
+                📂 Saved Carts
+              </button>
             </div>
+
+            {isSavedCartsPanelOpen && (
+              <div className="saved-carts-panel">
+                <div className="admin-section-header">
+                  <h3>Saved Carts</h3>
+                  <button
+                    type="button"
+                    className="cancel-btn"
+                    onClick={() => setIsSavedCartsPanelOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+
+                {savedCartDrafts.length > 0 ? (
+                  <div className="ticket-list">
+                    {savedCartDrafts.map((saved) => (
+                      <div key={saved.id} className="ticket-row ticket-row-detailed">
+                        <div className="ticket-row-header">
+                          <strong>{saved.label || saved.customerName}</strong>
+                          <div className="deleted-drug-meta">
+                            {saved.items.length} item{saved.items.length === 1 ? '' : 's'}
+                            {' · '}
+                            {saved.saleType === 'wholesale' ? 'Wholesale' : 'Retail'}
+                            {' · Saved '}
+                            {new Date(saved.savedAt).toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="deleted-drug-actions">
+                          <button
+                            type="button"
+                            className="restore-btn"
+                            onClick={() => handleResumeSavedCartDraft(saved)}
+                          >
+                            ▶ Resume
+                          </button>
+                          <button
+                            type="button"
+                            className="permanent-delete-btn"
+                            onClick={() => handleDiscardSavedCartDraft(saved)}
+                          >
+                            ✕ Discard
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="admin-section-sub">
+                    Nothing saved right now — use the 💾 on an open cart's tab to set it aside.
+                  </p>
+                )}
+              </div>
+            )}
 
             {activeDraft ? (
               <div className="ticket-draft-builder">
@@ -4122,136 +4552,29 @@ export default function App() {
                 </div>
 
                 <div className="ticket-builder-cart">
-                  {activeDraft.saleType === 'wholesale' ? (
-                    <div className="customer-input-row wholesale-customer-picker">
-                      {activeDraft.customerId ? (
-                        <div className="wholesale-customer-chosen">
-                          <div>
-                            <strong>{activeDraft.customerName}</strong>
-                            {activeDraft.customerPhone && (
-                              <span> · {activeDraft.customerPhone}</span>
-                            )}
-                            {(() => {
-                              const c = customersById.get(String(activeDraft.customerId));
-                              const balance = Number(c?.balance || 0);
-                              if (balance > 0) {
-                                return (
-                                  <div className="sent-back-reason">
-                                    Currently owes ₦{balance.toLocaleString()}
-                                  </div>
-                                );
-                              }
-                              if (balance < 0) {
-                                return (
-                                  <div className="sent-back-reason">
-                                    Pharmacy owes them ₦{Math.abs(balance).toLocaleString()}
-                                  </div>
-                                );
-                              }
-                              return null;
-                            })()}
-                          </div>
-                          <button
-                            type="button"
-                            className="price-rec-chip"
-                            onClick={() => handleClearDraftCustomer(activeDraft.id)}
-                          >
-                            Change
-                          </button>
-                        </div>
-                      ) : customerPickerForDraftId === activeDraft.id ? (
-                        <div className="wholesale-customer-search">
-                          <input
-                            type="text"
-                            className="search-input"
-                            autoFocus
-                            placeholder="Search customer by name or phone..."
-                            value={draftCustomerSearchTerm}
-                            onChange={(e) => setDraftCustomerSearchTerm(e.target.value)}
-                          />
-                          <div className="ticket-list">
-                            {activeCustomers
-                              .filter((c) => {
-                                const term = draftCustomerSearchTerm.trim().toLowerCase();
-                                if (!term) return true;
-                                return (
-                                  c.name.toLowerCase().includes(term) ||
-                                  (c.phone || '').includes(term)
-                                );
-                              })
-                              .slice(0, 8)
-                              .map((c) => (
-                                <div
-                                  key={c.id}
-                                  className="ticket-row"
-                                  style={{ cursor: 'pointer' }}
-                                  onClick={() => handlePickDraftCustomer(activeDraft.id, c)}
-                                >
-                                  {c.name}
-                                  {c.phone && ` · ${c.phone}`}
-                                  {Number(c.balance || 0) > 0 &&
-                                    ` (owes ₦${Number(c.balance).toLocaleString()})`}
-                                </div>
-                              ))}
-                            {activeCustomers.length === 0 && (
-                              <p className="admin-section-sub">
-                                No wholesale customers yet — add one below.
-                              </p>
-                            )}
-                          </div>
-                          <div className="deleted-drug-actions">
-                            <button
-                              type="button"
-                              className="restore-btn"
-                              onClick={() => {
-                                setCustomerPickerForDraftId(activeDraft.id);
-                                handleOpenAddCustomerModal();
-                              }}
-                            >
-                              + New Customer
-                            </button>
-                            <button
-                              type="button"
-                              className="permanent-delete-btn"
-                              onClick={() => setCustomerPickerForDraftId(null)}
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          className="restore-btn"
-                          onClick={() => {
-                            setCustomerPickerForDraftId(activeDraft.id);
-                            setDraftCustomerSearchTerm('');
-                          }}
-                        >
-                          👤 Choose Wholesale Customer
-                        </button>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="customer-input-row">
-                      <input
-                        type="text"
-                        placeholder="Customer Name"
-                        value={activeDraft.customerName}
-                        onChange={(e) =>
-                          setDraftField(activeDraft.id, 'customerName', e.target.value)
-                        }
-                      />
-                      <input
-                        type="text"
-                        placeholder="Customer Phone"
-                        value={activeDraft.customerPhone}
-                        onChange={(e) =>
-                          setDraftField(activeDraft.id, 'customerPhone', e.target.value)
-                        }
-                      />
-                    </div>
-                  )}
+                  {/* A wholesale cart no longer needs a registered
+                      customer picked here — that only matters if the
+                      person wants to owe, which the cashier sorts out
+                      at the till. Both sale types just take a plain
+                      name/phone for the receipt, same as retail. */}
+                  <div className="customer-input-row">
+                    <input
+                      type="text"
+                      placeholder="Customer Name"
+                      value={activeDraft.customerName}
+                      onChange={(e) =>
+                        setDraftField(activeDraft.id, 'customerName', e.target.value)
+                      }
+                    />
+                    <input
+                      type="text"
+                      placeholder="Customer Phone"
+                      value={activeDraft.customerPhone}
+                      onChange={(e) =>
+                        setDraftField(activeDraft.id, 'customerPhone', e.target.value)
+                      }
+                    />
+                  </div>
 
                   <div className="draft-price-toggle">
                     <button
@@ -4820,6 +5143,15 @@ export default function App() {
             )}
           </button>
           <button
+            className={catalogSection === 'customers' ? 'active' : ''}
+            onClick={() => setCatalogSection('customers')}
+          >
+            👥 Customers
+            {canApproveStockEntries && pendingCustomerChangeRequests.length > 0 && (
+              <span className="nav-badge">{pendingCustomerChangeRequests.length}</span>
+            )}
+          </button>
+          <button
             className={catalogSection === 'purchaselist' ? 'active' : ''}
             onClick={() => setCatalogSection('purchaselist')}
           >
@@ -5186,6 +5518,7 @@ export default function App() {
                     <PriceRecommendationHint
                       costPrice={newDrugLine.costPrice}
                       priceHistory={null}
+                      settings={pricingSettings}
                       onPickRetail={(price) =>
                         setNewDrugLine((prev) => ({ ...prev, retailPrice: String(price) }))
                       }
@@ -5391,6 +5724,7 @@ export default function App() {
                                   (d) => String(d.id) === String(item.drugId)
                                 )?.priceHistory
                               }
+                              settings={pricingSettings}
                               onPickRetail={(price) =>
                                 updateRestockLine(idx, 'retailPrice', price)
                               }
@@ -5957,6 +6291,7 @@ export default function App() {
               </button>
             </div>
 
+            <div className="purchase-list-table-wrap">
             <table className="purchase-list-table">
               <thead>
                 <tr>
@@ -6062,6 +6397,7 @@ export default function App() {
                 ))}
               </tbody>
             </table>
+            </div>
 
             {filteredPurchaseNeedsList.length === 0 && (
               <p className="admin-section-sub">
@@ -6194,7 +6530,7 @@ export default function App() {
           CUSTOMERS SCREEN — wholesale customers, their own place just
           like Drugs & Suppliers. Cashier/manager only.
       ======================================================== */}
-      {activeTab === 'customers' && canUseRestock && (
+      {activeTab === 'catalog' && canUseRestock && catalogSection === 'customers' && (
         <div className="tickets-screen no-print">
 
           {canApproveStockEntries && pendingCustomerChangeRequests.length > 0 && (
@@ -6215,9 +6551,21 @@ export default function App() {
                     <div key={request.id} className="ticket-row ticket-row-detailed">
                       <div className="ticket-row-header">
                         <strong>
-                          {request.type === 'DELETE' ? 'Delete' : 'Edit'}:{' '}
+                          {request.type === 'CREATE'
+                            ? 'New Customer'
+                            : request.type === 'DELETE'
+                              ? 'Delete'
+                              : 'Edit'}
+                          :{' '}
                           {request.proposedChanges?.name || liveCustomer?.name || 'Unknown customer'}
                         </strong>
+                        {request.type === 'CREATE' && (
+                          <div className="deleted-drug-meta">
+                            {(request.proposedChanges?.phones || []).join(', ') || 'No phone on file'}
+                            {request.proposedChanges?.address && ` · ${request.proposedChanges.address}`}
+                            {' · won\'t be able to owe until approved'}
+                          </div>
+                        )}
                         <div className="deleted-drug-meta">
                           Requested by {request.requestedByEmail}
                         </div>
@@ -6383,6 +6731,29 @@ export default function App() {
             >
               🏦 Bank Options
             </button>
+            <button
+              className={adminSection === 'pricing' ? 'active' : ''}
+              onClick={() => setAdminSection('pricing')}
+            >
+              💰 Pricing Settings
+            </button>
+            <button
+              className={adminSection === 'importexport' ? 'active' : ''}
+              onClick={() => setAdminSection('importexport')}
+            >
+              📥 Import / Export Drugs
+            </button>
+            {userRole === 'administrator' && (
+            <button
+              className={adminSection === 'roles' ? 'active' : ''}
+              onClick={() => {
+                setAdminSection('roles');
+                if (!allProfiles) handleLoadProfiles();
+              }}
+            >
+              🔑 Account Roles
+            </button>
+            )}
           </div>
 
           {adminSection === 'search' && (
@@ -6778,6 +7149,246 @@ export default function App() {
                 <div className="empty-state">Pick a start and end date to see profit for that period.</div>
               )}
             </div>
+          </section>
+          )}
+
+          {adminSection === 'pricing' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Pricing Settings</h3>
+              <span className="admin-section-sub">
+                The general recommended profit % used by the price suggestion
+                everywhere a cost price is entered — a specific drug's own
+                price history still overrides this once it has one
+              </span>
+            </div>
+
+            <div className="pricing-settings-form">
+              <div className="pricing-settings-group">
+                <h4>Below the high-value threshold</h4>
+                <div className="form-row">
+                  <div>
+                    <label>Wholesale profit %:</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={pricingSettingsForm.wholesalePercent}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, wholesalePercent: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label>Retail profit %:</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={pricingSettingsForm.retailPercent}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, retailPercent: e.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="pricing-settings-group">
+                <h4>At or above the high-value threshold (one price for both)</h4>
+                <div className="form-row">
+                  <div>
+                    <label>Threshold (₦):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={pricingSettingsForm.highValueThreshold}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, highValueThreshold: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label>Default profit %:</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={pricingSettingsForm.highValuePercent}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, highValuePercent: e.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div>
+                    <label>Min % (clamps learned history):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={pricingSettingsForm.highValueMinPercent}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, highValueMinPercent: e.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label>Max % (clamps learned history):</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={pricingSettingsForm.highValueMaxPercent}
+                      onChange={(e) =>
+                        setPricingSettingsForm((prev) => ({ ...prev, highValueMaxPercent: e.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <button
+                className="save-btn"
+                disabled={isSavingPricingSettings}
+                onClick={handleSavePricingSettings}
+              >
+                {isSavingPricingSettings ? 'Saving…' : 'Save Pricing Settings'}
+              </button>
+            </div>
+          </section>
+          )}
+
+          {adminSection === 'importexport' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Import / Export Drugs</h3>
+              <span className="admin-section-sub">
+                Bring drug details in from a CSV or Excel file, or download
+                everything currently in the catalog
+              </span>
+            </div>
+
+            <div className="import-export-panel">
+              <div className="import-export-block">
+                <h4>Download</h4>
+                <p className="admin-section-sub">
+                  Every active drug, in the columns this import also understands
+                </p>
+                <div className="import-export-buttons">
+                  <button className="save-btn" onClick={() => handleExportDrugs('csv')}>
+                    Download CSV
+                  </button>
+                  <button className="save-btn" onClick={() => handleExportDrugs('xlsx')}>
+                    Download Excel
+                  </button>
+                </div>
+              </div>
+
+              <div className="import-export-block">
+                <h4>Upload</h4>
+                <p className="admin-section-sub">
+                  Columns recognized: name, unitType, costPrice, retailPrice,
+                  wholesalePrice, stock, barcode, minStockQty,
+                  recommendedPurchaseQty, halfPackQty, halfPackPrice, packQty,
+                  packPrice. A row matches an existing drug by barcode, then
+                  by name — anything left blank in a matched row is left
+                  unchanged. Unmatched rows with a name create a new drug.
+                </p>
+                <input
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  onChange={(e) => handleDrugImportFileChosen(e.target.files?.[0])}
+                />
+
+                {importPreviewRows && (
+                  <div className="import-preview">
+                    <p>
+                      <strong>{importFileName}</strong> — {importPreviewRows.length} row
+                      {importPreviewRows.length === 1 ? '' : 's'} found.
+                    </p>
+                    <div className="import-export-buttons">
+                      <button
+                        className="save-btn"
+                        disabled={isImportingDrugs}
+                        onClick={handleConfirmDrugImport}
+                      >
+                        {isImportingDrugs ? 'Importing…' : 'Confirm Import'}
+                      </button>
+                      <button className="cancel-btn" onClick={handleCancelDrugImport}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {importResultSummary && (
+                  importResultSummary.success ? (
+                    <div className="import-result import-result-success">
+                      Created {importResultSummary.created}, updated {importResultSummary.updated}
+                      {importResultSummary.skipped.length > 0 &&
+                        `, skipped ${importResultSummary.skipped.length}`}
+                      .
+                      {importResultSummary.skipped.length > 0 && (
+                        <ul>
+                          {importResultSummary.skipped.map((s) => (
+                            <li key={s.row}>Row {s.row}: {s.reason}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="import-result import-result-error">
+                      Import failed: {importResultSummary.reason}
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+          </section>
+          )}
+
+          {adminSection === 'roles' && userRole === 'administrator' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Account Roles</h3>
+              <span className="admin-section-sub">
+                Change which role a logged-in account has — salesperson,
+                cashier, manager or administrator
+              </span>
+            </div>
+
+            <button className="save-btn" disabled={isLoadingProfiles} onClick={handleLoadProfiles}>
+              {isLoadingProfiles ? 'Loading…' : '🔄 Refresh List'}
+            </button>
+
+            {allProfiles && allProfiles.length > 0 ? (
+              <div className="profile-role-list">
+                {allProfiles.map((profile) => (
+                  <div key={profile.id} className="profile-role-card">
+                    <div className="profile-role-info">
+                      <strong>{profile.email || profile.id}</strong>
+                      <span className="deleted-drug-meta">Current role: {profile.role}</span>
+                    </div>
+                    <select
+                      value={profile.role}
+                      disabled={savingProfileId === profile.id}
+                      onChange={(e) => handleChangeUserRole(profile, e.target.value)}
+                    >
+                      <option value="salesperson">Salesperson</option>
+                      <option value="cashier">Cashier</option>
+                      <option value="manager">Manager</option>
+                      <option value="administrator">Administrator</option>
+                    </select>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                {allProfiles ? 'No accounts found.' : 'Hit "Refresh List" to load accounts.'}
+              </div>
+            )}
           </section>
           )}
 
@@ -7195,6 +7806,89 @@ export default function App() {
                 </li>
               ))}
             </ul>
+
+            {approvingTicket.saleType === 'wholesale' && !approvingTicket.customerId && (
+              <div className="wholesale-customer-picker">
+                {!isLinkingCustomerForApproval ? (
+                  <button
+                    type="button"
+                    className="restore-btn"
+                    onClick={() => {
+                      setIsLinkingCustomerForApproval(true);
+                      setApprovalCustomerSearchTerm('');
+                    }}
+                  >
+                    👤 This customer wants to owe / use an account
+                  </button>
+                ) : (
+                  <div className="wholesale-customer-search">
+                    <input
+                      type="text"
+                      className="search-input"
+                      autoFocus
+                      placeholder="Search customer by name or phone..."
+                      value={approvalCustomerSearchTerm}
+                      onChange={(e) => setApprovalCustomerSearchTerm(e.target.value)}
+                    />
+                    <div className="ticket-list">
+                      {activeCustomers
+                        .filter((c) => {
+                          const term = approvalCustomerSearchTerm.trim().toLowerCase();
+                          if (!term) return true;
+                          return (
+                            c.name.toLowerCase().includes(term) ||
+                            (c.phone || '').includes(term)
+                          );
+                        })
+                        .slice(0, 8)
+                        .map((c) => (
+                          <div
+                            key={c.id}
+                            className="ticket-row"
+                            style={{ cursor: 'pointer' }}
+                            onClick={() => handleLinkExistingCustomerForApproval(c)}
+                          >
+                            {c.name}
+                            {c.phone && ` · ${c.phone}`}
+                            {Number(c.balance || 0) > 0 &&
+                              ` (owes ₦${Number(c.balance).toLocaleString()})`}
+                          </div>
+                        ))}
+                      {activeCustomers.length === 0 && (
+                        <p className="admin-section-sub">
+                          No registered wholesale customers yet — add one below.
+                        </p>
+                      )}
+                    </div>
+                    <p className="admin-section-sub">
+                      Not on file yet? Adding them sends a request for a
+                      manager's approval — they can't owe until that's
+                      approved, so this sale still needs full payment
+                      for now.
+                    </p>
+                    <div className="deleted-drug-actions">
+                      <button
+                        type="button"
+                        className="restore-btn"
+                        onClick={() => {
+                          setCustomerPickerForApproval(true);
+                          handleOpenAddCustomerModal();
+                        }}
+                      >
+                        + New Customer
+                      </button>
+                      <button
+                        type="button"
+                        className="permanent-delete-btn"
+                        onClick={() => setIsLinkingCustomerForApproval(false)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {approvingTicket.saleType === 'wholesale' && approvingTicket.customerId && (() => {
               const customer = customersById.get(String(approvingTicket.customerId));
@@ -7904,16 +8598,48 @@ export default function App() {
                 />
               </label>
 
-              <label>
-                Phone:
-                <input
-                  type="text"
-                  value={customerFormData.phone}
-                  onChange={(e) =>
-                    setCustomerFormData({ ...customerFormData, phone: e.target.value })
-                  }
-                />
-              </label>
+              <label>Phone number(s):</label>
+              {(customerFormData.phones && customerFormData.phones.length > 0
+                ? customerFormData.phones
+                : ['']
+              ).map((num, idx) => (
+                <div key={idx} className="form-row electronic-line">
+                  <input
+                    type="text"
+                    placeholder={idx === 0 ? 'Primary phone' : 'Another number'}
+                    value={num}
+                    onChange={(e) => {
+                      const next = [...(customerFormData.phones.length > 0 ? customerFormData.phones : [''])];
+                      next[idx] = e.target.value;
+                      setCustomerFormData({ ...customerFormData, phones: next });
+                    }}
+                  />
+                  {customerFormData.phones.length > 1 && (
+                    <button
+                      type="button"
+                      className="permanent-delete-btn"
+                      onClick={() => {
+                        const next = customerFormData.phones.filter((_, i) => i !== idx);
+                        setCustomerFormData({ ...customerFormData, phones: next.length > 0 ? next : [''] });
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button
+                type="button"
+                className="price-rec-chip"
+                onClick={() =>
+                  setCustomerFormData({
+                    ...customerFormData,
+                    phones: [...(customerFormData.phones || []), '']
+                  })
+                }
+              >
+                + Add another number
+              </button>
 
               <label>
                 Email:
@@ -8029,7 +8755,11 @@ export default function App() {
                 : rejectingChangeRequest.kind === 'customer'
                 ? 'Customer'
                 : 'Supplier'}{' '}
-              {rejectingChangeRequest.request.type === 'DELETE' ? 'Deletion' : 'Edit'}
+              {rejectingChangeRequest.request.type === 'DELETE'
+                ? 'Deletion'
+                : rejectingChangeRequest.request.type === 'CREATE'
+                  ? 'Registration'
+                  : 'Edit'}
             </h3>
 
             <p className="form-section-hint">
@@ -8296,6 +9026,7 @@ export default function App() {
                 <PriceRecommendationHint
                   costPrice={formData.costPrice}
                   priceHistory={editingDrug?.priceHistory}
+                  settings={pricingSettings}
                   onPickRetail={(price) =>
                     setFormData((prev) => ({ ...prev, retailPrice: String(price) }))
                   }
