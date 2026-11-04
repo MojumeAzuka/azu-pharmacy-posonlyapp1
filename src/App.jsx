@@ -23,6 +23,19 @@ import {
   rejectReversalRequest,
   createTicket,
   fetchCloudTickets,
+  fetchLiveTickets,
+  bulkImportSuppliers,
+  bulkImportCustomers,
+  bulkImportBankOptions,
+  fetchProfileDirectory,
+  readCachedProfileDirectory,
+  createAccount,
+  updateAccountDetails,
+  setAccountPassword,
+  setAccountActive,
+  pushDrugStockDelta,
+  applyRealtimeTicketRow,
+  applyRealtimeDrugRow,
   syncPendingTicketsToCloud,
   expireStaleTickets,
   cancelTicket,
@@ -156,6 +169,57 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [authInfo, setAuthInfo] = useState('');
+  // 'login' | 'forgot' — which form the signed-out screen shows.
+  const [authView, setAuthView] = useState('login');
+  // True while the user arrived from a password-reset email link and
+  // still has to choose a new password (the link signs them in
+  // temporarily — they must not slip into the app without setting one).
+  const [isRecoveringPassword, setIsRecoveringPassword] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [isSavingPassword, setIsSavingPassword] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+
+  // Everyone's full name, so records show "Amaka Obi" instead of an email
+  // address. Old emails an account used before a change still resolve to
+  // the same person. Falls back to the raw email when no name is set.
+  const [profileDirectory, setProfileDirectory] = useState(() =>
+    readCachedProfileDirectory()
+  );
+  const profileNameIndex = React.useMemo(() => {
+    const index = new Map();
+    (profileDirectory || []).forEach((p) => {
+      const name = (p.full_name || '').trim();
+      if (!name) return;
+      [p.email, ...(Array.isArray(p.previous_emails) ? p.previous_emails : [])]
+        .filter(Boolean)
+        .forEach((e) => index.set(String(e).toLowerCase(), name));
+      index.set(String(p.id), name);
+    });
+    return index;
+  }, [profileDirectory]);
+  // "Is this record mine?" — by current email OR any email this account
+  // used before an admin changed it, so history stays attached to the
+  // person after an email change.
+  const myEmailSet = React.useMemo(() => {
+    const set = new Set();
+    if (session?.user?.email) set.add(session.user.email.toLowerCase());
+    const me = (profileDirectory || []).find((p) => p.id === session?.user?.id);
+    if (me) {
+      [me.email, ...(Array.isArray(me.previous_emails) ? me.previous_emails : [])]
+        .filter(Boolean)
+        .forEach((e) => set.add(String(e).toLowerCase()));
+    }
+    return set;
+  }, [profileDirectory, session?.user?.id, session?.user?.email]);
+  const isMyEmail = (email) =>
+    !!email && myEmailSet.has(String(email).toLowerCase());
+  const nameOf = (emailOrId) => {
+    if (!emailOrId) return emailOrId || '';
+    const key = String(emailOrId);
+    return profileNameIndex.get(key.toLowerCase()) || profileNameIndex.get(key) || key;
+  };
 
   // ============================================================
   // NAVIGATION
@@ -224,7 +288,8 @@ export default function App() {
     packQty: '',
     packPrice: '',
     minStockQty: '',
-    recommendedPurchaseQty: ''
+    recommendedPurchaseQty: '',
+    counterSpace: ''
   });
 
   // Unmissable confirm-delete modal, shared by drugs and suppliers — a
@@ -338,6 +403,12 @@ export default function App() {
   const [importFileName, setImportFileName] = useState('');
   const [isImportingDrugs, setIsImportingDrugs] = useState(false);
   const [importResultSummary, setImportResultSummary] = useState(null);
+  // Data Hub (every other dataset's import/export)
+  const [hubDatasetKey, setHubDatasetKey] = useState('suppliers');
+  const [hubPreviewRows, setHubPreviewRows] = useState(null);
+  const [hubFileName, setHubFileName] = useState('');
+  const [hubResult, setHubResult] = useState(null);
+  const [isHubBusy, setIsHubBusy] = useState(false);
 
   // Role management — the list of Supabase auth accounts/profiles,
   // fetched fresh (online-only feature) whenever the admin opens that
@@ -345,6 +416,15 @@ export default function App() {
   const [allProfiles, setAllProfiles] = useState(null);
   const [isLoadingProfiles, setIsLoadingProfiles] = useState(false);
   const [savingProfileId, setSavingProfileId] = useState(null);
+  // Account management modal: null | { mode: 'create' } | { mode: 'edit', profile } | { mode: 'password', profile }
+  const [accountModal, setAccountModal] = useState(null);
+  const [accountForm, setAccountForm] = useState({
+    email: '',
+    fullName: '',
+    password: '',
+    role: 'salesperson'
+  });
+  const [isSavingAccount, setIsSavingAccount] = useState(false);
 
   const [lastSeenAuditAt, setLastSeenAuditAt] = useState(
     () => localStorage.getItem(LAST_SEEN_AUDIT_KEY) || null
@@ -638,7 +718,10 @@ export default function App() {
 
     const {
       data: { subscription }
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setIsRecoveringPassword(true);
+      }
       setSession(session);
 
       if (session) {
@@ -684,6 +767,64 @@ export default function App() {
     if (error) {
       setAuthError(error.message);
     }
+  };
+
+  const handleSendPasswordReset = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthInfo('');
+
+    const email = loginEmail.trim();
+    if (!email) {
+      setAuthError('Enter your email address first.');
+      return;
+    }
+
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin
+    });
+
+    if (error) {
+      setAuthError(error.message);
+      return;
+    }
+
+    // Same message whether or not the address exists, so this form can't
+    // be used to discover which emails have accounts.
+    setAuthInfo(
+      'If that email has an account, a password reset link is on its way. Open it on this device and choose a new password.'
+    );
+  };
+
+  const handleSaveNewPassword = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+
+    if (newPassword.length < 8) {
+      setAuthError('Use at least 8 characters.');
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setAuthError('The two passwords do not match.');
+      return;
+    }
+
+    setIsSavingPassword(true);
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    setIsSavingPassword(false);
+
+    if (error) {
+      setAuthError(error.message);
+      return;
+    }
+
+    setNewPassword('');
+    setConfirmNewPassword('');
+    setIsRecoveringPassword(false);
+    setShowChangePassword(false);
+    // Drop the #access_token… recovery fragment from the address bar.
+    window.history.replaceState(null, '', window.location.pathname);
+    alert('Password updated.');
   };
 
   const handleLogout = async () => {
@@ -981,24 +1122,109 @@ export default function App() {
     if (activeTab === 'history' && isOnline) {
       fetchCloudSales();
     }
-
-    // Tickets need to feel close to real-time — a customer is standing
-    // at the till waiting — so re-pull from the cloud every 10s while
-    // either the attendant's POS screen (ticket drafts + "my tickets")
-    // or the cashier's Queue screen is open, on top of the
-    // reconnect/tab-switch fetch.
-    if ((activeTab === 'pos' || activeTab === 'tickets') && isOnline) {
-      fetchCloudTickets();
-      expireStaleTickets();
-
-      const interval = setInterval(() => {
-        fetchCloudTickets();
-        expireStaleTickets();
-      }, 10000);
-
-      return () => clearInterval(interval);
-    }
   }, [activeTab, isOnline]);
+
+  // ============================================================
+  // ALWAYS-ON LIVE TICKET SYNC
+  // ------------------------------------------------------------
+  // Runs on EVERY page (restocking, history, admin — anywhere) for any
+  // signed-in terminal, not just the POS/Queue tabs:
+  //   * a Supabase Realtime subscription pushes a ticket/stock change
+  //     the instant it happens on any other terminal, and
+  //   * a lightweight refresh every 5 seconds is the safety net for
+  //     anything Realtime misses (dropped websocket, sleeping tablet),
+  //     plus a refresh the moment the tab/app regains focus or the
+  //     network comes back.
+  // The refresh is small on purpose (open tickets + the last 2 hours),
+  // so running it constantly stays well inside the free-tier egress.
+  // ============================================================
+  const [realtimeStatus, setRealtimeStatus] = useState('connecting');
+
+  useEffect(() => {
+    if (!session || !isOnline) return undefined;
+
+    let stopped = false;
+    let running = false;
+
+    const refreshNow = async () => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        await fetchLiveTickets();
+        await expireStaleTickets();
+      } finally {
+        running = false;
+      }
+    };
+
+    refreshNow();
+    const interval = setInterval(refreshNow, 5000);
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refreshNow();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', refreshNow);
+
+    const channel = supabase
+      .channel(`live-sync-${session.user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'tickets' },
+        (payload) => {
+          if (payload.new && payload.new.id) applyRealtimeTicketRow(payload.new);
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'drugs' },
+        (payload) => {
+          if (payload.new && payload.new.id !== undefined) {
+            applyRealtimeDrugRow(payload.new);
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (stopped) return;
+        setRealtimeStatus(status === 'SUBSCRIBED' ? 'live' : 'polling');
+      });
+
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', refreshNow);
+      supabase.removeChannel(channel);
+    };
+  }, [session?.user?.id, isOnline]);
+
+  // Keep the name directory fresh (and sign out an account an
+  // administrator has just deactivated — its existing login token would
+  // otherwise keep working until it expires).
+  useEffect(() => {
+    if (!session || !isOnline) return undefined;
+    let stopped = false;
+
+    const refreshDirectory = async () => {
+      const rows = await fetchProfileDirectory();
+      if (stopped || !rows) return;
+      setProfileDirectory(rows);
+      const me = rows.find((p) => p.id === session.user.id);
+      if (me && me.is_active === false) {
+        alert('This account has been deactivated. Please contact an administrator.');
+        await supabase.auth.signOut();
+        setCart([]);
+        setSession(null);
+      }
+    };
+
+    refreshDirectory();
+    const interval = setInterval(refreshDirectory, 60000);
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+    };
+  }, [session?.user?.id, isOnline]);
 
   // ============================================================
   // DRUG INVENTORY (soft-deleted drugs are hidden from the catalog)
@@ -1011,7 +1237,8 @@ export default function App() {
             const term = searchTerm.toLowerCase().trim();
             const nameMatch = drug.name?.toLowerCase().includes(term);
             const barcodeMatch = drug.barcode?.toLowerCase().includes(term);
-            return Boolean(nameMatch || barcodeMatch);
+            const counterMatch = drug.counterSpace?.toLowerCase().includes(term);
+            return Boolean(nameMatch || barcodeMatch || counterMatch);
           })
           .toArray();
 
@@ -1033,7 +1260,8 @@ export default function App() {
     return allActiveDrugsForCrud.filter(
       (d) =>
         d.name?.toLowerCase().includes(term) ||
-        d.barcode?.toLowerCase().includes(term)
+        d.barcode?.toLowerCase().includes(term) ||
+        d.counterSpace?.toLowerCase().includes(term)
     );
   }, [allActiveDrugsForCrud, drugCrudSearchTerm]);
 
@@ -1104,6 +1332,14 @@ export default function App() {
     twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
 
     return all.filter((t) => new Date(t.createdAt) >= twoDaysAgo);
+  }, []);
+
+  // Tickets that exist only on THIS device after more than a few seconds
+  // — the cashier can't see them yet. Surfaced as a banner so a failed
+  // upload is never silent.
+  const undeliveredTickets = useLiveQuery(async () => {
+    const rows = await db.tickets.where('synced').equals(0).toArray();
+    return rows.filter((t) => t.status === 'PENDING_PAYMENT');
   }, []);
 
   // What the CASHIER queue shows: every attendant's submitted tickets
@@ -1312,7 +1548,7 @@ export default function App() {
   const myStockEntries = React.useMemo(() => {
     if (!allStockEntries || !session) return [];
     return allStockEntries.filter(
-      (e) => e.enteredByEmail === session.user.email
+      (e) => isMyEmail(e.enteredByEmail)
     );
   }, [allStockEntries, session]);
 
@@ -1323,7 +1559,7 @@ export default function App() {
     if (!entry || entry.status === 'REJECTED') return false;
     const ageMs = Date.now() - new Date(entry.createdAt).getTime();
     if (ageMs > STOCK_ENTRY_EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000) return false;
-    const isOwner = entry.enteredByEmail === session?.user?.email;
+    const isOwner = isMyEmail(entry.enteredByEmail);
     return isOwner || hasRole(userRole, 'manager');
   };
 
@@ -1444,7 +1680,7 @@ export default function App() {
     return allTickets.filter(
       (t) =>
         t.attendantId === session.user.id ||
-        t.attendantEmail === session.user.email
+        isMyEmail(t.attendantEmail)
     );
   }, [allTickets, session]);
 
@@ -1488,17 +1724,17 @@ export default function App() {
       records = records.filter(
         (s) =>
           s.cashierId === session.user.id ||
-          s.cashierEmail === session.user.email
+          isMyEmail(s.cashierEmail)
       );
     } else {
       records = records.filter(
         (s) =>
           s.attendantId === session.user.id ||
-          s.attendantEmail === session.user.email ||
+          isMyEmail(s.attendantEmail) ||
           (!s.attendantId &&
             !s.attendantEmail &&
             (s.cashierId === session.user.id ||
-              s.cashierEmail === session.user.email))
+              isMyEmail(s.cashierEmail)))
       );
     }
 
@@ -1752,6 +1988,18 @@ export default function App() {
             )
           );
 
+          if (result.customerBalanceAdjustment > 0) {
+            alert(
+              `Reversed. ${reversingSale.customerName || 'The customer'}'s account was reduced by ₦${Number(result.customerBalanceAdjustment).toLocaleString()}` +
+                (result.customerBalanceNow !== null && result.customerBalanceNow !== undefined
+                  ? ` — balance is now ${
+                      result.customerBalanceNow >= 0
+                        ? `₦${Number(result.customerBalanceNow).toLocaleString()} owed by the customer`
+                        : `₦${Math.abs(Number(result.customerBalanceNow)).toLocaleString()} credit owed to the customer`
+                    }.`
+                  : '.')
+            );
+          }
           setReversingSale(null);
           setReversalQtys({});
         } else {
@@ -1811,6 +2059,11 @@ export default function App() {
             : s
         )
       );
+      if (result.customerBalanceAdjustment > 0) {
+        alert(
+          `Reversal approved. The wholesale customer's account was reduced by ₦${Number(result.customerBalanceAdjustment).toLocaleString()}.`
+        );
+      }
     } else {
       alert(result.reason || 'Unable to approve this reversal request.');
     }
@@ -3200,7 +3453,7 @@ export default function App() {
   const handleApproveStockEdit = async (editRequest) => {
     if (
       !window.confirm(
-        `Approve this correction to the stock entry from ${editRequest.requestedByEmail}? Stock will update immediately.`
+        `Approve this correction to the stock entry from ${nameOf(editRequest.requestedByEmail)}? Stock will update immediately.`
       )
     ) {
       return;
@@ -3346,7 +3599,7 @@ export default function App() {
   const DRUG_EXPORT_COLUMNS = [
     'name', 'unitType', 'costPrice', 'retailPrice', 'wholesalePrice',
     'stock', 'barcode', 'minStockQty', 'recommendedPurchaseQty',
-    'halfPackQty', 'halfPackPrice', 'packQty', 'packPrice'
+    'halfPackQty', 'halfPackPrice', 'packQty', 'packPrice', 'counterSpace'
   ];
 
   const handleExportDrugs = async (format) => {
@@ -3411,6 +3664,244 @@ export default function App() {
   };
 
   // ============================================================
+  // DATA HUB — download (and where it's safe, upload) every dataset
+  // ============================================================
+  const flattenForExport = (row) => {
+    const out = {};
+    Object.entries(row || {}).forEach(([k, v]) => {
+      if (k === 'synced' || k === 'reversalPending' || k === 'balanceDirty') return;
+      if (v === null || v === undefined) out[k] = '';
+      else if (typeof v === 'object') out[k] = JSON.stringify(v);
+      else out[k] = v;
+    });
+    return out;
+  };
+
+  const humanItemsSummary = (items) =>
+    (Array.isArray(items) ? items : [])
+      .map((i) => `${i.name} x${i.quantity}${i.reversedQty ? ` (returned ${i.reversedQty})` : ''}`)
+      .join('; ');
+
+  const DATA_HUB_DATASETS = [
+    {
+      key: 'suppliers',
+      label: 'Suppliers',
+      help: 'Columns: name, contactPerson, phone, email, address. Matches existing suppliers by name.',
+      importFn: bulkImportSuppliers,
+      getRows: async () =>
+        (await db.suppliers.toArray())
+          .filter((r) => !r.deletedAt)
+          .map((r) => ({
+            name: r.name,
+            contactPerson: r.contactPerson || '',
+            phone: r.phone || '',
+            email: r.email || '',
+            address: r.address || ''
+          }))
+    },
+    {
+      key: 'customers',
+      label: 'Wholesale Customers',
+      help: 'Columns: name, phones (separate several with ; ), email, address, balance. Matches by name. "balance" is only used for brand-new customers (opening balance) — existing balances are never changed by an import.',
+      importFn: bulkImportCustomers,
+      getRows: async () =>
+        (await db.customers.toArray())
+          .filter((r) => !r.deletedAt)
+          .map((r) => ({
+            name: r.name,
+            phones: (r.phones && r.phones.length ? r.phones : r.phone ? [r.phone] : []).join('; '),
+            email: r.email || '',
+            address: r.address || '',
+            balance: Number(r.balance || 0)
+          }))
+    },
+    {
+      key: 'banks',
+      label: 'Bank Options',
+      adminOnly: true,
+      help: 'Columns: name, color. Existing names are skipped.',
+      importFn: bulkImportBankOptions,
+      getRows: async () =>
+        (await db.bankOptions.toArray()).map((r) => ({
+          name: r.name,
+          color: r.color || '',
+          active: r.active === false ? 'no' : 'yes'
+        }))
+    },
+    {
+      key: 'sales',
+      label: 'Sales (one row per sale)',
+      exportOnly: true,
+      help: 'Every sale you can see, with full names for attendant and cashier. Export only — sales can\'t be imported, so history can\'t be altered.',
+      getRows: async () =>
+        (allSalesForSearch || []).map((s) => ({
+          saleId: s.id,
+          date: s.createdAt,
+          saleType: s.saleType,
+          attendant: nameOf(s.attendantEmail) || '',
+          cashier: nameOf(s.cashierEmail) || '',
+          customer: s.customerName || '',
+          customerPhone: s.customerPhone || '',
+          total: s.total,
+          amountPaid: s.amountPaid ?? '',
+          customerBalanceAfter: s.customerBalanceAfter ?? '',
+          items: humanItemsSummary(s.items)
+        }))
+    },
+    {
+      key: 'saleItems',
+      label: 'Sale Items (one row per item sold)',
+      exportOnly: true,
+      help: 'Each drug line of each sale, including how many were returned.',
+      getRows: async () =>
+        (allSalesForSearch || []).flatMap((s) =>
+          (Array.isArray(s.items) ? s.items : []).map((i) => ({
+            saleId: s.id,
+            date: s.createdAt,
+            cashier: nameOf(s.cashierEmail) || '',
+            drug: i.name,
+            quantity: i.quantity,
+            returnedQty: i.reversedQty || 0,
+            unitPrice: i.activePrice ?? '',
+            lineTotal: i.lineTotal ?? ''
+          }))
+        )
+    },
+    {
+      key: 'stockEntries',
+      label: 'Stock Entries (restocking)',
+      exportOnly: true,
+      help: 'Every restock entry with who entered it.',
+      getRows: async () =>
+        (await db.stockEntries.toArray()).map((r) =>
+          flattenForExport({ ...r, enteredBy: nameOf(r.enteredByEmail) })
+        )
+    },
+    {
+      key: 'tickets',
+      label: 'Tickets',
+      exportOnly: true,
+      help: 'All tickets stored on this device (last 2 days are kept in sync).',
+      getRows: async () =>
+        (await db.tickets.toArray()).map((r) =>
+          flattenForExport({
+            ...r,
+            attendant: nameOf(r.attendantEmail),
+            cashier: nameOf(r.cashierEmail),
+            items: humanItemsSummary(r.items)
+          })
+        )
+    },
+    {
+      key: 'reversals',
+      label: 'Reversal Requests',
+      exportOnly: true,
+      help: 'Return / reversal requests and their outcome.',
+      getRows: async () =>
+        (await db.reversalRequests.toArray()).map((r) =>
+          flattenForExport({ ...r, requestedBy: nameOf(r.requestedByEmail), decidedBy: nameOf(r.decidedByEmail) })
+        )
+    },
+    {
+      key: 'purchaseLists',
+      label: 'Purchase Lists',
+      exportOnly: true,
+      help: 'Saved purchase lists.',
+      getRows: async () =>
+        (await db.purchaseLists.toArray()).map((r) =>
+          flattenForExport({ ...r, createdBy: nameOf(r.createdByEmail) })
+        )
+    },
+    {
+      key: 'audit',
+      label: 'Audit Log',
+      exportOnly: true,
+      adminOnly: true,
+      help: 'The full audit trail stored on this device.',
+      getRows: async () =>
+        (await db.auditLog.toArray()).map((r) =>
+          flattenForExport({ ...r, actor: nameOf(r.actorEmail) })
+        )
+    },
+    {
+      key: 'accounts',
+      label: 'Accounts',
+      exportOnly: true,
+      adminOnly: true,
+      help: 'Names, emails, roles and status (no passwords — those are never readable).',
+      getRows: async () => {
+        const res = await fetchAllProfiles();
+        return (res.success ? res.profiles : []).map((p) => ({
+          fullName: p.full_name || '',
+          email: p.email || '',
+          role: p.role,
+          active: p.is_active === false ? 'no' : 'yes'
+        }));
+      }
+    }
+  ];
+
+  const activeHubDataset =
+    DATA_HUB_DATASETS.find((d) => d.key === hubDatasetKey) || DATA_HUB_DATASETS[0];
+
+  const handleHubExport = async (format) => {
+    setIsHubBusy(true);
+    try {
+      const rows = await activeHubDataset.getRows();
+      if (!rows || rows.length === 0) {
+        alert('There is nothing to export for this dataset yet.');
+        return;
+      }
+      const XLSX = await import('xlsx');
+      const worksheet = XLSX.utils.json_to_sheet(rows);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, activeHubDataset.label.slice(0, 28));
+      const stamp = new Date().toISOString().slice(0, 10);
+      XLSX.writeFile(workbook, `azu-${activeHubDataset.key}-${stamp}.${format === 'csv' ? 'csv' : 'xlsx'}`, {
+        bookType: format === 'csv' ? 'csv' : 'xlsx'
+      });
+    } catch (err) {
+      alert(`Export failed: ${err.message}`);
+    } finally {
+      setIsHubBusy(false);
+    }
+  };
+
+  const handleHubFileChosen = async (file) => {
+    if (!file) return;
+    setHubFileName(file.name);
+    setHubResult(null);
+    try {
+      const XLSX = await import('xlsx');
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      setHubPreviewRows(XLSX.utils.sheet_to_json(sheet, { defval: '' }));
+    } catch (err) {
+      alert(`Couldn't read that file: ${err.message}`);
+      setHubPreviewRows(null);
+    }
+  };
+
+  const handleHubConfirmImport = async () => {
+    if (!hubPreviewRows || !activeHubDataset.importFn) return;
+    setIsHubBusy(true);
+    try {
+      const result = await activeHubDataset.importFn(hubPreviewRows, {
+        id: session?.user?.id,
+        email: session?.user?.email,
+        role: userRole
+      });
+      setHubResult(result);
+      if (result.success) {
+        setHubPreviewRows(null);
+        setHubFileName('');
+      }
+    } finally {
+      setIsHubBusy(false);
+    }
+  };
+
+  // ============================================================
   // ROLE MANAGEMENT (administrator-only)
   // ============================================================
   const handleLoadProfiles = async () => {
@@ -3429,9 +3920,15 @@ export default function App() {
 
   const handleChangeUserRole = async (profile, newRole) => {
     if (newRole === profile.role) return;
+    if (profile.role === 'administrator' || newRole === 'administrator') {
+      alert(
+        "Administrator roles can only be changed directly in Supabase — not from this panel."
+      );
+      return;
+    }
     if (
       !window.confirm(
-        `Change ${profile.email || profile.id}'s role from "${profile.role}" to "${newRole}"?`
+        `Change ${profile.full_name || profile.email || profile.id}'s role from "${profile.role}" to "${newRole}"?`
       )
     ) {
       return;
@@ -3452,6 +3949,134 @@ export default function App() {
     } finally {
       setSavingProfileId(null);
     }
+  };
+
+  const adminActor = () => ({
+    id: session?.user?.id,
+    email: session?.user?.email,
+    role: userRole
+  });
+
+  const refreshAccountLists = async () => {
+    await handleLoadProfiles();
+    const rows = await fetchProfileDirectory();
+    if (rows) setProfileDirectory(rows);
+  };
+
+  const handleOpenCreateAccount = () => {
+    setAccountForm({ email: '', fullName: '', password: '', role: 'salesperson' });
+    setAccountModal({ mode: 'create' });
+  };
+
+  const handleOpenEditAccount = (profile) => {
+    setAccountForm({
+      email: profile.email || '',
+      fullName: profile.full_name || '',
+      password: '',
+      role: profile.role
+    });
+    setAccountModal({ mode: 'edit', profile });
+  };
+
+  const handleOpenSetPassword = (profile) => {
+    setAccountForm({ email: '', fullName: '', password: '', role: profile.role });
+    setAccountModal({ mode: 'password', profile });
+  };
+
+  const handleSubmitAccountModal = async (e) => {
+    e.preventDefault();
+    if (!accountModal) return;
+    setIsSavingAccount(true);
+    try {
+      let result;
+      if (accountModal.mode === 'create') {
+        result = await createAccount(
+          {
+            email: accountForm.email,
+            fullName: accountForm.fullName,
+            password: accountForm.password,
+            role: accountForm.role
+          },
+          adminActor()
+        );
+        if (result.success) {
+          alert(
+            `Account created.\n\nEmail: ${accountForm.email.trim().toLowerCase()}\nPassword: ${accountForm.password}\n\nGive these to ${accountForm.fullName.trim()} — they can change the password themselves after signing in (Change Password button).`
+          );
+        }
+      } else if (accountModal.mode === 'edit') {
+        const target = accountModal.profile;
+        const emailChanged =
+          accountForm.email.trim().toLowerCase() !== (target.email || '').toLowerCase();
+        if (
+          emailChanged &&
+          !window.confirm(
+            `Change the login email from ${target.email} to ${accountForm.email.trim()}?\n\nAll of ${target.full_name || 'this person'}'s past sales and approvals stay linked to them.`
+          )
+        ) {
+          setIsSavingAccount(false);
+          return;
+        }
+        result = await updateAccountDetails(
+          target.id,
+          {
+            fullName: accountForm.fullName,
+            email: accountForm.email,
+            role: accountForm.role
+          },
+          adminActor()
+        );
+      } else {
+        result = await setAccountPassword(
+          accountModal.profile.id,
+          accountForm.password,
+          adminActor()
+        );
+        if (result.success) {
+          alert(
+            `Password changed for ${accountModal.profile.full_name || accountModal.profile.email}.\n\nNew password: ${accountForm.password}\n\nGive it to them — they can change it themselves after signing in.`
+          );
+        }
+      }
+
+      if (result.success) {
+        setAccountModal(null);
+        await refreshAccountLists();
+      } else {
+        alert(result.reason || 'That did not work.');
+      }
+    } finally {
+      setIsSavingAccount(false);
+    }
+  };
+
+  const handleToggleAccountActive = async (profile) => {
+    const makeActive = profile.is_active === false;
+    if (
+      !window.confirm(
+        makeActive
+          ? `Re-activate ${profile.full_name || profile.email}? They will be able to sign in again.`
+          : `Deactivate ${profile.full_name || profile.email}? They won't be able to sign in, but all their past records stay.`
+      )
+    ) {
+      return;
+    }
+    setSavingProfileId(profile.id);
+    try {
+      const result = await setAccountActive(profile.id, makeActive, adminActor());
+      if (result.success) await refreshAccountLists();
+      else alert(result.reason || 'Could not change that account.');
+    } finally {
+      setSavingProfileId(null);
+    }
+  };
+
+  const generateTemporaryPassword = () => {
+    const chars = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    const bytes = new Uint32Array(10);
+    crypto.getRandomValues(bytes);
+    const pw = Array.from(bytes, (n) => chars[n % chars.length]).join('');
+    setAccountForm((f) => ({ ...f, password: pw }));
   };
 
   const handleAddBankOption = async () => {
@@ -3541,7 +4166,8 @@ export default function App() {
                 await db.drugs.update(
                   existingDrug.id,
                   {
-                    stock: newStock
+                    stock: newStock,
+                    synced: 0
                   }
                 );
               }
@@ -3598,10 +4224,11 @@ export default function App() {
         if (!updatedDrug) return;
 
         try {
-          await supabase
-            .from('drugs')
-            .update({ stock: updatedDrug.stock })
-            .eq('id', updatedDrug.id);
+          await pushDrugStockDelta(
+            updatedDrug.id,
+            -Number(item.quantity),
+            updatedDrug.stock
+          );
         } catch (cloudErr) {
           console.warn(
             `Stock update postponed for ${item.name}:`,
@@ -3658,7 +4285,8 @@ export default function App() {
       packQty: '',
       packPrice: '',
       minStockQty: '',
-      recommendedPurchaseQty: ''
+      recommendedPurchaseQty: '',
+      counterSpace: ''
     });
 
     setIsModalOpen(true);
@@ -3712,7 +4340,8 @@ export default function App() {
       recommendedPurchaseQty:
         drug.recommendedPurchaseQty ??
         drug.recommended_purchase_qty ??
-        ''
+        '',
+      counterSpace: drug.counterSpace ?? drug.counter_space ?? ''
     });
 
     setIsModalOpen(true);
@@ -3772,12 +4401,22 @@ export default function App() {
       pack_qty: drugPayload.packQty,
       pack_price: drugPayload.packPrice,
       min_stock_qty: drugPayload.minStockQty ?? null,
-      recommended_purchase_qty: drugPayload.recommendedPurchaseQty ?? null
+      recommended_purchase_qty: drugPayload.recommendedPurchaseQty ?? null,
+      counter_space: drugPayload.counterSpace ?? ''
     };
 
-    const { error: upsertError } = await supabase
+    let { error: upsertError } = await supabase
       .from('drugs')
       .upsert([cloudPayload]);
+
+    // Migration v18 not run yet -> counter_space column is missing; save
+    // the rest rather than rejecting the whole drug.
+    if (upsertError && /counter_space/i.test(upsertError.message || '')) {
+      const { counter_space, ...withoutCounter } = cloudPayload;
+      ({ error: upsertError } = await supabase
+        .from('drugs')
+        .upsert([withoutCounter]));
+    }
 
     if (upsertError) {
       console.error('Cloud save failed:', upsertError.message);
@@ -3865,6 +4504,7 @@ export default function App() {
         packPrice: optionalNumber(formData.packPrice),
         minStockQty: optionalNumber(formData.minStockQty),
         recommendedPurchaseQty: optionalNumber(formData.recommendedPurchaseQty),
+        counterSpace: String(formData.counterSpace || '').trim(),
         synced: 0
       };
 
@@ -4028,7 +4668,94 @@ export default function App() {
   // ============================================================
   // LOGIN SCREEN
   // ============================================================
+  if (session && isRecoveringPassword) {
+    return (
+      <div className="login-container">
+        <div className="login-card">
+          <h2>CHOOSE A NEW PASSWORD</h2>
+          <p>Signed in as {session.user.email}</p>
+
+          {authError && <div className="auth-error">{authError}</div>}
+
+          <form onSubmit={handleSaveNewPassword}>
+            <label>New password:</label>
+            <input
+              type="password"
+              required
+              minLength={8}
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+            />
+
+            <label>Confirm new password:</label>
+            <input
+              type="password"
+              required
+              minLength={8}
+              autoComplete="new-password"
+              value={confirmNewPassword}
+              onChange={(e) => setConfirmNewPassword(e.target.value)}
+            />
+
+            <button type="submit" className="login-btn" disabled={isSavingPassword}>
+              {isSavingPassword ? 'Saving…' : 'Save Password'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   if (!session) {
+    if (authView === 'forgot') {
+      return (
+        <div className="login-container">
+          <div className="login-card">
+            <h2>RESET PASSWORD</h2>
+            <p>
+              Enter your account email and we'll send you a link to choose a
+              new password.
+            </p>
+
+            {authError && <div className="auth-error">{authError}</div>}
+            {authInfo && <div className="auth-info">{authInfo}</div>}
+
+            <form onSubmit={handleSendPasswordReset}>
+              <label>Email Address:</label>
+              <input
+                type="email"
+                required
+                placeholder="cashier@azupharmacy.com"
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+              />
+
+              <button type="submit" className="login-btn">
+                Send Reset Link
+              </button>
+            </form>
+
+            <button
+              type="button"
+              className="link-btn"
+              onClick={() => {
+                setAuthView('login');
+                setAuthError('');
+                setAuthInfo('');
+              }}
+            >
+              ← Back to sign in
+            </button>
+            <p className="auth-hint">
+              Can't get into your email? Ask an administrator to set a new
+              password for you.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="login-container">
         <div className="login-card">
@@ -4104,6 +4831,18 @@ export default function App() {
               Sign In
             </button>
           </form>
+
+          <button
+            type="button"
+            className="link-btn"
+            onClick={() => {
+              setAuthView('forgot');
+              setAuthError('');
+              setAuthInfo('');
+            }}
+          >
+            Forgot your password?
+          </button>
         </div>
       </div>
     );
@@ -4122,14 +4861,24 @@ export default function App() {
 
         <div className="user-profile-header">
           <div className="user-info-group">
-            <span className="user-email">
-              {session?.user?.email}
+            <span className="user-email" title={session?.user?.email}>
+              {nameOf(session?.user?.email)}
             </span>
 
             <span className="user-role-badge">
               {userRole.toUpperCase()}
             </span>
           </div>
+
+          <button
+            className="logout-btn"
+            onClick={() => {
+              setAuthError('');
+              setShowChangePassword(true);
+            }}
+          >
+            Change Password
+          </button>
 
           <button
             className="logout-btn"
@@ -4264,6 +5013,142 @@ export default function App() {
         </div>
 
       </header>
+
+      {accountModal && (
+        <div className="modal-overlay no-print">
+          <div className="modal-card">
+            <h3>
+              {accountModal.mode === 'create'
+                ? 'New Account'
+                : accountModal.mode === 'edit'
+                ? `Edit ${accountModal.profile.full_name || accountModal.profile.email}`
+                : `Set Password — ${accountModal.profile.full_name || accountModal.profile.email}`}
+            </h3>
+
+            <form className="crud-form" onSubmit={handleSubmitAccountModal}>
+              {accountModal.mode !== 'password' && (
+                <>
+                  <label>Full name</label>
+                  <input
+                    required
+                    value={accountForm.fullName}
+                    onChange={(e) => setAccountForm({ ...accountForm, fullName: e.target.value })}
+                  />
+
+                  <label>Login email</label>
+                  <input
+                    type="email"
+                    required
+                    value={accountForm.email}
+                    onChange={(e) => setAccountForm({ ...accountForm, email: e.target.value })}
+                  />
+
+                  <label>Role</label>
+                  <select
+                    value={accountForm.role}
+                    onChange={(e) => setAccountForm({ ...accountForm, role: e.target.value })}
+                  >
+                    <option value="salesperson">Salesperson</option>
+                    <option value="cashier">Cashier</option>
+                    <option value="manager">Manager</option>
+                  </select>
+                </>
+              )}
+
+              {accountModal.mode !== 'edit' && (
+                <>
+                  <label>
+                    {accountModal.mode === 'create' ? 'Initial password' : 'New password'} (min. 8
+                    characters)
+                  </label>
+                  <div className="form-row">
+                    <input
+                      required
+                      minLength={8}
+                      value={accountForm.password}
+                      onChange={(e) => setAccountForm({ ...accountForm, password: e.target.value })}
+                    />
+                    <button type="button" className="cancel-btn" onClick={generateTemporaryPassword}>
+                      Generate
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {accountModal.mode === 'edit' && (
+                <p className="auth-hint">
+                  Changing the email keeps all of this person's past sales and approvals —
+                  their records are tied to their account, not to the email.
+                </p>
+              )}
+
+              <div className="modal-actions">
+                <button type="button" className="cancel-btn" onClick={() => setAccountModal(null)}>
+                  Cancel
+                </button>
+                <button type="submit" className="save-btn" disabled={isSavingAccount}>
+                  {isSavingAccount ? 'Saving…' : 'Save'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showChangePassword && (
+        <div className="modal-overlay no-print">
+          <div className="modal-card">
+            <h3>Change My Password</h3>
+            {authError && <div className="auth-error">{authError}</div>}
+            <form className="crud-form" onSubmit={handleSaveNewPassword}>
+              <label>New password:</label>
+              <input
+                type="password"
+                required
+                minLength={8}
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+              />
+              <label>Confirm new password:</label>
+              <input
+                type="password"
+                required
+                minLength={8}
+                autoComplete="new-password"
+                value={confirmNewPassword}
+                onChange={(e) => setConfirmNewPassword(e.target.value)}
+              />
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="cancel-btn"
+                  onClick={() => {
+                    setShowChangePassword(false);
+                    setNewPassword('');
+                    setConfirmNewPassword('');
+                  }}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="save-btn" disabled={isSavingPassword}>
+                  {isSavingPassword ? 'Saving…' : 'Save Password'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {undeliveredTickets && undeliveredTickets.length > 0 && (
+        <div className="undelivered-banner no-print" role="alert">
+          ⚠ {undeliveredTickets.length} ticket
+          {undeliveredTickets.length === 1 ? '' : 's'} not yet delivered to
+          the cashier (
+          {isOnline ? 'retrying every few seconds' : 'you are offline'}).
+          Keep this screen open until this warning disappears.
+        </div>
+      )}
 
       {/* ========================================================
           DRUGS & SUPPLIERS — bottom bar, not top nav.
@@ -4510,6 +5395,11 @@ export default function App() {
                               <span className="unit-tag">
                                 {drug.unitType || drug.unit_type}
                               </span>
+                              {drug.counterSpace && (
+                                <span className="unit-tag counter-space-tag" title="Space on the counter">
+                                  📍 {drug.counterSpace}
+                                </span>
+                              )}
                               <span
                                 className={`stock-tag ${
                                   drug.stock < 10 ? 'low-stock' : ''
@@ -4745,7 +5635,7 @@ export default function App() {
                           })
                           .join(', ')}
                         {' · '}Sale {request.saleId} · requested by{' '}
-                        {request.requestedByEmail}
+                        {nameOf(request.requestedByEmail)}
                       </div>
                     </div>
 
@@ -4821,7 +5711,7 @@ export default function App() {
                       key={email}
                       value={email}
                     >
-                      {email}
+                      {nameOf(email)}
                     </option>
                   ))}
                 </select>
@@ -4887,7 +5777,7 @@ export default function App() {
                       <strong>
                         Salesperson:
                       </strong>{' '}
-                      {sale.attendantEmail || '— (direct sale)'}
+                      {nameOf(sale.attendantEmail) || '— (direct sale)'}
                     </span>
 
                     <span>
@@ -4895,7 +5785,7 @@ export default function App() {
                       <strong>
                         Cashier:
                       </strong>{' '}
-                      {sale.cashierEmail}
+                      {nameOf(sale.cashierEmail)}
                     </span>
 
                   </div>
@@ -4959,6 +5849,18 @@ export default function App() {
                             : 'Pharmacy owes them'}
                           : ₦{Math.abs(Number(sale.customerBalanceAfter)).toLocaleString()}
                         </span>
+                        {Array.isArray(sale.reversalLog) &&
+                          sale.reversalLog.some((r) => r.balanceCredit) && (
+                            <span>
+                              Returned goods credited to account: ₦
+                              {sale.reversalLog
+                                .reduce(
+                                  (sum, r) => sum + Number(r.balanceCredit || 0),
+                                  0
+                                )
+                                .toLocaleString()}
+                            </span>
+                          )}
                       </div>
                     )}
 
@@ -5071,7 +5973,7 @@ export default function App() {
                     </ul>
 
                     <div className="deleted-drug-meta">
-                      Total Due: ₦{t.total.toLocaleString()} · by {t.attendantEmail}
+                      Total Due: ₦{t.total.toLocaleString()} · by {nameOf(t.attendantEmail)}
                     </div>
 
                     <div className="deleted-drug-actions">
@@ -5205,7 +6107,7 @@ export default function App() {
 
                     <div className="deleted-drug-meta">
                       Total Cost: ₦{entry.totalCost.toLocaleString()} · by{' '}
-                      {entry.enteredByEmail}
+                      {nameOf(entry.enteredByEmail)}
                     </div>
 
                     <div className="deleted-drug-actions">
@@ -5251,7 +6153,7 @@ export default function App() {
                 {pendingStockEntryEdits.map((editRequest) => (
                   <div key={editRequest.id} className="ticket-row ticket-row-detailed">
                     <div className="ticket-row-header">
-                      <strong>Correction from {editRequest.requestedByEmail}</strong>
+                      <strong>Correction from {nameOf(editRequest.requestedByEmail)}</strong>
                     </div>
 
                     <ul className="ticket-row-items">
@@ -5433,6 +6335,9 @@ export default function App() {
                           <div className="drug-name">{d.name}</div>
                           <div className="tags-row">
                             <span className="unit-tag">{d.unitType}</span>
+                            {d.counterSpace && (
+                              <span className="unit-tag counter-space-tag">📍 {d.counterSpace}</span>
+                            )}
                             <span
                               className={`stock-tag ${d.stock < 10 ? 'low-stock' : ''}`}
                             >
@@ -5947,7 +6852,7 @@ export default function App() {
                           <div className="deleted-drug-meta">
                             {entry.items.length} item(s) · ₦
                             {entry.totalCost.toLocaleString()} · by{' '}
-                            {entry.enteredByEmail}
+                            {nameOf(entry.enteredByEmail)}
                           </div>
                           {pendingEdit && (
                             <div className="sent-back-reason">
@@ -6008,7 +6913,7 @@ export default function App() {
                           {request.proposedChanges?.name || liveDrug?.name || 'Unknown drug'}
                         </strong>
                         <div className="deleted-drug-meta">
-                          Requested by {request.requestedByEmail}
+                          Requested by {nameOf(request.requestedByEmail)}
                         </div>
                       </div>
                       {request.type === 'EDIT' && request.proposedChanges && (
@@ -6084,6 +6989,7 @@ export default function App() {
                           {Number(drug.retailPrice || 0).toLocaleString()} · Wholesale ₦
                           {Number(drug.wholesalePrice || 0).toLocaleString()}
                           {drug.minStockQty != null && <> · Min {drug.minStockQty}</>}
+                          {drug.counterSpace && <> · 📍 {drug.counterSpace}</>}
                         </div>
                         {pendingReq && (
                           <div className="sent-back-reason">
@@ -6148,7 +7054,7 @@ export default function App() {
                           {request.proposedChanges?.name || liveSupplier?.name || 'Unknown supplier'}
                         </strong>
                         <div className="deleted-drug-meta">
-                          Requested by {request.requestedByEmail}
+                          Requested by {nameOf(request.requestedByEmail)}
                         </div>
                       </div>
                       <div className="deleted-drug-actions">
@@ -6515,7 +7421,7 @@ export default function App() {
                       {entry.totalCost - Number(entry.amountPaid || 0) > 0 && (
                         <> · Owed ₦{(entry.totalCost - Number(entry.amountPaid || 0)).toLocaleString()}</>
                       )}
-                      {hasRole(userRole, 'manager') && <> · by {entry.enteredByEmail}</>}
+                      {hasRole(userRole, 'manager') && <> · by {nameOf(entry.enteredByEmail)}</>}
                     </div>
                   </div>
                 ))}
@@ -6567,7 +7473,7 @@ export default function App() {
                           </div>
                         )}
                         <div className="deleted-drug-meta">
-                          Requested by {request.requestedByEmail}
+                          Requested by {nameOf(request.requestedByEmail)}
                         </div>
                       </div>
                       <div className="deleted-drug-actions">
@@ -6743,6 +7649,16 @@ export default function App() {
             >
               📥 Import / Export Drugs
             </button>
+            <button
+              className={adminSection === 'datahub' ? 'active' : ''}
+              onClick={() => {
+                setAdminSection('datahub');
+                setHubPreviewRows(null);
+                setHubResult(null);
+              }}
+            >
+              🗂️ Data Hub (all other data)
+            </button>
             {userRole === 'administrator' && (
             <button
               className={adminSection === 'roles' ? 'active' : ''}
@@ -6795,7 +7711,7 @@ export default function App() {
 
                       <div className="drug-search-accountability">
                         <span>
-                          👤 Sold by: <strong>{match.cashierEmail}</strong>
+                          👤 Sold by: <strong>{nameOf(match.cashierEmail)}</strong>
                         </span>
                         <span>
                           🕒 {new Date(match.createdAt).toLocaleString()}
@@ -6832,7 +7748,7 @@ export default function App() {
                     <div className="deleted-drug-info">
                       <strong>{drug.name}</strong>
                       <span className="deleted-drug-meta">
-                        Deleted by {drug.deletedBy || 'unknown'} on{' '}
+                        Deleted by {nameOf(drug.deletedBy) || 'unknown'} on{' '}
                         {new Date(drug.deletedAt).toLocaleString()}
                       </span>
                     </div>
@@ -6879,7 +7795,7 @@ export default function App() {
                     <div className="deleted-drug-info">
                       <strong>{customer.name}</strong>
                       <span className="deleted-drug-meta">
-                        Deleted by {customer.deletedBy || 'unknown'} on{' '}
+                        Deleted by {nameOf(customer.deletedBy) || 'unknown'} on{' '}
                         {new Date(customer.deletedAt).toLocaleString()}
                       </span>
                     </div>
@@ -6926,7 +7842,7 @@ export default function App() {
                     <div className="deleted-drug-info">
                       <strong>{supplier.name}</strong>
                       <span className="deleted-drug-meta">
-                        Deleted by {supplier.deletedBy || 'unknown'} on{' '}
+                        Deleted by {nameOf(supplier.deletedBy) || 'unknown'} on{' '}
                         {new Date(supplier.deletedAt).toLocaleString()}
                       </span>
                     </div>
@@ -7349,40 +8265,184 @@ export default function App() {
           </section>
           )}
 
-          {adminSection === 'roles' && userRole === 'administrator' && (
+          {adminSection === 'datahub' && (
           <section className="admin-section">
             <div className="admin-section-header">
-              <h3>Account Roles</h3>
+              <h3>Data Hub</h3>
               <span className="admin-section-sub">
-                Change which role a logged-in account has — salesperson,
-                cashier, manager or administrator
+                Download any dataset as CSV or Excel; upload the ones that are safe to bring in
               </span>
             </div>
 
-            <button className="save-btn" disabled={isLoadingProfiles} onClick={handleLoadProfiles}>
-              {isLoadingProfiles ? 'Loading…' : '🔄 Refresh List'}
-            </button>
+            <div className="admin-section-nav">
+              {DATA_HUB_DATASETS.filter((d) => !d.adminOnly || userRole === 'administrator').map((d) => (
+                <button
+                  key={d.key}
+                  className={hubDatasetKey === d.key ? 'active' : ''}
+                  onClick={() => {
+                    setHubDatasetKey(d.key);
+                    setHubPreviewRows(null);
+                    setHubResult(null);
+                    setHubFileName('');
+                  }}
+                >
+                  {d.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="import-export-panel">
+              <div className="import-export-block">
+                <h4>Download — {activeHubDataset.label}</h4>
+                <p className="admin-section-sub">{activeHubDataset.help}</p>
+                <div className="import-export-buttons">
+                  <button className="save-btn" disabled={isHubBusy} onClick={() => handleHubExport('csv')}>
+                    Download CSV
+                  </button>
+                  <button className="save-btn" disabled={isHubBusy} onClick={() => handleHubExport('xlsx')}>
+                    Download Excel
+                  </button>
+                </div>
+              </div>
+
+              {activeHubDataset.importFn && (
+                <div className="import-export-block">
+                  <h4>Upload — {activeHubDataset.label}</h4>
+                  <p className="admin-section-sub">
+                    Tip: download first, edit the file, then upload it back.
+                  </p>
+                  <input
+                    type="file"
+                    accept=".csv,.xlsx,.xls"
+                    onChange={(e) => handleHubFileChosen(e.target.files?.[0])}
+                  />
+
+                  {hubPreviewRows && (
+                    <div className="import-preview">
+                      <p>
+                        <strong>{hubFileName}</strong> — {hubPreviewRows.length} row
+                        {hubPreviewRows.length === 1 ? '' : 's'} found.
+                      </p>
+                      <div className="modal-actions">
+                        <button className="save-btn" disabled={isHubBusy} onClick={handleHubConfirmImport}>
+                          {isHubBusy ? 'Importing…' : 'Confirm Import'}
+                        </button>
+                        <button
+                          className="cancel-btn"
+                          onClick={() => {
+                            setHubPreviewRows(null);
+                            setHubFileName('');
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {hubResult &&
+                    (hubResult.success ? (
+                      <div className="import-result">
+                        Created {hubResult.created}, updated {hubResult.updated}
+                        {hubResult.skipped && hubResult.skipped.length > 0 && (
+                          <>
+                            , skipped {hubResult.skipped.length}:
+                            <ul>
+                              {hubResult.skipped.slice(0, 10).map((x, i) => (
+                                <li key={i}>
+                                  Row {x.row}: {x.reason}
+                                </li>
+                              ))}
+                            </ul>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="import-result import-result-error">
+                        Import failed: {hubResult.reason}
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {activeHubDataset.exportOnly && (
+                <p className="auth-hint">
+                  This dataset is download-only — sales, stock history, tickets and the audit trail
+                  can't be uploaded, so records can't be rewritten after the fact.
+                </p>
+              )}
+            </div>
+          </section>
+          )}
+
+          {adminSection === 'roles' && userRole === 'administrator' && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <h3>Accounts</h3>
+              <span className="admin-section-sub">
+                Create accounts, edit names / emails / roles, set passwords,
+                deactivate. Administrator accounts can only be changed in
+                Supabase.
+              </span>
+            </div>
+
+            <div className="form-row">
+              <button className="save-btn" onClick={handleOpenCreateAccount}>
+                ➕ New Account
+              </button>
+              <button className="cancel-btn" disabled={isLoadingProfiles} onClick={handleLoadProfiles}>
+                {isLoadingProfiles ? 'Loading…' : '🔄 Refresh List'}
+              </button>
+            </div>
 
             {allProfiles && allProfiles.length > 0 ? (
               <div className="profile-role-list">
-                {allProfiles.map((profile) => (
-                  <div key={profile.id} className="profile-role-card">
-                    <div className="profile-role-info">
-                      <strong>{profile.email || profile.id}</strong>
-                      <span className="deleted-drug-meta">Current role: {profile.role}</span>
+                {allProfiles.map((profile) => {
+                  const isAdminTarget = profile.role === 'administrator';
+                  return (
+                    <div key={profile.id} className="profile-role-card">
+                      <div className="profile-role-info">
+                        <strong>
+                          {profile.full_name || '(no name set)'}
+                          {profile.is_active === false && ' — DEACTIVATED'}
+                        </strong>
+                        <span className="deleted-drug-meta">{profile.email || profile.id}</span>
+                        <span className="deleted-drug-meta">Role: {profile.role}</span>
+                      </div>
+
+                      {isAdminTarget ? (
+                        <span className="deleted-drug-meta">
+                          🔒 Administrator — managed in Supabase only
+                        </span>
+                      ) : (
+                        <div className="profile-account-actions">
+                          <select
+                            value={profile.role}
+                            disabled={savingProfileId === profile.id}
+                            onChange={(e) => handleChangeUserRole(profile, e.target.value)}
+                          >
+                            <option value="salesperson">Salesperson</option>
+                            <option value="cashier">Cashier</option>
+                            <option value="manager">Manager</option>
+                          </select>
+                          <button className="cancel-btn" onClick={() => handleOpenEditAccount(profile)}>
+                            Edit
+                          </button>
+                          <button className="cancel-btn" onClick={() => handleOpenSetPassword(profile)}>
+                            Set Password
+                          </button>
+                          <button
+                            className="cancel-btn"
+                            disabled={savingProfileId === profile.id}
+                            onClick={() => handleToggleAccountActive(profile)}
+                          >
+                            {profile.is_active === false ? 'Reactivate' : 'Deactivate'}
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    <select
-                      value={profile.role}
-                      disabled={savingProfileId === profile.id}
-                      onChange={(e) => handleChangeUserRole(profile, e.target.value)}
-                    >
-                      <option value="salesperson">Salesperson</option>
-                      <option value="cashier">Cashier</option>
-                      <option value="manager">Manager</option>
-                      <option value="administrator">Administrator</option>
-                    </select>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="empty-state">
@@ -7430,7 +8490,7 @@ export default function App() {
                     <div className="audit-log-main">
                       <strong>{entry.action.replace(/_/g, ' ')}</strong>
                       <span className="audit-log-meta">
-                        {entry.actorEmail} ({entry.actorRole}) ·{' '}
+                        {nameOf(entry.actorEmail)} ({entry.actorRole}) ·{' '}
                         {new Date(entry.createdAt).toLocaleString()}
                       </span>
                     </div>
@@ -7496,7 +8556,7 @@ export default function App() {
                     Cashier:
                   </strong>{' '}
                   {
-                    saleSuccessData.cashierEmail
+                    nameOf(saleSuccessData.cashierEmail)
                   }
                 </p>
 
@@ -8094,7 +9154,7 @@ export default function App() {
             <h3>Send Back — {sendingBackTicket.customerName}</h3>
 
             <p className="form-section-hint">
-              This sends the ticket back to {sendingBackTicket.attendantEmail}{' '}
+              This sends the ticket back to {nameOf(sendingBackTicket.attendantEmail)}{' '}
               to adjust the cart (drop something the customer can't afford,
               add something they forgot). It leaves the payment queue until
               they resubmit it — their place in line (
@@ -8148,7 +9208,7 @@ export default function App() {
 
             <p className="form-section-hint">
               Nothing changes in the catalog — this just tells{' '}
-              {rejectingStockEntry.enteredByEmail} why it was turned down.
+              {nameOf(rejectingStockEntry.enteredByEmail)} why it was turned down.
             </p>
 
             <div>
@@ -8704,7 +9764,7 @@ export default function App() {
 
             <p className="form-section-hint">
               The original entry stays exactly as it was — this just tells{' '}
-              {rejectingStockEdit.requestedByEmail} why the correction was
+              {nameOf(rejectingStockEdit.requestedByEmail)} why the correction was
               turned down.
             </p>
 
@@ -8764,7 +9824,7 @@ export default function App() {
 
             <p className="form-section-hint">
               Nothing changes — this tells{' '}
-              {rejectingChangeRequest.request.requestedByEmail} why it was turned down.
+              {nameOf(rejectingChangeRequest.request.requestedByEmail)} why it was turned down.
             </p>
 
             <div>
@@ -9232,6 +10292,21 @@ export default function App() {
                         setFormData({
                           ...formData,
                           recommendedPurchaseQty: e.target.value
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label>Space on the Counter:</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Shelf A2, Fridge, Drawer 3"
+                      value={formData.counterSpace || ''}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          counterSpace: e.target.value
                         })
                       }
                     />

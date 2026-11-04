@@ -3615,3 +3615,53 @@ select {
   border-radius: 6px;
   border: 1px solid #cbd5e1;
 }
+
+.undelivered-banner {
+  background: #fff3cd;
+  color: #7a5200;
+  border-bottom: 2px solid #f0b429;
+  padding: 8px 14px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.auth-info {
+  background: #e6f4ea;
+  color: #1e6b34;
+  border: 1px solid #b7dfc3;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+}
+.link-btn {
+  background: none;
+  border: none;
+  color: #0b69c7;
+  text-decoration: underline;
+  cursor: pointer;
+  margin-top: 12px;
+  font-size: 0.9rem;
+}
+.auth-hint {
+  margin-top: 10px;
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.profile-account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.profile-account-actions .cancel-btn {
+  flex: none;
+  padding: 6px 10px;
+}
+
+.counter-space-tag {
+  background: #eef2ff;
+  color: #3730a3;
+}

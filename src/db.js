@@ -318,6 +318,53 @@ export async function ensureSeedData() {
 // PAGE_SIZE, so the full catalog syncs down regardless of size.
 const DRUGS_SYNC_PAGE_SIZE = 1000;
 
+export function mapCloudDrug(drug) {
+  return {
+          id: String(drug.id),
+          name: drug.name,
+          unitType: drug.unit_type || drug.unitType || 'Sachet',
+          costPrice: Number(drug.cost_price ?? drug.costPrice ?? 0),
+          retailPrice: Number(drug.retail_price ?? drug.retailPrice ?? 0),
+          wholesalePrice: Number(drug.wholesale_price ?? drug.wholesalePrice ?? 0),
+          stock: Number(drug.stock ?? 0),
+          barcode: drug.barcode || '',
+          halfPackQty:
+            drug.half_pack_qty ?? drug.halfPackQty ?? null,
+          halfPackPrice:
+            drug.half_pack_price ?? drug.halfPackPrice ?? null,
+          packQty: drug.pack_qty ?? drug.packQty ?? null,
+          packPrice: drug.pack_price ?? drug.packPrice ?? null,
+          // Both optional — the standard minimum quantity a shelf should
+          // never fall below, and how many to buy when it's time to
+          // restock. Either can be left blank; the purchase-list
+          // generator just works with whatever's actually filled in.
+          minStockQty: drug.min_stock_qty ?? drug.minStockQty ?? null,
+          recommendedPurchaseQty:
+            drug.recommended_purchase_qty ?? drug.recommendedPurchaseQty ?? null,
+          // Past (costPrice, retailPrice, wholesalePrice) choices for this
+          // specific drug — feeds getPriceRecommendation() so the % profit
+          // suggested next time reflects what was actually chosen before,
+          // not just the generic default.
+          priceHistory: drug.price_history ?? drug.priceHistory ?? [],
+          deletedAt: drug.deleted_at || drug.deletedAt || null,
+          deletedBy: drug.deleted_by || drug.deletedBy || null,
+          counterSpace: drug.counter_space ?? drug.counterSpace ?? '',
+  synced: 1
+  };
+}
+
+// Pulls a single drug row pushed by Realtime into the local table.
+export async function applyRealtimeDrugRow(row) {
+  try {
+    if (!row || row.id === undefined) return;
+    const existing = await db.drugs.get(String(row.id));
+    if (existing && Number(existing.synced) === 0) return;
+    await db.drugs.put(mapCloudDrug(row));
+  } catch (err) {
+    console.warn('Realtime drug apply failed:', err.message);
+  }
+}
+
 export async function syncDrugsFromCloud() {
   try {
     let allCloudDrugs = [];
@@ -351,37 +398,7 @@ export async function syncDrugsFromCloud() {
 
       const mappedDrugs = allCloudDrugs
         .filter((drug) => !pendingIds.has(String(drug.id)))
-        .map((drug) => ({
-          id: String(drug.id),
-          name: drug.name,
-          unitType: drug.unit_type || drug.unitType || 'Sachet',
-          costPrice: Number(drug.cost_price ?? drug.costPrice ?? 0),
-          retailPrice: Number(drug.retail_price ?? drug.retailPrice ?? 0),
-          wholesalePrice: Number(drug.wholesale_price ?? drug.wholesalePrice ?? 0),
-          stock: Number(drug.stock ?? 0),
-          barcode: drug.barcode || '',
-          halfPackQty:
-            drug.half_pack_qty ?? drug.halfPackQty ?? null,
-          halfPackPrice:
-            drug.half_pack_price ?? drug.halfPackPrice ?? null,
-          packQty: drug.pack_qty ?? drug.packQty ?? null,
-          packPrice: drug.pack_price ?? drug.packPrice ?? null,
-          // Both optional — the standard minimum quantity a shelf should
-          // never fall below, and how many to buy when it's time to
-          // restock. Either can be left blank; the purchase-list
-          // generator just works with whatever's actually filled in.
-          minStockQty: drug.min_stock_qty ?? drug.minStockQty ?? null,
-          recommendedPurchaseQty:
-            drug.recommended_purchase_qty ?? drug.recommendedPurchaseQty ?? null,
-          // Past (costPrice, retailPrice, wholesalePrice) choices for this
-          // specific drug — feeds getPriceRecommendation() so the % profit
-          // suggested next time reflects what was actually chosen before,
-          // not just the generic default.
-          priceHistory: drug.price_history ?? drug.priceHistory ?? [],
-          deletedAt: drug.deleted_at || drug.deletedAt || null,
-          deletedBy: drug.deleted_by || drug.deletedBy || null,
-          synced: 1
-        }));
+        .map(mapCloudDrug);
 
       if (mappedDrugs.length > 0) {
         await db.drugs.bulkPut(mappedDrugs);
@@ -402,25 +419,31 @@ export async function syncPendingDrugsToCloud() {
     if (unsyncedDrugs.length === 0) return;
 
     for (const drug of unsyncedDrugs) {
-      const { error } = await supabase.from('drugs').upsert([
-        {
-          id: drug.id,
-          name: drug.name,
-          unit_type: drug.unitType,
-          cost_price: drug.costPrice,
-          retail_price: drug.retailPrice,
-          wholesale_price: drug.wholesalePrice,
-          stock: drug.stock,
-          barcode: drug.barcode,
-          half_pack_qty: drug.halfPackQty ?? null,
-          half_pack_price: drug.halfPackPrice ?? null,
-          pack_qty: drug.packQty ?? null,
-          pack_price: drug.packPrice ?? null,
-          min_stock_qty: drug.minStockQty ?? null,
-          recommended_purchase_qty: drug.recommendedPurchaseQty ?? null,
-          price_history: drug.priceHistory ?? []
-        }
-      ]);
+      const row = {
+        id: drug.id,
+        name: drug.name,
+        unit_type: drug.unitType,
+        cost_price: drug.costPrice,
+        retail_price: drug.retailPrice,
+        wholesale_price: drug.wholesalePrice,
+        stock: drug.stock,
+        barcode: drug.barcode,
+        half_pack_qty: drug.halfPackQty ?? null,
+        half_pack_price: drug.halfPackPrice ?? null,
+        pack_qty: drug.packQty ?? null,
+        pack_price: drug.packPrice ?? null,
+        min_stock_qty: drug.minStockQty ?? null,
+        recommended_purchase_qty: drug.recommendedPurchaseQty ?? null,
+        price_history: drug.priceHistory ?? [],
+        counter_space: drug.counterSpace ?? ''
+      };
+      let { error } = await supabase.from('drugs').upsert([row]);
+      // If migration v18 hasn't been run yet the counter_space column
+      // doesn't exist — retry without it so drug sync never stalls.
+      if (error && /counter_space/i.test(error.message || '')) {
+        const { counter_space, ...rowWithoutCounter } = row;
+        ({ error } = await supabase.from('drugs').upsert([rowWithoutCounter]));
+      }
 
       if (!error) {
         await db.drugs.update(drug.id, { synced: 1 });
@@ -461,7 +484,8 @@ const DRUG_IMPORT_HEADER_ALIASES = {
   halfPackQty: ['halfpackqty', 'halfpack'],
   halfPackPrice: ['halfpackprice'],
   packQty: ['packqty', 'pack'],
-  packPrice: ['packprice']
+  packPrice: ['packprice'],
+  counterSpace: ['counterspace', 'spaceonthecounter', 'counter', 'shelf', 'location', 'counterlocation']
 };
 
 function normalizeHeaderKey(key) {
@@ -480,6 +504,229 @@ function normalizeImportRow(row) {
     }
   }
   return out;
+}
+
+// ============================================================
+// BULK IMPORT FOR SUPPLIERS / CUSTOMERS / BANK OPTIONS
+// (managers + administrators; bank options administrator-only)
+// A row matches an existing record by name (case-insensitive); blank
+// cells leave existing values untouched. New wholesale customers start
+// at the balance in the row (opening balance) — existing customers'
+// balances are NEVER changed by an import, since balances are driven by
+// sales, payments and returns.
+// ============================================================
+function normalizeRowWith(row, aliasMap) {
+  const out = {};
+  const rowKeys = Object.keys(row || {});
+  for (const [field, aliases] of Object.entries(aliasMap)) {
+    const matchKey = rowKeys.find((k) => aliases.includes(normalizeHeaderKey(k)));
+    if (matchKey !== undefined && String(row[matchKey]).trim() !== '') {
+      out[field] = row[matchKey];
+    }
+  }
+  return out;
+}
+
+const SUPPLIER_IMPORT_ALIASES = {
+  name: ['name', 'suppliername', 'supplier', 'company'],
+  contactPerson: ['contactperson', 'contact', 'contactname'],
+  phone: ['phone', 'phonenumber', 'tel', 'mobile'],
+  email: ['email', 'emailaddress'],
+  address: ['address', 'location']
+};
+
+const CUSTOMER_IMPORT_ALIASES = {
+  name: ['name', 'customername', 'fullname', 'customer'],
+  phones: ['phones', 'phone', 'phonenumber', 'phonenumbers', 'tel', 'mobile'],
+  email: ['email', 'emailaddress'],
+  address: ['address', 'location'],
+  balance: ['balance', 'openingbalance', 'owing', 'owes']
+};
+
+function requireManagerForImport(actor, label) {
+  const role = actor?.role;
+  if (!(role === 'manager' || role === 'administrator')) {
+    return { success: false, reason: `Only managers and administrators can import ${label}.` };
+  }
+  return null;
+}
+
+export async function bulkImportSuppliers(rows, actor) {
+  const denied = requireManagerForImport(actor, 'suppliers');
+  if (denied) return denied;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { success: false, reason: 'Nothing to import — the file had no usable rows.' };
+  }
+  try {
+    const existing = (await db.suppliers.toArray()).filter((s) => !s.deletedAt);
+    const byName = new Map(existing.map((s) => [String(s.name).trim().toLowerCase(), s]));
+    let created = 0;
+    let updated = 0;
+    const skipped = [];
+    const toPut = [];
+
+    rows.forEach((raw, index) => {
+      const row = normalizeRowWith(raw, SUPPLIER_IMPORT_ALIASES);
+      const name = row.name ? String(row.name).trim() : '';
+      if (!name) {
+        skipped.push({ row: index + 1, reason: 'No supplier name.' });
+        return;
+      }
+      const match = byName.get(name.toLowerCase());
+      const fields = {};
+      ['contactPerson', 'phone', 'email', 'address'].forEach((f) => {
+        if (row[f] !== undefined) fields[f] = String(row[f]).trim();
+      });
+      if (match) {
+        const merged = { ...match, ...fields, synced: 0 };
+        toPut.push(merged);
+        byName.set(name.toLowerCase(), merged);
+        updated += 1;
+      } else {
+        const fresh = {
+          id: generateId('SUPPLIER'),
+          name,
+          contactPerson: '',
+          phone: '',
+          email: '',
+          address: '',
+          ...fields,
+          synced: 0
+        };
+        toPut.push(fresh);
+        byName.set(name.toLowerCase(), fresh);
+        created += 1;
+      }
+    });
+
+    if (toPut.length > 0) await db.suppliers.bulkPut(toPut);
+    if (navigator.onLine) await syncPendingSuppliersToCloud();
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'suppliers_imported',
+      targetType: 'supplier',
+      targetId: 'bulk',
+      details: { created, updated, skipped: skipped.length }
+    });
+    return { success: true, created, updated, skipped };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function bulkImportCustomers(rows, actor) {
+  const denied = requireManagerForImport(actor, 'customers');
+  if (denied) return denied;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { success: false, reason: 'Nothing to import — the file had no usable rows.' };
+  }
+  try {
+    const existing = (await db.customers.toArray()).filter((c) => !c.deletedAt);
+    const byName = new Map(existing.map((c) => [String(c.name).trim().toLowerCase(), c]));
+    let created = 0;
+    let updated = 0;
+    const skipped = [];
+    const toPut = [];
+
+    rows.forEach((raw, index) => {
+      const row = normalizeRowWith(raw, CUSTOMER_IMPORT_ALIASES);
+      const name = row.name ? String(row.name).trim() : '';
+      if (!name) {
+        skipped.push({ row: index + 1, reason: 'No customer name.' });
+        return;
+      }
+      // Several numbers can share one cell, separated by ; , or /
+      const phones = row.phones
+        ? String(row.phones)
+            .split(/[;,/]/)
+            .map((p) => p.trim())
+            .filter(Boolean)
+        : null;
+      const match = byName.get(name.toLowerCase());
+
+      if (match) {
+        const merged = {
+          ...match,
+          ...(phones ? { phones, phone: phones[0] || '' } : {}),
+          ...(row.email !== undefined ? { email: String(row.email).trim() } : {}),
+          ...(row.address !== undefined ? { address: String(row.address).trim() } : {}),
+          synced: 0
+        };
+        toPut.push(merged);
+        byName.set(name.toLowerCase(), merged);
+        updated += 1;
+      } else {
+        const openingBalance = Number(row.balance);
+        const fresh = {
+          id: generateId('CUSTOMER'),
+          name,
+          phones: phones || [],
+          phone: (phones && phones[0]) || '',
+          email: row.email !== undefined ? String(row.email).trim() : '',
+          address: row.address !== undefined ? String(row.address).trim() : '',
+          balance: Number.isFinite(openingBalance) ? openingBalance : 0,
+          balanceDirty: 1,
+          synced: 0
+        };
+        toPut.push(fresh);
+        byName.set(name.toLowerCase(), fresh);
+        created += 1;
+      }
+    });
+
+    if (toPut.length > 0) await db.customers.bulkPut(toPut);
+    if (navigator.onLine) await syncPendingCustomersToCloud();
+
+    await logAuditEvent({
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      action: 'customers_imported',
+      targetType: 'customer',
+      targetId: 'bulk',
+      details: { created, updated, skipped: skipped.length }
+    });
+    return { success: true, created, updated, skipped };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export async function bulkImportBankOptions(rows, actor) {
+  if (actor?.role !== 'administrator') {
+    return { success: false, reason: 'Only an administrator can import bank options.' };
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { success: false, reason: 'Nothing to import — the file had no usable rows.' };
+  }
+  try {
+    const existing = await db.bankOptions.toArray();
+    const names = new Set(existing.map((b) => String(b.name).trim().toLowerCase()));
+    let created = 0;
+    const skipped = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = normalizeRowWith(rows[i], {
+        name: ['name', 'bank', 'bankname'],
+        color: ['color', 'colour']
+      });
+      const name = row.name ? String(row.name).trim() : '';
+      if (!name) {
+        skipped.push({ row: i + 1, reason: 'No bank name.' });
+        continue;
+      }
+      if (names.has(name.toLowerCase())) {
+        skipped.push({ row: i + 1, reason: `"${name}" already exists.` });
+        continue;
+      }
+      await addBankOption(name, actor, row.color ? String(row.color).trim() : undefined);
+      names.add(name.toLowerCase());
+      created += 1;
+    }
+    return { success: true, created, updated: 0, skipped };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
 }
 
 export async function bulkImportDrugs(rows, actor) {
@@ -538,6 +785,9 @@ export async function bulkImportDrugs(rows, actor) {
           const n = optionalNumber(row[field]);
           if (n !== undefined) changes[field] = n;
         });
+        if (row.counterSpace !== undefined && String(row.counterSpace).trim() !== '') {
+          changes.counterSpace = String(row.counterSpace).trim();
+        }
         const merged = { ...existing, ...changes };
         toPut.push(merged);
         if (merged.costPrice > 0 && (merged.retailPrice > 0 || merged.wholesalePrice > 0)) {
@@ -563,6 +813,7 @@ export async function bulkImportDrugs(rows, actor) {
           packPrice: optionalNumber(row.packPrice) ?? null,
           minStockQty: optionalNumber(row.minStockQty) ?? null,
           recommendedPurchaseQty: optionalNumber(row.recommendedPurchaseQty) ?? null,
+          counterSpace: row.counterSpace ? String(row.counterSpace).trim() : '',
           priceHistory: [],
           synced: 0
         };
@@ -881,8 +1132,8 @@ export async function fetchAllProfiles() {
     const { data, error } = await supabase.from('profiles').select('*');
     if (error) throw error;
     const profiles = (data || []).slice().sort((a, b) => {
-      const aLabel = (a.email || a.id || '').toLowerCase();
-      const bLabel = (b.email || b.id || '').toLowerCase();
+      const aLabel = (a.full_name || a.email || a.id || '').toLowerCase();
+      const bLabel = (b.full_name || b.email || b.id || '').toLowerCase();
       return aLabel.localeCompare(bLabel);
     });
     return { success: true, profiles };
@@ -891,6 +1142,44 @@ export async function fetchAllProfiles() {
   }
 }
 
+// Lightweight directory (id, email, previous emails, full name, role,
+// active flag) used everywhere a record shows who did something. Cached
+// in localStorage so names still show while offline.
+const PROFILE_DIRECTORY_CACHE_KEY = 'azu_profile_directory_v1';
+
+export function readCachedProfileDirectory() {
+  try {
+    const raw = localStorage.getItem(PROFILE_DIRECTORY_CACHE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchProfileDirectory() {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, email, full_name, role, is_active, previous_emails');
+    if (error) throw error;
+    const rows = data || [];
+    try {
+      localStorage.setItem(PROFILE_DIRECTORY_CACHE_KEY, JSON.stringify(rows));
+    } catch {
+      /* storage unavailable — fine */
+    }
+    return rows;
+  } catch (err) {
+    console.warn('Unable to load profile directory:', err.message);
+    return null;
+  }
+}
+
+// A role other than administrator can be changed by an administrator
+// from the app. Changing an ADMINISTRATOR's role — or promoting anyone
+// to administrator — is deliberately blocked here, in the UI, and by a
+// database trigger (migration v18): it can only be done directly in
+// Supabase.
 export async function updateUserRole(profileId, newRole, actor) {
   if (actor?.role !== 'administrator') {
     return { success: false, reason: 'Only an administrator can change account roles.' };
@@ -898,7 +1187,28 @@ export async function updateUserRole(profileId, newRole, actor) {
   if (!ROLE_RANK.hasOwnProperty(newRole)) {
     return { success: false, reason: `"${newRole}" isn't a recognized role.` };
   }
+  if (newRole === 'administrator') {
+    return {
+      success: false,
+      reason: 'Administrator roles can only be granted directly in Supabase.'
+    };
+  }
   try {
+    const { data: target, error: lookupError } = await supabase
+      .from('profiles')
+      .select('id, role')
+      .eq('id', profileId)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+    if (!target) return { success: false, reason: 'Account not found.' };
+    if (target.role === 'administrator') {
+      return {
+        success: false,
+        reason:
+          "An administrator's role can only be changed directly in Supabase."
+      };
+    }
+
     const { error } = await supabase
       .from('profiles')
       .update({ role: newRole })
@@ -920,22 +1230,119 @@ export async function updateUserRole(profileId, newRole, actor) {
   }
 }
 
+// ------------------------------------------------------------
+// ACCOUNT MANAGEMENT (administrator-only, via the `admin-users` Edge
+// Function — it holds the service-role key; the browser never does).
+// ------------------------------------------------------------
+async function callAdminUsers(payload, actor, auditAction, auditTarget, auditDetails) {
+  if (actor?.role !== 'administrator') {
+    return { success: false, reason: 'Only an administrator can manage accounts.' };
+  }
+  try {
+    const { data, error } = await supabase.functions.invoke('admin-users', {
+      body: payload
+    });
+    if (error) {
+      // supabase-js hides the function's JSON error body inside the
+      // error's `context` response — dig it out so the real reason shows.
+      let message = error.message;
+      try {
+        const body = await error.context?.json?.();
+        if (body?.error) message = body.error;
+      } catch {
+        /* keep generic message */
+      }
+      if (/Failed to send a request|not found|404/i.test(message || '')) {
+        message =
+          'The account-management function is not deployed yet (see SETUP_NOTES.md). ' + message;
+      }
+      return { success: false, reason: message };
+    }
+    if (data?.error) return { success: false, reason: data.error };
+
+    await logAuditEvent({
+      action: auditAction,
+      actorEmail: actor?.email,
+      actorRole: actor?.role,
+      targetType: 'profile',
+      targetId: auditTarget || data?.id || null,
+      // Never log passwords.
+      details: auditDetails || {}
+    });
+    return { success: true, ...data };
+  } catch (err) {
+    return { success: false, reason: err.message };
+  }
+}
+
+export function createAccount({ email, fullName, password, role }, actor) {
+  return callAdminUsers(
+    { action: 'create', email, fullName, password, role },
+    actor,
+    'account_created',
+    null,
+    { email, fullName, role }
+  );
+}
+
+export function updateAccountDetails(id, { fullName, email, role }, actor) {
+  return callAdminUsers(
+    { action: 'update', id, fullName, email, role },
+    actor,
+    'account_updated',
+    id,
+    { fullName, email, role }
+  );
+}
+
+export function setAccountPassword(id, password, actor) {
+  return callAdminUsers(
+    { action: 'set_password', id, password },
+    actor,
+    'account_password_set',
+    id,
+    {}
+  );
+}
+
+export function setAccountActive(id, active, actor) {
+  return callAdminUsers(
+    { action: 'set_active', id, active },
+    actor,
+    active ? 'account_reactivated' : 'account_deactivated',
+    id,
+    {}
+  );
+}
+
 export async function syncPendingSalesToCloud() {
   try {
     const unsyncedSales = await db.sales.where('synced').equals(0).toArray();
     if (unsyncedSales.length === 0) return;
 
     for (const sale of unsyncedSales) {
-      const { error } = await supabase.from('sales').insert([
+      // Full field list — this retry path used to send only a handful
+      // of columns, so a sale that had to be retried lost its attendant,
+      // wholesale customer, amount paid and balance snapshot in the cloud.
+      let { error } = await supabase.from('sales').upsert([
         {
           id: sale.id,
           total: sale.total,
           sale_type: sale.saleType,
-          cashier_id: sale.cashierId,
-          cashier_email: sale.cashierEmail,
+          cashier_id: sale.cashierId || null,
+          cashier_email: sale.cashierEmail || null,
+          attendant_id: sale.attendantId || null,
+          attendant_email: sale.attendantEmail || null,
           customer_name: sale.customerName,
           customer_phone: sale.customerPhone,
+          customer_id: sale.customerId || null,
+          amount_paid: sale.amountPaid ?? null,
+          customer_balance_before: sale.customerBalanceBefore ?? null,
+          customer_balance_after: sale.customerBalanceAfter ?? null,
           items: sale.items,
+          payment_method: sale.paymentMethod ?? null,
+          ticket_id: sale.ticketId || null,
+          reversal_log: sale.reversalLog ?? null,
           created_at: sale.createdAt
         }
       ]);
@@ -1182,7 +1589,8 @@ export async function requestDrugEdit(drug, changes, actor) {
         pack_qty: changes.packQty ?? null,
         pack_price: changes.packPrice ?? null,
         min_stock_qty: changes.minStockQty ?? null,
-        recommended_purchase_qty: changes.recommendedPurchaseQty ?? null
+        recommended_purchase_qty: changes.recommendedPurchaseQty ?? null,
+        ...(changes.counterSpace !== undefined ? { counter_space: changes.counterSpace } : {})
       };
 
       if (navigator.onLine) {
@@ -1372,7 +1780,8 @@ export async function approveDrugChangeRequest(request, actor) {
               pack_qty: c.packQty ?? null,
               pack_price: c.packPrice ?? null,
               min_stock_qty: c.minStockQty ?? null,
-              recommended_purchase_qty: c.recommendedPurchaseQty ?? null
+              recommended_purchase_qty: c.recommendedPurchaseQty ?? null,
+              ...(c.counterSpace !== undefined ? { counter_space: c.counterSpace } : {})
             })
             .eq('id', target.drugId);
           if (!error) await db.drugs.update(target.drugId, { synced: 1 });
@@ -1680,16 +2089,68 @@ export async function reverseSaleItems(sale, reversals, actor) {
 
         if (navigator.onLine) {
           try {
-            await supabase
-              .from('drugs')
-              .update({ stock: restoredStock })
-              .eq('id', drugKey);
-            await db.drugs.update(existingDrug.id, { synced: 1 });
+            // Server-side +quantity, so a sale made on another terminal
+            // a moment ago isn't wiped out by this restore.
+            const result = await applyCloudStockDelta(
+              drugKey,
+              detail.quantity,
+              restoredStock
+            );
+            if (result.ok) {
+              await db.drugs.update(existingDrug.id, {
+                stock: result.stock,
+                synced: 1
+              });
+            }
           } catch (err) {
             console.warn('Cloud stock restore postponed:', err.message);
           }
         }
       }
+    }
+
+    // WHOLESALE BALANCE: goods that come back reduce what the customer
+    // owes by their refund value. If they'd already paid in full (or the
+    // refund is bigger than what they owed) the balance goes NEGATIVE,
+    // meaning the pharmacy now owes THEM — it shows as credit on their
+    // record and is automatically used up by their next purchase.
+    let customerBalanceAdjustment = 0;
+    let customerBalanceNow = null;
+    if (sale.customerId && sale.saleType === 'wholesale' && refundTotal > 0) {
+      customerBalanceAdjustment = refundTotal;
+      try {
+        const customer = await db.customers.get(sale.customerId);
+        if (customer) {
+          const localAfter = Number(customer.balance || 0) - refundTotal;
+          customerBalanceNow = localAfter;
+          await db.customers.update(sale.customerId, {
+            balance: localAfter,
+            balanceDirty: 1,
+            synced: 0
+          });
+          if (navigator.onLine) {
+            const result = await applyCloudCustomerBalanceDelta(
+              sale.customerId,
+              -refundTotal,
+              localAfter
+            );
+            if (result.ok) {
+              customerBalanceNow = result.balance;
+              await db.customers.update(sale.customerId, {
+                balance: result.balance,
+                balanceDirty: 0,
+                synced: 1
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Customer balance adjustment postponed:', err.message);
+      }
+      // Tag the log entries so the receipt/history can explain it.
+      reversedDetails.forEach((d) => {
+        d.balanceCredit = d.refund;
+      });
     }
 
     // Persist the reversed sale locally FIRST, unconditionally — not
@@ -1744,7 +2205,9 @@ export async function reverseSaleItems(sale, reversals, actor) {
       updatedItems,
       newTotal,
       reversalLog: newReversalLog,
-      cloudSynced
+      cloudSynced,
+      customerBalanceAdjustment,
+      customerBalanceNow
     };
   } catch (err) {
     console.warn('Unable to reverse sale items:', err.message);
@@ -2820,20 +3283,36 @@ export async function syncPendingCustomersToCloud() {
     if (pending.length === 0) return;
 
     for (const customer of pending) {
-      const { error } = await supabase.from('customers').upsert([
-        {
-          id: customer.id,
-          name: customer.name,
-          phones: customer.phones || (customer.phone ? [customer.phone] : []),
-          phone: customer.phone,
-          email: customer.email,
-          address: customer.address,
-          balance: customer.balance,
-          deleted_at: customer.deletedAt || null,
-          deleted_by: customer.deletedBy || null
-        }
-      ]);
-      if (!error) await db.customers.update(customer.id, { synced: 1 });
+      // Only send the balance when this device has an unconfirmed
+      // balance change (balanceDirty) or the customer isn't in the cloud
+      // yet. A plain name/address edit must never overwrite a balance
+      // another terminal has changed since this device last looked.
+      let includeBalance = Boolean(customer.balanceDirty);
+      if (!includeBalance) {
+        const { data: existing } = await supabase
+          .from('customers')
+          .select('id')
+          .eq('id', customer.id)
+          .maybeSingle();
+        includeBalance = !existing;
+      }
+
+      const row = {
+        id: customer.id,
+        name: customer.name,
+        phones: customer.phones || (customer.phone ? [customer.phone] : []),
+        phone: customer.phone,
+        email: customer.email,
+        address: customer.address,
+        deleted_at: customer.deletedAt || null,
+        deleted_by: customer.deletedBy || null
+      };
+      if (includeBalance) row.balance = customer.balance;
+
+      const { error } = await supabase.from('customers').upsert([row]);
+      if (!error) {
+        await db.customers.update(customer.id, { synced: 1, balanceDirty: 0 });
+      }
     }
   } catch (err) {
     console.warn('Unable to sync pending customers:', err.message);
@@ -3365,15 +3844,26 @@ export async function recordWholesalePayment(customerId, ticketTotal, amountPaid
   const balanceAfter = balanceBefore + Number(ticketTotal || 0) - Number(amountPaid || 0);
 
   if (customer) {
-    await db.customers.update(customerId, { balance: balanceAfter, synced: 0 });
+    await db.customers.update(customerId, {
+      balance: balanceAfter,
+      balanceDirty: 1,
+      synced: 0
+    });
 
     if (navigator.onLine) {
       try {
-        const { error } = await supabase
-          .from('customers')
-          .update({ balance: balanceAfter })
-          .eq('id', customerId);
-        if (!error) await db.customers.update(customerId, { synced: 1 });
+        const result = await applyCloudCustomerBalanceDelta(
+          customerId,
+          balanceAfter - balanceBefore,
+          balanceAfter
+        );
+        if (result.ok) {
+          await db.customers.update(customerId, {
+            balance: result.balance,
+            balanceDirty: 0,
+            synced: 1
+          });
+        }
       } catch (err) {
         console.warn('Cloud customer balance update postponed:', err.message);
       }
@@ -4822,6 +5312,316 @@ async function getNextDailyTicketNumber() {
   }
 }
 
+// ============================================================
+// TICKET CLOUD HELPERS
+// ------------------------------------------------------------
+// One mapper each way, so every code path that sends or receives a
+// ticket (create, retry-sync, live pull, realtime push, claim) agrees on
+// the exact same field list. Before this, each path had its own
+// hand-copied list and they drifted apart (a missing column in one
+// silently broke ticket delivery between terminals).
+// ============================================================
+function ticketToCloudRow(t) {
+  return {
+    id: t.id,
+    status: t.status,
+    items: t.items,
+    total: t.total,
+    sale_type: t.saleType,
+    customer_name: t.customerName,
+    customer_phone: t.customerPhone,
+    customer_id: t.customerId || null,
+    daily_number: t.dailyNumber ?? null,
+    adjustment_reason: t.adjustmentReason ?? null,
+    sent_back_at: t.sentBackAt ?? null,
+    attendant_id: t.attendantId,
+    attendant_email: t.attendantEmail,
+    cashier_id: t.cashierId || null,
+    cashier_email: t.cashierEmail || null,
+    payment_method: t.paymentMethod || null,
+    sale_id: t.saleId || null,
+    created_at: t.createdAt,
+    paid_at: t.paidAt || null
+  };
+}
+
+export function mapCloudTicket(t) {
+  return {
+    id: String(t.id),
+    status: t.status,
+    items: t.items || [],
+    total: Number(t.total || 0),
+    saleType: t.sale_type || 'retail',
+    customerName: t.customer_name || '',
+    customerPhone: t.customer_phone || '',
+    customerId: t.customer_id || null,
+    dailyNumber: t.daily_number ?? null,
+    adjustmentReason: t.adjustment_reason || null,
+    sentBackAt: t.sent_back_at || null,
+    attendantId: t.attendant_id,
+    attendantEmail: t.attendant_email,
+    cashierId: t.cashier_id || null,
+    cashierEmail: t.cashier_email || null,
+    paymentMethod: t.payment_method || null,
+    saleId: t.sale_id || null,
+    createdAt: t.created_at,
+    paidAt: t.paid_at || null,
+    synced: 1
+  };
+}
+
+// Writes cloud ticket rows into the local table, EXCEPT any ticket this
+// device still has unsynced local changes for (synced: 0) — those win
+// until they've been pushed.
+async function mergeCloudTicketRows(rows) {
+  if (!rows || rows.length === 0) return 0;
+  const pendingIds = new Set(
+    (await db.tickets.where('synced').equals(0).toArray()).map((t) =>
+      String(t.id)
+    )
+  );
+  const mapped = rows
+    .filter((t) => !pendingIds.has(String(t.id)))
+    .map(mapCloudTicket);
+  if (mapped.length > 0) await db.tickets.bulkPut(mapped);
+  return mapped.length;
+}
+
+// Pushes ONE local ticket to the cloud safely:
+//   - not in the cloud yet  -> insert it
+//   - already finished in the cloud by someone else (PAID / CANCELLED /
+//     EXPIRED) and different from ours -> don't clobber it; tell the
+//     caller to adopt the cloud copy instead
+//   - otherwise -> update, but only if the row is still in the status we
+//     just looked at (so we can't overwrite a change made in between)
+// Returns { ok, adoptCloud?, error? }.
+async function pushTicketToCloud(ticket) {
+  const { data: existing, error: lookupError } = await supabase
+    .from('tickets')
+    .select('id,status')
+    .eq('id', ticket.id)
+    .maybeSingle();
+  if (lookupError) return { ok: false, error: lookupError };
+
+  const row = ticketToCloudRow(ticket);
+
+  if (!existing) {
+    const { error } = await supabase.from('tickets').insert([row]);
+    if (error) return { ok: false, error };
+    return { ok: true };
+  }
+
+  const cloudFinished = ['PAID', 'CANCELLED', 'EXPIRED'].includes(
+    existing.status
+  );
+  if (cloudFinished && existing.status !== ticket.status) {
+    return { ok: true, adoptCloud: true };
+  }
+
+  const { data: updated, error } = await supabase
+    .from('tickets')
+    .update(row)
+    .eq('id', ticket.id)
+    .eq('status', existing.status)
+    .select('id');
+  if (error) return { ok: false, error };
+  if (!updated || updated.length === 0) {
+    // Changed under us between the lookup and the update — leave it
+    // unsynced; the next retry looks at the fresh state.
+    return { ok: false, error: new Error('Ticket changed in the cloud — will retry.') };
+  }
+  return { ok: true };
+}
+
+// Marks a ticket delivered after a push, or swaps in the cloud copy.
+async function settleTicketPush(ticket, result) {
+  if (!result.ok) return false;
+  if (result.adoptCloud) {
+    const { data } = await supabase
+      .from('tickets')
+      .select('*')
+      .eq('id', ticket.id)
+      .maybeSingle();
+    if (data) await db.tickets.put(mapCloudTicket(data));
+    else await db.tickets.update(ticket.id, { synced: 1 });
+    return true;
+  }
+  await db.tickets.update(ticket.id, { synced: 1 });
+  return true;
+}
+
+// Atomic stock change (+/-) applied on the SERVER, so two terminals
+// selling the same drug at the same moment both count — the old way
+// (each terminal wrote its own absolute "stock = N") let the last
+// writer erase the other's sale. Needs migration v18's
+// adjust_drug_stock(); if that function isn't deployed yet it falls
+// back to the old absolute write so nothing breaks in the meantime.
+async function applyCloudStockDelta(drugId, delta, localStockAfter) {
+  const id = String(drugId);
+  try {
+    const { data, error } = await supabase.rpc('adjust_drug_stock', {
+      p_id: id,
+      p_delta: delta
+    });
+    if (!error && data !== null && data !== undefined) {
+      return { ok: true, stock: Number(data) };
+    }
+    if (error) console.warn('adjust_drug_stock RPC unavailable, using fallback:', error.message);
+  } catch (err) {
+    console.warn('adjust_drug_stock RPC failed, using fallback:', err.message);
+  }
+  try {
+    const { error } = await supabase
+      .from('drugs')
+      .update({ stock: localStockAfter })
+      .eq('id', id);
+    if (!error) return { ok: true, stock: localStockAfter };
+  } catch (err) {
+    console.warn('Cloud stock fallback failed:', err.message);
+  }
+  return { ok: false };
+}
+
+// Exported wrapper for App.jsx's direct-checkout path.
+export async function pushDrugStockDelta(drugId, delta, localStockAfter) {
+  const result = await applyCloudStockDelta(drugId, delta, localStockAfter);
+  if (result.ok) {
+    await db.drugs.update(
+      (await db.drugs.get(String(drugId))) ? String(drugId) : Number(drugId),
+      { stock: result.stock, synced: 1 }
+    );
+  }
+  return result;
+}
+
+// Same idea for a wholesale customer's running balance.
+async function applyCloudCustomerBalanceDelta(customerId, delta, localBalanceAfter) {
+  const id = String(customerId);
+  try {
+    const { data, error } = await supabase.rpc('adjust_customer_balance', {
+      p_id: id,
+      p_delta: delta
+    });
+    if (!error && data !== null && data !== undefined) {
+      return { ok: true, balance: Number(data) };
+    }
+    if (error) console.warn('adjust_customer_balance RPC unavailable, using fallback:', error.message);
+  } catch (err) {
+    console.warn('adjust_customer_balance RPC failed, using fallback:', err.message);
+  }
+  try {
+    const { error } = await supabase
+      .from('customers')
+      .update({ balance: localBalanceAfter })
+      .eq('id', id);
+    if (!error) return { ok: true, balance: localBalanceAfter };
+  } catch (err) {
+    console.warn('Cloud customer balance fallback failed:', err.message);
+  }
+  return { ok: false };
+}
+
+// Claims a ticket for this cashier in the cloud. Returns
+//   { ok: true }                      - claimed (or already ours, unfinished)
+//   { ok: true, offline: true }       - couldn't reach the cloud at all
+//   { ok: false, reason }             - genuinely taken, with the REAL why
+// Crucially it first makes sure the ticket actually EXISTS in the cloud.
+// The old version skipped that, so a ticket whose first upload had
+// failed matched zero rows and was wrongly reported as "already
+// approved by someone else".
+async function claimTicketInCloud(ticket, actor) {
+  try {
+    const local = await db.tickets.get(ticket.id);
+    if (local && Number(local.synced) === 0) {
+      const pushed = await pushTicketToCloud(local);
+      if (pushed.ok && !pushed.adoptCloud) {
+        await db.tickets.update(ticket.id, { synced: 1 });
+      } else if (pushed.adoptCloud) {
+        await settleTicketPush(local, pushed);
+        return {
+          ok: false,
+          reason: 'This ticket was already handled by someone else.'
+        };
+      } else {
+        throw pushed.error || new Error('Could not upload ticket.');
+      }
+    }
+
+    const { data: claimed, error: claimError } = await supabase
+      .from('tickets')
+      .update({
+        status: 'PAID',
+        cashier_id: actor?.id,
+        cashier_email: actor?.email
+      })
+      .eq('id', ticket.id)
+      .eq('status', 'PENDING_PAYMENT')
+      .select('id');
+    if (claimError) throw claimError;
+    if (claimed && claimed.length > 0) return { ok: true };
+
+    // Zero rows: find out the real reason instead of guessing.
+    const { data: row, error: rowError } = await supabase
+      .from('tickets')
+      .select('*')
+      .eq('id', ticket.id)
+      .maybeSingle();
+    if (rowError) throw rowError;
+
+    if (row) await mergeCloudTicketRows([row]);
+
+    if (!row) {
+      return {
+        ok: false,
+        reason:
+          'This ticket could not be found in the cloud. Check your connection and try again.'
+      };
+    }
+    // A previous attempt by THIS cashier claimed it but never finished
+    // (page closed mid-approval) — let them finish it.
+    if (row.status === 'PAID' && !row.sale_id && row.cashier_id === actor?.id) {
+      return { ok: true };
+    }
+    if (row.status === 'PAID') {
+      return {
+        ok: false,
+        reason: `This ticket was already approved${row.cashier_email ? ` by ${row.cashier_email}` : ''}.`
+      };
+    }
+    if (row.status === 'CANCELLED') {
+      return { ok: false, reason: 'This ticket was cancelled.' };
+    }
+    if (row.status === 'EXPIRED') {
+      return { ok: false, reason: 'This ticket expired before it was approved.' };
+    }
+    if (row.status === 'SENT_BACK') {
+      return {
+        ok: false,
+        reason: 'This ticket was sent back to the attendant for changes.'
+      };
+    }
+    return { ok: false, reason: 'This ticket is no longer awaiting payment.' };
+  } catch (err) {
+    console.warn('Ticket claim check failed, proceeding offline-style:', err.message);
+    return { ok: true, offline: true };
+  }
+}
+
+// Undo a claim when approval failed after it succeeded, so the ticket
+// goes back into the queue instead of being stuck "PAID" with no sale.
+async function releaseTicketClaim(ticketId, actor) {
+  try {
+    await supabase
+      .from('tickets')
+      .update({ status: 'PENDING_PAYMENT', cashier_id: null, cashier_email: null })
+      .eq('id', ticketId)
+      .eq('status', 'PAID')
+      .is('sale_id', null);
+  } catch (err) {
+    console.warn('Could not release ticket claim:', err.message);
+  }
+}
+
 export async function createTicket(ticketPayload, actor) {
   // Same ₦0-ticket guard as App.jsx, duplicated here so a bug anywhere
   // else that calls this directly can't slip a free "sale" through.
@@ -4856,28 +5656,19 @@ export async function createTicket(ticketPayload, actor) {
     return { success: false, reason: err.message };
   }
 
+  let delivered = false;
+  let deliveryError = null;
   if (navigator.onLine) {
     try {
-      const { error } = await supabase.from('tickets').insert([
-        {
-          id: ticket.id,
-          status: ticket.status,
-          items: ticket.items,
-          total: ticket.total,
-          sale_type: ticket.saleType,
-          customer_name: ticket.customerName,
-          customer_phone: ticket.customerPhone,
-          customer_id: ticket.customerId || null,
-          attendant_id: ticket.attendantId,
-          attendant_email: ticket.attendantEmail,
-          daily_number: ticket.dailyNumber,
-          created_at: ticket.createdAt
-        }
-      ]);
-      if (!error) {
-        await db.tickets.update(ticket.id, { synced: 1 });
+      const pushed = await pushTicketToCloud(ticket);
+      if (pushed.ok) {
+        delivered = await settleTicketPush(ticket, pushed);
+      } else {
+        deliveryError = pushed.error?.message || 'unknown error';
+        console.warn('Cloud ticket creation postponed:', deliveryError);
       }
     } catch (err) {
+      deliveryError = err.message;
       console.warn('Cloud ticket creation postponed:', err.message);
     }
   }
@@ -4891,7 +5682,92 @@ export async function createTicket(ticketPayload, actor) {
     details: { total: ticket.total, customerName: ticket.customerName }
   });
 
-  return { success: true, ticket };
+  return { success: true, ticket, delivered, deliveryError };
+}
+
+// ------------------------------------------------------------
+// LIVE TICKET REFRESH — runs every few seconds on every terminal.
+// Deliberately small so it's cheap to run constantly (egress!):
+//   1. every ticket that's still open in the cloud (pending / sent back)
+//   2. any ticket THIS device still thinks is open but that wasn't in
+//      (1) — i.e. someone approved/cancelled it — fetched by id so the
+//      stale queue entry disappears
+//   3. tickets from the last 2 hours (so recent PAID/CANCELLED ones show)
+// plus pushes any ticket this device hasn't managed to upload yet.
+// Returns { newPendingCount } for callers that want to react.
+// ------------------------------------------------------------
+export async function fetchLiveTickets() {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  try {
+    // Push first: anything stuck local-only gets another chance.
+    await syncPendingTicketsToCloud();
+
+    const { data: open, error } = await supabase
+      .from('tickets')
+      .select('*')
+      .in('status', ['PENDING_PAYMENT', 'SENT_BACK'])
+      .order('created_at', { ascending: false })
+      .limit(300);
+    if (error) throw error;
+
+    const openRows = open || [];
+    const openIds = new Set(openRows.map((r) => String(r.id)));
+
+    const localOpen = await db.tickets
+      .filter(
+        (t) =>
+          (t.status === 'PENDING_PAYMENT' || t.status === 'SENT_BACK') &&
+          Number(t.synced) !== 0 &&
+          !openIds.has(String(t.id))
+      )
+      .toArray();
+
+    let closedRows = [];
+    if (localOpen.length > 0) {
+      const { data: closed } = await supabase
+        .from('tickets')
+        .select('*')
+        .in(
+          'id',
+          localOpen.map((t) => t.id)
+        );
+      closedRows = closed || [];
+      // A "synced" local ticket that no longer exists in the cloud at all
+      // (deleted by an admin) shouldn't sit in the queue forever.
+      const foundIds = new Set(closedRows.map((r) => String(r.id)));
+      for (const t of localOpen) {
+        if (!foundIds.has(String(t.id))) {
+          await db.tickets.update(t.id, { status: 'CANCELLED' });
+        }
+      }
+    }
+
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const { data: recent } = await supabase
+      .from('tickets')
+      .select('*')
+      .gte('created_at', twoHoursAgo.toISOString())
+      .order('created_at', { ascending: false })
+      .limit(300);
+
+    const byId = new Map();
+    [...(recent || []), ...closedRows, ...openRows].forEach((r) =>
+      byId.set(String(r.id), r)
+    );
+    await mergeCloudTicketRows([...byId.values()]);
+  } catch (err) {
+    console.warn('Live ticket refresh failed:', err.message);
+  }
+}
+
+// Pulls one ticket row (from a Realtime push) into the local table.
+export async function applyRealtimeTicketRow(row) {
+  try {
+    if (!row || !row.id) return;
+    await mergeCloudTicketRows([row]);
+  } catch (err) {
+    console.warn('Realtime ticket apply failed:', err.message);
+  }
 }
 
 // Pulls every ticket from the last 2 days down from Supabase, so a
@@ -4914,89 +5790,36 @@ export async function fetchCloudTickets() {
       .order('created_at', { ascending: false });
 
     if (error) throw error;
-    if (!data || data.length === 0) return;
-
-    const pendingIds = new Set(
-      (await db.tickets.where('synced').equals(0).toArray()).map((t) =>
-        String(t.id)
-      )
-    );
-
-    const mapped = data
-      .filter((t) => !pendingIds.has(String(t.id)))
-      .map((t) => ({
-        id: String(t.id),
-        status: t.status,
-        items: t.items || [],
-        total: Number(t.total || 0),
-        saleType: t.sale_type || 'retail',
-        customerName: t.customer_name || '',
-        customerPhone: t.customer_phone || '',
-        customerId: t.customer_id || null,
-        dailyNumber: t.daily_number ?? null,
-        adjustmentReason: t.adjustment_reason || null,
-        sentBackAt: t.sent_back_at || null,
-        attendantId: t.attendant_id,
-        attendantEmail: t.attendant_email,
-        cashierId: t.cashier_id || null,
-        cashierEmail: t.cashier_email || null,
-        paymentMethod: t.payment_method || null,
-        saleId: t.sale_id || null,
-        createdAt: t.created_at,
-        paidAt: t.paid_at || null,
-        synced: 1
-      }));
-
-    if (mapped.length > 0) {
-      await db.tickets.bulkPut(mapped);
-    }
+    await mergeCloudTicketRows(data || []);
   } catch (err) {
     console.warn('Unable to fetch tickets from cloud:', err.message);
   }
 }
 
+let ticketPushInFlight = false;
 export async function syncPendingTicketsToCloud() {
+  if (ticketPushInFlight) return;
+  ticketPushInFlight = true;
   try {
     const pending = await db.tickets.where('synced').equals(0).toArray();
     if (pending.length === 0) return;
 
     for (const ticket of pending) {
-      const { error } = await supabase.from('tickets').upsert([
-        {
-          id: ticket.id,
-          status: ticket.status,
-          items: ticket.items,
-          total: ticket.total,
-          sale_type: ticket.saleType,
-          customer_name: ticket.customerName,
-          customer_phone: ticket.customerPhone,
-          // This was missing before — any ticket that went through this
-          // retry path (rather than the direct insert in createTicket)
-          // silently lost its linked wholesale customer in the cloud,
-          // which is exactly what made a reloaded queue treat an owing
-          // wholesale sale like an anonymous walk-in that had to be
-          // paid in full.
-          customer_id: ticket.customerId || null,
-          daily_number: ticket.dailyNumber ?? null,
-          adjustment_reason: ticket.adjustmentReason ?? null,
-          sent_back_at: ticket.sentBackAt ?? null,
-          attendant_id: ticket.attendantId,
-          attendant_email: ticket.attendantEmail,
-          cashier_id: ticket.cashierId || null,
-          cashier_email: ticket.cashierEmail || null,
-          payment_method: ticket.paymentMethod || null,
-          sale_id: ticket.saleId || null,
-          created_at: ticket.createdAt,
-          paid_at: ticket.paidAt || null
+      try {
+        const result = await pushTicketToCloud(ticket);
+        if (result.ok) {
+          await settleTicketPush(ticket, result);
+        } else {
+          console.warn('Ticket push postponed:', result.error?.message);
         }
-      ]);
-
-      if (!error) {
-        await db.tickets.update(ticket.id, { synced: 1 });
+      } catch (err) {
+        console.warn('Ticket push postponed:', err.message);
       }
     }
   } catch (err) {
     console.warn('Unable to sync pending tickets:', err.message);
+  } finally {
+    ticketPushInFlight = false;
   }
 }
 
@@ -5030,12 +5853,26 @@ export async function expireStaleTickets() {
 
       if (navigator.onLine) {
         try {
-          const { error } = await supabase
+          // Only expire if the cloud row is STILL pending — if another
+          // terminal approved it in the meantime, never overwrite PAID.
+          const { data: expired, error } = await supabase
             .from('tickets')
             .update({ status: 'EXPIRED' })
-            .eq('id', ticket.id);
+            .eq('id', ticket.id)
+            .eq('status', 'PENDING_PAYMENT')
+            .select('id');
           if (!error) {
-            await db.tickets.update(ticket.id, { synced: 1 });
+            if (expired && expired.length > 0) {
+              await db.tickets.update(ticket.id, { synced: 1 });
+            } else {
+              // Not pending in the cloud any more — take the real state.
+              const { data: real } = await supabase
+                .from('tickets')
+                .select('*')
+                .eq('id', ticket.id)
+                .maybeSingle();
+              if (real) await db.tickets.put(mapCloudTicket(real));
+            }
           }
         } catch (err) {
           console.warn('Cloud ticket expiry postponed:', err.message);
@@ -5049,20 +5886,43 @@ export async function expireStaleTickets() {
 
 export async function cancelTicket(ticket, actor) {
   try {
-    await db.tickets.update(ticket.id, { status: 'CANCELLED', synced: 0 });
-
+    // Cloud first (when online) with a status guard: cancelling a ticket
+    // that another terminal has just approved must NOT flip a paid sale
+    // back to cancelled.
     if (navigator.onLine) {
       try {
-        const { error } = await supabase
+        const local = await db.tickets.get(ticket.id);
+        if (local && Number(local.synced) === 0) {
+          const pushed = await pushTicketToCloud(local);
+          if (pushed.ok) await settleTicketPush(local, pushed);
+        }
+        const { data: cancelled, error } = await supabase
           .from('tickets')
           .update({ status: 'CANCELLED' })
-          .eq('id', ticket.id);
-        if (!error) {
-          await db.tickets.update(ticket.id, { synced: 1 });
+          .eq('id', ticket.id)
+          .in('status', ['PENDING_PAYMENT', 'SENT_BACK'])
+          .select('id');
+        if (error) throw error;
+        if (!cancelled || cancelled.length === 0) {
+          const { data: real } = await supabase
+            .from('tickets')
+            .select('*')
+            .eq('id', ticket.id)
+            .maybeSingle();
+          if (real) await db.tickets.put(mapCloudTicket(real));
+          if (real && real.status === 'CANCELLED') return { success: true };
+          return {
+            success: false,
+            reason: 'This ticket has already been handled by someone else.'
+          };
         }
+        await db.tickets.update(ticket.id, { status: 'CANCELLED', synced: 1 });
       } catch (err) {
         console.warn('Cloud ticket cancel postponed:', err.message);
+        await db.tickets.update(ticket.id, { status: 'CANCELLED', synced: 0 });
       }
+    } else {
+      await db.tickets.update(ticket.id, { status: 'CANCELLED', synced: 0 });
     }
 
     await logAuditEvent({
@@ -5102,16 +5962,15 @@ export async function sendTicketBack(ticket, reason, actor) {
     const trimmedReason = (reason || '').trim();
     const sentBackAt = new Date().toISOString();
 
-    await db.tickets.update(ticket.id, {
-      status: 'SENT_BACK',
-      adjustmentReason: trimmedReason,
-      sentBackAt,
-      synced: 0
-    });
-
+    let cloudDone = false;
     if (navigator.onLine) {
       try {
-        const { error } = await supabase
+        const local = await db.tickets.get(ticket.id);
+        if (local && Number(local.synced) === 0) {
+          const pushed = await pushTicketToCloud(local);
+          if (pushed.ok) await settleTicketPush(local, pushed);
+        }
+        const { data: moved, error } = await supabase
           .from('tickets')
           .update({
             status: 'SENT_BACK',
@@ -5119,14 +5978,33 @@ export async function sendTicketBack(ticket, reason, actor) {
             sent_back_at: sentBackAt
           })
           .eq('id', ticket.id)
-          .eq('status', 'PENDING_PAYMENT');
-        if (!error) {
-          await db.tickets.update(ticket.id, { synced: 1 });
+          .eq('status', 'PENDING_PAYMENT')
+          .select('id');
+        if (error) throw error;
+        if (!moved || moved.length === 0) {
+          const { data: real } = await supabase
+            .from('tickets')
+            .select('*')
+            .eq('id', ticket.id)
+            .maybeSingle();
+          if (real) await db.tickets.put(mapCloudTicket(real));
+          return {
+            success: false,
+            reason: 'This ticket has already been handled by someone else.'
+          };
         }
+        cloudDone = true;
       } catch (err) {
         console.warn('Cloud ticket send-back postponed:', err.message);
       }
     }
+
+    await db.tickets.update(ticket.id, {
+      status: 'SENT_BACK',
+      adjustmentReason: trimmedReason,
+      sentBackAt,
+      synced: cloudDone ? 1 : 0
+    });
 
     await logAuditEvent({
       actorEmail: actor?.email,
@@ -5194,23 +6072,10 @@ export async function resubmitTicket(ticketId, updatedPayload, actor) {
 
     if (navigator.onLine) {
       try {
-        const { error } = await supabase
-          .from('tickets')
-          .update({
-            items: update.items,
-            total: update.total,
-            sale_type: update.saleType,
-            customer_name: update.customerName,
-            customer_phone: update.customerPhone,
-            customer_id: update.customerId,
-            status: 'PENDING_PAYMENT',
-            adjustment_reason: null,
-            sent_back_at: null
-          })
-          .eq('id', ticketId);
-        if (!error) {
-          await db.tickets.update(ticketId, { synced: 1 });
-        }
+        const local = await db.tickets.get(ticketId);
+        const pushed = await pushTicketToCloud(local);
+        if (pushed.ok) await settleTicketPush(local, pushed);
+        else console.warn('Cloud ticket resubmit postponed:', pushed.error?.message);
       } catch (err) {
         console.warn('Cloud ticket resubmit postponed:', err.message);
       }
@@ -5307,15 +6172,9 @@ export async function linkCustomerToTicket(ticket, customerId, actor) {
 
     if (navigator.onLine) {
       try {
-        const { error } = await supabase
-          .from('tickets')
-          .update({
-            customer_id: changes.customerId,
-            customer_name: changes.customerName,
-            customer_phone: changes.customerPhone
-          })
-          .eq('id', ticket.id);
-        if (!error) await db.tickets.update(ticket.id, { synced: 1 });
+        const local = await db.tickets.get(ticket.id);
+        const pushed = await pushTicketToCloud(local);
+        if (pushed.ok) await settleTicketPush(local, pushed);
       } catch (err) {
         console.warn('Cloud ticket-customer link postponed:', err.message);
       }
@@ -5367,6 +6226,30 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
     let customerBalanceBefore = null;
     let customerBalanceAfter = null;
     if (ticket.saleType === 'wholesale' && ticket.customerId) {
+      // Another terminal may have just changed this customer's balance
+      // (a payment, a return, another sale) — use the cloud's figure,
+      // not a possibly-stale local copy, for the minimum-payment check.
+      if (navigator.onLine) {
+        try {
+          const { data: cloudCustomer } = await supabase
+            .from('customers')
+            .select('balance')
+            .eq('id', ticket.customerId)
+            .maybeSingle();
+          const localCustomer = await db.customers.get(ticket.customerId);
+          if (
+            cloudCustomer &&
+            localCustomer &&
+            Number(localCustomer.synced) !== 0
+          ) {
+            await db.customers.update(ticket.customerId, {
+              balance: Number(cloudCustomer.balance || 0)
+            });
+          }
+        } catch (err) {
+          console.warn('Customer balance refresh skipped:', err.message);
+        }
+      }
       const customer = await db.customers.get(ticket.customerId);
       const balanceBefore = Number(customer?.balance || 0);
       const minimumRequired = Math.max(0, balanceBefore);
@@ -5394,48 +6277,19 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       };
     }
 
-    // Guard #2 (different devices/accounts): the actual fix for two
-    // cashiers approving the same ticket at the same time. This
-    // conditional update only succeeds for whichever device gets here
-    // first — `.eq('status', 'PENDING_PAYMENT')` means the row only
-    // matches (and `claimed` comes back non-empty) if nobody else has
-    // already flipped it to PAID/CANCELLED/EXPIRED. Losing this race
-    // means someone else got there first; bail out instead of
-    // double-deducting stock and creating two sales for one ticket.
+    // Guard #2 (different devices/accounts): claim the ticket in the
+    // cloud. claimTicketInCloud first makes sure the ticket really
+    // exists there (uploading it if its first upload failed), then does
+    // the conditional PENDING_PAYMENT -> PAID flip, and on a genuine
+    // loss reports the REAL reason (who approved it / cancelled / sent
+    // back) instead of a guess.
+    let claimedInCloud = false;
     if (navigator.onLine) {
-      try {
-        const { data: claimed, error: claimError } = await supabase
-          .from('tickets')
-          .update({
-            status: 'PAID',
-            cashier_id: actor?.id,
-            cashier_email: actor?.email
-          })
-          .eq('id', ticket.id)
-          .eq('status', 'PENDING_PAYMENT')
-          .select();
-
-        if (claimError) throw claimError;
-
-        if (!claimed || claimed.length === 0) {
-          // Someone else already claimed it — pull the real state down
-          // so this device's queue updates and stops offering it.
-          await fetchCloudTickets();
-          return {
-            success: false,
-            reason:
-              'This ticket was already approved (or cancelled) by someone else.'
-          };
-        }
-      } catch (err) {
-        // Couldn't even reach Supabase to check — fall through to the
-        // offline path below. Two different OFFLINE devices approving
-        // the same ticket at the same time is a real remaining edge
-        // case (true conflict-free offline sync would need more than
-        // this), but this still protects the common case: anyone
-        // online, and the same device twice.
-        console.warn('Ticket claim check failed, proceeding offline-style:', err.message);
+      const claim = await claimTicketInCloud(ticket, actor);
+      if (!claim.ok) {
+        return { success: false, reason: claim.reason };
       }
+      claimedInCloud = !claim.offline;
     }
 
     const saleId = generateId('SALE');
@@ -5462,6 +6316,8 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       synced: 0
     };
 
+    const stockChanges = [];
+    try {
     await db.transaction('rw', db.drugs, db.sales, db.tickets, db.customers, async () => {
       // Re-check one more time inside the transaction, in case a
       // fetchCloudTickets() triggered by something else slipped this
@@ -5482,9 +6338,16 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
           // Stock is never allowed to go negative — clamp at 0. A sale is
           // still recorded in full even if the pharmacy was already
           // short on physical stock; only the recorded count floors out.
+          const newStock = Math.max(0, (existingDrug.stock || 0) - item.quantity);
           await db.drugs.update(existingDrug.id, {
-            stock: Math.max(0, (existingDrug.stock || 0) - item.quantity),
+            stock: newStock,
             synced: 0
+          });
+          stockChanges.push({
+            drugKey,
+            localId: existingDrug.id,
+            quantity: Number(item.quantity),
+            newStock
           });
         }
       }
@@ -5504,18 +6367,32 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       if (ticket.saleType === 'wholesale' && ticket.customerId) {
         await db.customers.update(ticket.customerId, {
           balance: customerBalanceAfter,
+          balanceDirty: 1,
           synced: 0
         });
       }
     });
+    } catch (txErr) {
+      // Local save failed AFTER we claimed it in the cloud — put the
+      // ticket back in the queue so it isn't stranded as "paid".
+      if (claimedInCloud) await releaseTicketClaim(ticket.id, actor);
+      throw txErr;
+    }
 
     if (ticket.saleType === 'wholesale' && ticket.customerId && navigator.onLine) {
       try {
-        const { error } = await supabase
-          .from('customers')
-          .update({ balance: customerBalanceAfter })
-          .eq('id', ticket.customerId);
-        if (!error) await db.customers.update(ticket.customerId, { synced: 1 });
+        const result = await applyCloudCustomerBalanceDelta(
+          ticket.customerId,
+          Number(ticket.total) - amountPaid,
+          customerBalanceAfter
+        );
+        if (result.ok) {
+          await db.customers.update(ticket.customerId, {
+            balance: result.balance,
+            balanceDirty: 0,
+            synced: 1
+          });
+        }
       } catch (err) {
         console.warn('Cloud customer balance update postponed:', err.message);
       }
@@ -5526,21 +6403,21 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       // the cloud. Each piece retries independently on the next
       // reconnect (via syncPendingDrugsToCloud / syncPendingSalesToCloud
       // / syncPendingTicketsToCloud) if any of these calls fail here.
-      for (const item of ticket.items) {
-        if (!item.id) continue;
-        const drugKey = String(item.id);
-        const existingDrug =
-          (await db.drugs.get(drugKey)) || (await db.drugs.get(Number(item.id)));
-        if (existingDrug) {
-          try {
-            const { error } = await supabase
-              .from('drugs')
-              .update({ stock: existingDrug.stock })
-              .eq('id', drugKey);
-            if (!error) await db.drugs.update(existingDrug.id, { synced: 1 });
-          } catch (err) {
-            console.warn('Cloud stock update postponed:', err.message);
+      for (const change of stockChanges) {
+        try {
+          const result = await applyCloudStockDelta(
+            change.drugKey,
+            -change.quantity,
+            change.newStock
+          );
+          if (result.ok) {
+            await db.drugs.update(change.localId, {
+              stock: result.stock,
+              synced: 1
+            });
           }
+        } catch (err) {
+          console.warn('Cloud stock update postponed:', err.message);
         }
       }
 
