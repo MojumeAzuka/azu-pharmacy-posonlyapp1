@@ -1234,31 +1234,22 @@ export async function updateUserRole(profileId, newRole, actor) {
 // ACCOUNT MANAGEMENT (administrator-only, via the `admin-users` Edge
 // Function — it holds the service-role key; the browser never does).
 // ------------------------------------------------------------
-async function callAdminUsers(payload, actor, auditAction, auditTarget, auditDetails) {
+async function callAdminUsers(rpcName, params, actor, auditAction, auditTarget, auditDetails) {
   if (actor?.role !== 'administrator') {
     return { success: false, reason: 'Only an administrator can manage accounts.' };
   }
   try {
-    const { data, error } = await supabase.functions.invoke('admin-users', {
-      body: payload
-    });
+    const { data, error } = await supabase.rpc(rpcName, params);
     if (error) {
-      // supabase-js hides the function's JSON error body inside the
-      // error's `context` response — dig it out so the real reason shows.
-      let message = error.message;
-      try {
-        const body = await error.context?.json?.();
-        if (body?.error) message = body.error;
-      } catch {
-        /* keep generic message */
-      }
-      if (/Failed to send a request|not found|404/i.test(message || '')) {
+      let message = error.message || 'That did not work.';
+      if (/could not find the function|schema cache|does not exist/i.test(message)) {
         message =
-          'The account-management function is not deployed yet (see SETUP_NOTES.md). ' + message;
+          'Account management is not set up in the database yet — run migration_v19_admin_accounts_in_sql.sql in the Supabase SQL editor. (' +
+          message +
+          ')';
       }
       return { success: false, reason: message };
     }
-    if (data?.error) return { success: false, reason: data.error };
 
     await logAuditEvent({
       action: auditAction,
@@ -1269,7 +1260,7 @@ async function callAdminUsers(payload, actor, auditAction, auditTarget, auditDet
       // Never log passwords.
       details: auditDetails || {}
     });
-    return { success: true, ...data };
+    return { success: true, ...(data || {}) };
   } catch (err) {
     return { success: false, reason: err.message };
   }
@@ -1277,7 +1268,8 @@ async function callAdminUsers(payload, actor, auditAction, auditTarget, auditDet
 
 export function createAccount({ email, fullName, password, role }, actor) {
   return callAdminUsers(
-    { action: 'create', email, fullName, password, role },
+    'admin_create_account',
+    { p_email: email, p_password: password, p_full_name: fullName, p_role: role },
     actor,
     'account_created',
     null,
@@ -1287,7 +1279,8 @@ export function createAccount({ email, fullName, password, role }, actor) {
 
 export function updateAccountDetails(id, { fullName, email, role }, actor) {
   return callAdminUsers(
-    { action: 'update', id, fullName, email, role },
+    'admin_update_account',
+    { p_id: id, p_full_name: fullName, p_email: email, p_role: role },
     actor,
     'account_updated',
     id,
@@ -1297,7 +1290,8 @@ export function updateAccountDetails(id, { fullName, email, role }, actor) {
 
 export function setAccountPassword(id, password, actor) {
   return callAdminUsers(
-    { action: 'set_password', id, password },
+    'admin_set_password',
+    { p_id: id, p_password: password },
     actor,
     'account_password_set',
     id,
@@ -1307,7 +1301,8 @@ export function setAccountPassword(id, password, actor) {
 
 export function setAccountActive(id, active, actor) {
   return callAdminUsers(
-    { action: 'set_active', id, active },
+    'admin_set_active',
+    { p_id: id, p_active: active },
     actor,
     active ? 'account_reactivated' : 'account_deactivated',
     id,

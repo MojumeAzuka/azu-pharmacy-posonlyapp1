@@ -708,6 +708,21 @@ export default function App() {
   // SUPABASE AUTH
   // ============================================================
   useEffect(() => {
+    // An expired / already-used reset link comes back as #error=...
+    try {
+      const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+      if (params.get('error_description')) {
+        setAuthError(
+          'That reset link has expired or was already used. Tap "Forgot your password?" to get a new one.'
+        );
+        window.history.replaceState(null, '', window.location.pathname);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
 
@@ -4001,7 +4016,7 @@ export default function App() {
         );
         if (result.success) {
           alert(
-            `Account created.\n\nEmail: ${accountForm.email.trim().toLowerCase()}\nPassword: ${accountForm.password}\n\nGive these to ${accountForm.fullName.trim()} — they can change the password themselves after signing in (Change Password button).`
+            `Account created.\n\nEmail: ${accountForm.email.trim().toLowerCase()}\nPassword: ${accountForm.password}\n\nGive these to ${accountForm.fullName.trim()} — if they ever forget it, they can use “Forgot your password?” on the sign-in page, or you can set a new one here.`
           );
         }
       } else if (accountModal.mode === 'edit') {
@@ -4034,7 +4049,7 @@ export default function App() {
         );
         if (result.success) {
           alert(
-            `Password changed for ${accountModal.profile.full_name || accountModal.profile.email}.\n\nNew password: ${accountForm.password}\n\nGive it to them — they can change it themselves after signing in.`
+            `Password changed for ${accountModal.profile.full_name || accountModal.profile.email}.\n\nNew password: ${accountForm.password}\n\nGive it to them.`
           );
         }
       }
@@ -4872,16 +4887,6 @@ export default function App() {
 
           <button
             className="logout-btn"
-            onClick={() => {
-              setAuthError('');
-              setShowChangePassword(true);
-            }}
-          >
-            Change Password
-          </button>
-
-          <button
-            className="logout-btn"
             onClick={handleLogout}
           >
             Sign Out
@@ -5095,50 +5100,6 @@ export default function App() {
         </div>
       )}
 
-      {showChangePassword && (
-        <div className="modal-overlay no-print">
-          <div className="modal-card">
-            <h3>Change My Password</h3>
-            {authError && <div className="auth-error">{authError}</div>}
-            <form className="crud-form" onSubmit={handleSaveNewPassword}>
-              <label>New password:</label>
-              <input
-                type="password"
-                required
-                minLength={8}
-                autoComplete="new-password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-              />
-              <label>Confirm new password:</label>
-              <input
-                type="password"
-                required
-                minLength={8}
-                autoComplete="new-password"
-                value={confirmNewPassword}
-                onChange={(e) => setConfirmNewPassword(e.target.value)}
-              />
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="cancel-btn"
-                  onClick={() => {
-                    setShowChangePassword(false);
-                    setNewPassword('');
-                    setConfirmNewPassword('');
-                  }}
-                >
-                  Cancel
-                </button>
-                <button type="submit" className="save-btn" disabled={isSavingPassword}>
-                  {isSavingPassword ? 'Saving…' : 'Save Password'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {undeliveredTickets && undeliveredTickets.length > 0 && (
         <div className="undelivered-banner no-print" role="alert">
