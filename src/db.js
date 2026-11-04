@@ -2518,6 +2518,9 @@ export async function fetchSuppliers() {
         phone: s.phone || '',
         email: s.email || '',
         address: s.address || '',
+        bankName: s.bank_name || '',
+        accountNumber: s.account_number || '',
+        accountName: s.account_name || '',
         deletedAt: s.deleted_at || null,
         deletedBy: s.deleted_by || null,
         synced: 1
@@ -2539,6 +2542,9 @@ export async function addSupplier(payload, actor) {
     phone: (payload.phone || '').trim(),
     email: (payload.email || '').trim(),
     address: (payload.address || '').trim(),
+    bankName: (payload.bankName || '').trim(),
+    accountNumber: (payload.accountNumber || '').trim(),
+    accountName: (payload.accountName || '').trim(),
     synced: 0
   };
 
@@ -2553,7 +2559,10 @@ export async function addSupplier(payload, actor) {
           contact_person: supplier.contactPerson,
           phone: supplier.phone,
           email: supplier.email,
-          address: supplier.address
+          address: supplier.address,
+          bank_name: supplier.bankName,
+          account_number: supplier.accountNumber,
+          account_name: supplier.accountName
         }
       ]);
       if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
@@ -2588,6 +2597,9 @@ export async function syncPendingSuppliersToCloud() {
           phone: supplier.phone,
           email: supplier.email,
           address: supplier.address,
+          bank_name: supplier.bankName || '',
+          account_number: supplier.accountNumber || '',
+          account_name: supplier.accountName || '',
           deleted_at: supplier.deletedAt || null,
           deleted_by: supplier.deletedBy || null
         }
@@ -2624,7 +2636,10 @@ export async function updateSupplier(supplier, changes, actor) {
       contactPerson: (changes.contactPerson ?? supplier.contactPerson ?? '').trim(),
       phone: (changes.phone ?? supplier.phone ?? '').trim(),
       email: (changes.email ?? supplier.email ?? '').trim(),
-      address: (changes.address ?? supplier.address ?? '').trim()
+      address: (changes.address ?? supplier.address ?? '').trim(),
+      bankName: (changes.bankName ?? supplier.bankName ?? '').trim(),
+      accountNumber: (changes.accountNumber ?? supplier.accountNumber ?? '').trim(),
+      accountName: (changes.accountName ?? supplier.accountName ?? '').trim()
     };
 
     if (isManager) {
@@ -2639,7 +2654,10 @@ export async function updateSupplier(supplier, changes, actor) {
               contact_person: cleaned.contactPerson,
               phone: cleaned.phone,
               email: cleaned.email,
-              address: cleaned.address
+              address: cleaned.address,
+              bank_name: cleaned.bankName,
+              account_number: cleaned.accountNumber,
+              account_name: cleaned.accountName
             })
             .eq('id', supplier.id);
           if (!error) await db.suppliers.update(supplier.id, { synced: 1 });
@@ -2908,7 +2926,10 @@ export async function approveSupplierChangeRequest(request, actor) {
               contact_person: target.proposedChanges.contactPerson,
               phone: target.proposedChanges.phone,
               email: target.proposedChanges.email,
-              address: target.proposedChanges.address
+              address: target.proposedChanges.address,
+              bank_name: target.proposedChanges.bankName ?? '',
+              account_number: target.proposedChanges.accountNumber ?? '',
+              account_name: target.proposedChanges.accountName ?? ''
             })
             .eq('id', target.supplierId);
           if (!error) await db.suppliers.update(target.supplierId, { synced: 1 });
@@ -6148,20 +6169,24 @@ export async function clampNegativeStockToZero() {
 // ============================================================
 export async function linkCustomerToTicket(ticket, customerId, actor) {
   try {
-    const customer = await db.customers.get(customerId);
-    if (!customer) {
+    // customerId === null means "take the account off this ticket" —
+    // the sale then has to be paid in full like any walk-in.
+    const customer = customerId ? await db.customers.get(customerId) : null;
+    if (customerId && !customer) {
       return { success: false, reason: 'Customer not found.' };
     }
-    if (customer.deletedAt) {
+    if (customer && customer.deletedAt) {
       return { success: false, reason: 'This customer has been deleted.' };
     }
 
-    const changes = {
-      customerId: customer.id,
-      customerName: customer.name,
-      customerPhone: customer.phone || ticket.customerPhone || '',
-      synced: 0
-    };
+    const changes = customer
+      ? {
+          customerId: customer.id,
+          customerName: customer.name,
+          customerPhone: customer.phone || ticket.customerPhone || '',
+          synced: 0
+        }
+      : { customerId: null, synced: 0 };
 
     await db.tickets.update(ticket.id, changes);
 
@@ -6178,10 +6203,12 @@ export async function linkCustomerToTicket(ticket, customerId, actor) {
     await logAuditEvent({
       actorEmail: actor?.email,
       actorRole: actor?.role,
-      action: 'ticket_customer_linked',
+      action: customer ? 'ticket_customer_linked' : 'ticket_customer_unlinked',
       targetType: 'ticket',
       targetId: ticket.id,
-      details: { customerId: customer.id, customerName: customer.name }
+      details: customer
+        ? { customerId: customer.id, customerName: customer.name }
+        : { customerId: null }
     });
 
     return { success: true, ticket: { ...ticket, ...changes } };
@@ -6259,6 +6286,14 @@ export async function approveTicket(ticket, paymentBreakdown, actor) {
       }
       customerBalanceBefore = balanceBefore;
       customerBalanceAfter = balanceBefore + ticket.total - amountPaid;
+    } else if (Math.abs(amountPaid - ticket.total) > 1) {
+      // No account attached → nothing can be left owing. The screen
+      // checks this too; this is the backstop so a short payment can
+      // never be recorded against a ticket with no customer account.
+      return {
+        success: false,
+        reason: `Payment entered (₦${amountPaid.toLocaleString()}) doesn't match the ticket total (₦${Number(ticket.total).toLocaleString()}). With no customer account attached the ticket must be paid in full.`
+      };
     }
 
     // Guard #1 (same device): if this device's own local copy already

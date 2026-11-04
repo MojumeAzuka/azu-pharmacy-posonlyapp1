@@ -318,7 +318,10 @@ export default function App() {
     contactPerson: '',
     phone: '',
     email: '',
-    address: ''
+    address: '',
+    bankName: '',
+    accountNumber: '',
+    accountName: ''
   });
 
   // --- Wholesale Customers CRUD ---
@@ -344,6 +347,7 @@ export default function App() {
   // linked yet.
   const [isLinkingCustomerForApproval, setIsLinkingCustomerForApproval] = useState(false);
   const [approvalCustomerSearchTerm, setApprovalCustomerSearchTerm] = useState('');
+  const [draftCustomerSearch, setDraftCustomerSearch] = useState('');
 
   // --- Drugs CRUD list (separate from the ticket-builder search) ---
   const [drugCrudSearchTerm, setDrugCrudSearchTerm] = useState('');
@@ -1850,6 +1854,61 @@ export default function App() {
       }, 0);
   }, [allStockEntries]);
 
+  // ------------------------------------------------------------
+  // DEBTS PAGE DATA (managers)
+  // Customers: balance > 0 = they owe the pharmacy, < 0 = pharmacy owes
+  // them. Suppliers: from applied stock entries — what's unpaid is owed
+  // to the supplier; an overpayment is credit the supplier owes back.
+  // ------------------------------------------------------------
+  const [debtView, setDebtView] = useState('customers');
+  const [debtSearch, setDebtSearch] = useState('');
+
+  const customerDebts = React.useMemo(() => {
+    const rows = activeCustomers
+      .map((c) => ({ ...c, balanceNum: Number(c.balance || 0) }))
+      .filter((c) => Math.abs(c.balanceNum) >= 1);
+    return {
+      owingUs: rows.filter((c) => c.balanceNum > 0).sort((a, b) => b.balanceNum - a.balanceNum),
+      weOwe: rows.filter((c) => c.balanceNum < 0).sort((a, b) => a.balanceNum - b.balanceNum)
+    };
+  }, [activeCustomers]);
+
+  const supplierDebts = React.useMemo(() => {
+    const bySupplier = new Map();
+    (allStockEntries || [])
+      .filter((e) => e.status === 'APPLIED')
+      .forEach((e) => {
+        const owed = Number(e.totalCost || 0) - Number(e.amountPaid || 0);
+        if (Math.abs(owed) < 1) return;
+        const key = String(e.supplierId || e.supplierName || 'unknown');
+        const row =
+          bySupplier.get(key) || {
+            key,
+            supplierId: e.supplierId,
+            name: e.supplierName || 'Unknown supplier',
+            weOwe: 0,
+            theyOwe: 0,
+            entries: []
+          };
+        if (owed > 0) {
+          row.weOwe += owed;
+          row.entries.push({ ...e, owed });
+        } else {
+          row.theyOwe += -owed;
+        }
+        bySupplier.set(key, row);
+      });
+    const supplierById = new Map((suppliers || []).map((s) => [String(s.id), s]));
+    const rows = [...bySupplier.values()].map((r) => ({
+      ...r,
+      supplier: supplierById.get(String(r.supplierId)) || null
+    }));
+    return {
+      weOwe: rows.filter((r) => r.weOwe > 0).sort((a, b) => b.weOwe - a.weOwe),
+      theyOwe: rows.filter((r) => r.theyOwe > 0).sort((a, b) => b.theyOwe - a.theyOwe)
+    };
+  }, [allStockEntries, suppliers]);
+
   // Quick drugId -> drug lookup, for sale line items old enough that
   // they predate the costPrice snapshot on the item itself.
   const dashboardDrugLookup = React.useMemo(() => {
@@ -2455,6 +2514,25 @@ export default function App() {
     );
   };
 
+  // Attach (or, with null, remove) a wholesale account on a ticket draft.
+  // Optional: a wholesale sale can still go through with no account at
+  // all — it just has to be paid in full.
+  const handlePickDraftCustomer = (draftId, customer) => {
+    setTicketDrafts((prev) =>
+      prev.map((d) => {
+        if (d.id !== draftId) return d;
+        if (!customer) return { ...d, customerId: null };
+        return {
+          ...d,
+          customerId: customer.id,
+          customerName: customer.name,
+          customerPhone: customer.phone || d.customerPhone || ''
+        };
+      })
+    );
+    setDraftCustomerSearch('');
+  };
+
   const setDraftSaleType = (draftId, type) => {
     setTicketDrafts((prev) =>
       prev.map((d) => {
@@ -2655,6 +2733,38 @@ export default function App() {
         alert(
           `Payment entered (₦${sum.toLocaleString()}) doesn't match the ticket total (₦${approvingTicket.total.toLocaleString()}). Adjust the amounts so they add up exactly.`
         );
+        return;
+      }
+    }
+
+    // A wholesale account is NEVER approved silently: the cashier sees
+    // exactly what was owed, what is being paid and what the account
+    // will look like afterwards, and has to confirm it.
+    if (isWholesaleWithCustomer) {
+      const cust = customersById.get(String(approvingTicket.customerId));
+      const before = Number(cust?.balance || 0);
+      const after = before + Number(approvingTicket.total) - sum;
+      const afterText =
+        after > 0
+          ? `${approvingTicket.customerName} will OWE ₦${after.toLocaleString()}`
+          : after < 0
+            ? `The pharmacy will owe ${approvingTicket.customerName} ₦${Math.abs(after).toLocaleString()}`
+            : `${approvingTicket.customerName}'s account will be settled (₦0)`;
+      const beforeText =
+        before > 0
+          ? `owes ₦${before.toLocaleString()}`
+          : before < 0
+            ? `is owed ₦${Math.abs(before).toLocaleString()} by the pharmacy`
+            : 'has a ₦0 balance';
+      if (
+        !window.confirm(
+          `Account: ${approvingTicket.customerName}\n` +
+            `Before this sale: ${beforeText}\n` +
+            `This ticket: ₦${Number(approvingTicket.total).toLocaleString()}\n` +
+            `Paying now: ₦${sum.toLocaleString()}\n\n` +
+            `After: ${afterText}.\n\nConfirm this payment?`
+        )
+      ) {
         return;
       }
     }
@@ -2878,7 +2988,7 @@ export default function App() {
   // ============================================================
   const handleOpenAddSupplierModal = () => {
     setEditingSupplier(null);
-    setSupplierFormData({ name: '', contactPerson: '', phone: '', email: '', address: '' });
+    setSupplierFormData({ name: '', contactPerson: '', phone: '', email: '', address: '', bankName: '', accountNumber: '', accountName: '' });
     setIsSupplierModalOpen(true);
   };
 
@@ -2889,7 +2999,10 @@ export default function App() {
       contactPerson: supplier.contactPerson || supplier.contact_person || '',
       phone: supplier.phone || '',
       email: supplier.email || '',
-      address: supplier.address || ''
+      address: supplier.address || '',
+      bankName: supplier.bankName || '',
+      accountNumber: supplier.accountNumber || '',
+      accountName: supplier.accountName || ''
     });
     setIsSupplierModalOpen(true);
   };
@@ -3033,6 +3146,19 @@ export default function App() {
   // for, which is what unlocks owing. A brand-new/unapproved customer
   // (see addCustomer above) never reaches here — only one that already
   // exists in `customers` can be linked.
+  const handleUnlinkCustomerForApproval = async () => {
+    if (!approvingTicket) return;
+    const result = await linkCustomerToTicket(approvingTicket, null, {
+      email: session?.user?.email,
+      role: userRole
+    });
+    if (result.success) {
+      setApprovingTicket(result.ticket);
+    } else {
+      alert(result.reason || 'Unable to remove this account.');
+    }
+  };
+
   const handleLinkExistingCustomerForApproval = async (customer) => {
     if (!approvingTicket) return;
     const result = await linkCustomerToTicket(approvingTicket, customer.id, {
@@ -4984,6 +5110,15 @@ export default function App() {
               </button>
             )}
 
+            {hasRole(userRole, 'manager') && (
+              <button
+                className={activeTab === 'debts' ? 'active-tab' : ''}
+                onClick={() => setActiveTab('debts')}
+              >
+                💰 Debts
+              </button>
+            )}
+
             {/* "Restock" as its own top-nav button, and the "+ Add Drug"
                 button below, have both moved into the single "Drugs &
                 Suppliers" bottom bar (see just after this header) — one
@@ -5443,6 +5578,72 @@ export default function App() {
                       Wholesale
                     </button>
                   </div>
+
+                  {activeDraft.saleType === 'wholesale' && (
+                    <div className="draft-customer-picker">
+                      {activeDraft.customerId ? (() => {
+                        const picked = customersById.get(String(activeDraft.customerId));
+                        return (
+                          <div className="draft-customer-chip">
+                            <span>
+                              👤 <strong>{picked?.name || activeDraft.customerName}</strong>
+                              {picked?.phone && ` · ${picked.phone}`}
+                            </span>
+                            <button
+                              type="button"
+                              className="permanent-delete-btn"
+                              onClick={() => handlePickDraftCustomer(activeDraft.id, null)}
+                            >
+                              ✕ Remove account
+                            </button>
+                          </div>
+                        );
+                      })() : (
+                        <>
+                          <input
+                            type="text"
+                            className="search-input"
+                            placeholder="Wholesale account (optional) — search name or phone"
+                            value={draftCustomerSearch}
+                            onChange={(e) => setDraftCustomerSearch(e.target.value)}
+                          />
+                          <div className="draft-customer-list">
+                            {activeCustomers
+                              .filter((c) => {
+                                const term = draftCustomerSearch.trim().toLowerCase();
+                                if (!term) return true;
+                                return (
+                                  (c.name || '').toLowerCase().includes(term) ||
+                                  (c.phone || '').includes(term) ||
+                                  (c.phones || []).some((p) => String(p).includes(term))
+                                );
+                              })
+                              .map((c) => (
+                                <button
+                                  type="button"
+                                  key={c.id}
+                                  className="draft-customer-option"
+                                  onClick={() => handlePickDraftCustomer(activeDraft.id, c)}
+                                >
+                                  {c.name}
+                                  {c.phone && <small> · {c.phone}</small>}
+                                </button>
+                              ))}
+                            {activeCustomers.length === 0 && (
+                              <p className="admin-section-sub">
+                                No wholesale accounts on file yet.
+                              </p>
+                            )}
+                          </div>
+                          <p className="admin-section-sub">
+                            Only pick an account if this customer wants to owe
+                            or use their balance. The cashier can change it at
+                            payment.
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   <div
                     className="cart-items-list ticket-items-list"
@@ -7558,6 +7759,238 @@ export default function App() {
       {/* ========================================================
           ADMINISTRATOR SCREEN
       ======================================================== */}
+      {/* ========================================================
+          DEBTS (managers) — who owes the pharmacy, who the pharmacy
+          owes, with phone numbers and supplier account numbers.
+      ======================================================== */}
+      {activeTab === 'debts' && hasRole(userRole, 'manager') && (() => {
+        const money = (n) => `₦${Math.round(Math.abs(n)).toLocaleString()}`;
+        const term = debtSearch.trim().toLowerCase();
+        const phonesOf = (c) =>
+          (Array.isArray(c.phones) && c.phones.length ? c.phones : [c.phone]).filter(Boolean);
+        const matchCustomer = (c) =>
+          !term ||
+          (c.name || '').toLowerCase().includes(term) ||
+          phonesOf(c).some((p) => String(p).includes(term));
+        const matchSupplier = (r) =>
+          !term ||
+          (r.name || '').toLowerCase().includes(term) ||
+          (r.supplier?.phone || '').includes(term);
+        const totalOwingUs = customerDebts.owingUs.reduce((s, c) => s + c.balanceNum, 0);
+        const totalWeOweCustomers = customerDebts.weOwe.reduce((s, c) => s - c.balanceNum, 0);
+        const totalWeOweSuppliers = supplierDebts.weOwe.reduce((s, r) => s + r.weOwe, 0);
+        const totalSuppliersOweUs = supplierDebts.theyOwe.reduce((s, r) => s + r.theyOwe, 0);
+
+        const copyText = (text) => {
+          try {
+            navigator.clipboard.writeText(text);
+          } catch {
+            /* ignore */
+          }
+        };
+
+        const CustomerRow = ({ c }) => (
+          <div className="ticket-row debt-row">
+            <div className="debt-row-main">
+              <strong>{c.name}</strong>
+              <div className="deleted-drug-meta">
+                {phonesOf(c).length === 0
+                  ? 'No phone on file'
+                  : phonesOf(c).map((p, i) => (
+                      <React.Fragment key={p + i}>
+                        {i > 0 && ' · '}
+                        <a href={`tel:${p}`}>{p}</a>
+                      </React.Fragment>
+                    ))}
+              </div>
+            </div>
+            <div className="debt-amount">{money(c.balanceNum)}</div>
+          </div>
+        );
+
+        const SupplierRow = ({ r, kind }) => (
+          <div className="ticket-row ticket-row-detailed debt-row">
+            <div className="ticket-row-header">
+              <strong>{r.name}</strong>
+              <div className="debt-amount">{money(kind === 'weOwe' ? r.weOwe : r.theyOwe)}</div>
+            </div>
+            <div className="deleted-drug-meta">
+              {[r.supplier?.contactPerson].filter(Boolean).join(' · ')}
+              {r.supplier?.phone ? (
+                <>
+                  {r.supplier?.contactPerson ? ' · ' : ''}
+                  <a href={`tel:${r.supplier.phone}`}>{r.supplier.phone}</a>
+                </>
+              ) : (
+                !r.supplier?.contactPerson && 'No phone on file'
+              )}
+            </div>
+            {kind === 'weOwe' && (
+              <div className="debt-bank">
+                {r.supplier?.accountNumber ? (
+                  <>
+                    🏦 {r.supplier.bankName || 'Bank'} ·{' '}
+                    <strong>{r.supplier.accountNumber}</strong>
+                    {r.supplier.accountName && ` · ${r.supplier.accountName}`}{' '}
+                    <button
+                      type="button"
+                      className="send-back-btn"
+                      onClick={() => copyText(r.supplier.accountNumber)}
+                    >
+                      Copy number
+                    </button>
+                  </>
+                ) : (
+                  <span className="admin-section-sub">
+                    No account number saved — add one under Drugs, Suppliers &amp; Customers → Suppliers.
+                  </span>
+                )}
+              </div>
+            )}
+            {kind === 'weOwe' &&
+              r.entries.map((entry) => (
+                <div key={entry.id} className="debt-entry">
+                  <span>
+                    {new Date(entry.createdAt).toLocaleDateString()} · total{' '}
+                    {money(entry.totalCost)} · paid {money(entry.amountPaid || 0)} · owed{' '}
+                    <strong>{money(entry.owed)}</strong>
+                  </span>
+                  <button
+                    type="button"
+                    className="restore-btn"
+                    onClick={() => {
+                      setRecordingPaymentFor(entry);
+                      setRecordPaymentAmount('');
+                    }}
+                  >
+                    💳 Record Payment
+                  </button>
+                </div>
+              ))}
+          </div>
+        );
+
+        return (
+          <div className="tickets-screen no-print">
+            <div className="admin-section-nav">
+              <button
+                className={debtView === 'customers' ? 'active' : ''}
+                onClick={() => setDebtView('customers')}
+              >
+                👥 Customers
+              </button>
+              <button
+                className={debtView === 'suppliers' ? 'active' : ''}
+                onClick={() => setDebtView('suppliers')}
+              >
+                🚚 Suppliers
+              </button>
+            </div>
+
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Search by name or phone..."
+              value={debtSearch}
+              onChange={(e) => setDebtSearch(e.target.value)}
+            />
+
+            {debtView === 'customers' ? (
+              <>
+                <div className="debt-summary">
+                  <div>
+                    <small>Customers owe the pharmacy</small>
+                    <strong>{money(totalOwingUs)}</strong>
+                  </div>
+                  <div>
+                    <small>Pharmacy owes customers</small>
+                    <strong>{money(totalWeOweCustomers)}</strong>
+                  </div>
+                </div>
+
+                <section className="admin-section">
+                  <div className="admin-section-header">
+                    <h3>Owed BY customers ({customerDebts.owingUs.filter(matchCustomer).length})</h3>
+                  </div>
+                  <div className="ticket-list">
+                    {customerDebts.owingUs.filter(matchCustomer).map((c) => (
+                      <CustomerRow key={c.id} c={c} />
+                    ))}
+                    {customerDebts.owingUs.filter(matchCustomer).length === 0 && (
+                      <p className="admin-section-sub">Nobody owes the pharmacy right now.</p>
+                    )}
+                  </div>
+                </section>
+
+                <section className="admin-section">
+                  <div className="admin-section-header">
+                    <h3>Owed TO customers ({customerDebts.weOwe.filter(matchCustomer).length})</h3>
+                    <span className="admin-section-sub">
+                      Credit they've overpaid or from returned goods.
+                    </span>
+                  </div>
+                  <div className="ticket-list">
+                    {customerDebts.weOwe.filter(matchCustomer).map((c) => (
+                      <CustomerRow key={c.id} c={c} />
+                    ))}
+                    {customerDebts.weOwe.filter(matchCustomer).length === 0 && (
+                      <p className="admin-section-sub">The pharmacy owes no customer right now.</p>
+                    )}
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
+                <div className="debt-summary">
+                  <div>
+                    <small>Pharmacy owes suppliers</small>
+                    <strong>{money(totalWeOweSuppliers)}</strong>
+                  </div>
+                  <div>
+                    <small>Suppliers owe the pharmacy</small>
+                    <strong>{money(totalSuppliersOweUs)}</strong>
+                  </div>
+                </div>
+
+                <section className="admin-section">
+                  <div className="admin-section-header">
+                    <h3>Owed TO suppliers ({supplierDebts.weOwe.filter(matchSupplier).length})</h3>
+                    <span className="admin-section-sub">
+                      Unpaid balance on stock already received.
+                    </span>
+                  </div>
+                  <div className="ticket-list">
+                    {supplierDebts.weOwe.filter(matchSupplier).map((r) => (
+                      <SupplierRow key={r.key} r={r} kind="weOwe" />
+                    ))}
+                    {supplierDebts.weOwe.filter(matchSupplier).length === 0 && (
+                      <p className="admin-section-sub">No unpaid supplier balances.</p>
+                    )}
+                  </div>
+                </section>
+
+                <section className="admin-section">
+                  <div className="admin-section-header">
+                    <h3>Owed BY suppliers ({supplierDebts.theyOwe.filter(matchSupplier).length})</h3>
+                    <span className="admin-section-sub">
+                      Where more was paid than the stock was worth.
+                    </span>
+                  </div>
+                  <div className="ticket-list">
+                    {supplierDebts.theyOwe.filter(matchSupplier).map((r) => (
+                      <SupplierRow key={r.key} r={r} kind="theyOwe" />
+                    ))}
+                    {supplierDebts.theyOwe.filter(matchSupplier).length === 0 && (
+                      <p className="admin-section-sub">No supplier owes the pharmacy.</p>
+                    )}
+                  </div>
+                </section>
+              </>
+            )}
+          </div>
+        );
+      })()}
+
       {activeTab === 'admin' && hasRole(userRole, 'administrator') && (
         <div className="admin-screen no-print">
 
@@ -8828,9 +9261,38 @@ export default function App() {
               ))}
             </ul>
 
-            {approvingTicket.saleType === 'wholesale' && !approvingTicket.customerId && (
+            {approvingTicket.saleType === 'wholesale' && (
               <div className="wholesale-customer-picker">
                 {!isLinkingCustomerForApproval ? (
+                  approvingTicket.customerId ? (
+                    <div className="draft-customer-chip">
+                      <span>
+                        👤 Account: <strong>{approvingTicket.customerName}</strong>
+                        {approvingTicket.customerPhone &&
+                          approvingTicket.customerPhone !== 'N/A' &&
+                          ` · ${approvingTicket.customerPhone}`}
+                      </span>
+                      <span className="draft-customer-chip-actions">
+                        <button
+                          type="button"
+                          className="restore-btn"
+                          onClick={() => {
+                            setIsLinkingCustomerForApproval(true);
+                            setApprovalCustomerSearchTerm('');
+                          }}
+                        >
+                          Change
+                        </button>
+                        <button
+                          type="button"
+                          className="permanent-delete-btn"
+                          onClick={handleUnlinkCustomerForApproval}
+                        >
+                          Remove
+                        </button>
+                      </span>
+                    </div>
+                  ) : (
                   <button
                     type="button"
                     className="restore-btn"
@@ -8841,6 +9303,7 @@ export default function App() {
                   >
                     👤 This customer wants to owe / use an account
                   </button>
+                  )
                 ) : (
                   <div className="wholesale-customer-search">
                     <input
@@ -8873,6 +9336,8 @@ export default function App() {
                             {c.phone && ` · ${c.phone}`}
                             {Number(c.balance || 0) > 0 &&
                               ` (owes ₦${Number(c.balance).toLocaleString()})`}
+                            {Number(c.balance || 0) < 0 &&
+                              ` (pharmacy owes them ₦${Math.abs(Number(c.balance)).toLocaleString()})`}
                           </div>
                         ))}
                       {activeCustomers.length === 0 && (
@@ -9066,6 +9531,41 @@ export default function App() {
               of ₦{approvingTicket.total.toLocaleString()}
             </p>
 
+            {(() => {
+              const entered =
+                (Number(paymentCash) || 0) +
+                paymentElectronicLines.reduce((s, l) => s + (Number(l.amount) || 0), 0);
+              const hasAccount =
+                approvingTicket.saleType === 'wholesale' && approvingTicket.customerId;
+              let ok;
+              let message;
+              if (hasAccount) {
+                const cust = customersById.get(String(approvingTicket.customerId));
+                const need = getMinimumWholesalePayment(cust);
+                ok = entered + 1 >= need;
+                message = ok
+                  ? entered + 1 >= approvingTicket.total
+                    ? 'This payment will go through and covers the full ticket.'
+                    : `This payment will go through. ₦${Math.max(0, approvingTicket.total - entered).toLocaleString()} of this ticket will be added to the account.`
+                  : `This will NOT go through — at least ₦${need.toLocaleString()} (what is already owed) must be paid.`;
+              } else {
+                ok = Math.abs(entered - approvingTicket.total) <= 1;
+                message = ok
+                  ? 'This payment will go through.'
+                  : `This will NOT go through — no account is attached, so exactly ₦${approvingTicket.total.toLocaleString()} must be paid.${
+                      approvingTicket.saleType === 'wholesale'
+                        ? ' To let them owe, attach their account above.'
+                        : ''
+                    }`;
+              }
+              return (
+                <p className={`payment-verdict ${ok ? 'ok' : 'bad'}`}>
+                  {ok ? '✔ ' : '✖ '}
+                  {message}
+                </p>
+              );
+            })()}
+
             <div className="modal-actions">
               <button
                 type="button"
@@ -9084,7 +9584,7 @@ export default function App() {
                 Cancel
               </button>
 
-              {approvingTicket.saleType === 'wholesale' && approvingTicket.customerId && (
+              {approvingTicket.saleType === 'wholesale' && (
                 <button
                   type="button"
                   className="permanent-delete-btn"
@@ -9577,6 +10077,40 @@ export default function App() {
                   value={supplierFormData.address}
                   onChange={(e) =>
                     setSupplierFormData({ ...supplierFormData, address: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Bank name (for payments):
+                <input
+                  type="text"
+                  value={supplierFormData.bankName}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, bankName: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Account number:
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={supplierFormData.accountNumber}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, accountNumber: e.target.value })
+                  }
+                />
+              </label>
+
+              <label>
+                Account name:
+                <input
+                  type="text"
+                  value={supplierFormData.accountName}
+                  onChange={(e) =>
+                    setSupplierFormData({ ...supplierFormData, accountName: e.target.value })
                   }
                 />
               </label>
